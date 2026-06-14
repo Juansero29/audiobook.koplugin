@@ -75,12 +75,14 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
 
     local doc = self.ui.document
 
-    -- EPUB / rolling mode: use screen-coordinate selection
+    -- EPUB / rolling mode: use screen-coordinate selection.
+    -- Returns true when the sentence was found and highlighted on the
+    -- visible page (callers use this for read-along page advancement).
     if self.ui.rolling then
-        self:_highlightSentenceRolling(sentence, parsed_data, doc)
+        return self:_highlightSentenceRolling(sentence, parsed_data, doc)
     else
         -- PDF / paged mode: use view.highlight.temp
-        self:_highlightSentencePaging(sentence, parsed_data, doc)
+        return self:_highlightSentencePaging(sentence, parsed_data, doc)
     end
 end
 
@@ -473,9 +475,8 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         self:_ensureViewModule()
         self.is_highlighting = true
         UIManager:setDirty(self.ui.dialog or "all", "ui")
+        return true
     end
-
-
 end
 
 --[[--
