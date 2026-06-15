@@ -2711,12 +2711,10 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         local file_path = self.current_audio_file
         logger.warn("TTSEngine: kindle-gst-play:", file_path,
             "dur=", self._expected_play_duration_ms, "ms")
-        -- Request audio focus from audiomgrd.  'Music' is the only input
-        -- stream type audiomgrd accepts on PW5/PW6 (verified against the
-        -- binary: valid types are Music/micAsr/micHfp/micRaw/playOut); the
-        -- previously used 'tts' is silently ignored and the stream never
-        -- gets focused, so the mixer never consumes it.
-        os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
+        -- Audio focus ('Music') is taken once per session by
+        -- _ensureKindleKeepalive below — NOT per sentence: every setFocus
+        -- makes audiomgrd re-ramp gain to its stored level, which reset
+        -- the headset volume to max on every sentence boundary.
         -- Prefer the system gst-launch-0.10 pipeline: on PW5/PW6 the working
         -- recipe is mixersink stream-type=Music sync=true (the bundled
         -- gst-play binary sets neither and hangs in commit).  Fall back to
@@ -4363,6 +4361,10 @@ function TTSEngine:_ensureKindleKeepalive()
         if f then f:close() return end
         self._keepalive_pid = nil
     end
+    -- Take focus ONCE here, not per sentence: every setFocus makes
+    -- audiomgrd re-ramp gain to its stored level, which yanked the
+    -- headset volume back up on every sentence boundary.
+    os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
     local h = io.popen(
         "gst-launch-0.10 filesrc location=/dev/zero"
         .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
@@ -4453,7 +4455,10 @@ function TTSEngine:_trySystemGstLaunch(wav_file)
     -- 11025 bytes — odd).
     local frame_bytes = channels * math.floor(bits / 8)
     local lead_bytes = math.floor(rate / 4) * frame_bytes   -- ~0.25 s
-    local tail_bytes = math.floor(rate / 3) * frame_bytes   -- ~0.33 s
+    -- Full second of tail: the shm ring holds up to ~0.9 s when the
+    -- pipeline tears down at EOS and its fill level varies, so a shorter
+    -- pad clips the ending intermittently even with the keepalive up.
+    local tail_bytes = rate * frame_bytes                   -- 1 s
     local dd_cmd = string.format(
         "( dd if=/dev/zero bs=%d count=1 2>/dev/null;"
         .. " dd if='%s' bs=44 skip=1 2>/dev/null;"
@@ -4484,8 +4489,9 @@ function TTSEngine:_trySystemGstLaunch(wav_file)
     -- accepts) and sync=true: with the element's default sync=false the
     -- commit vfunc is handed mismatched in/out sample counts, rejects every
     -- buffer ("MixerSink:Commit:in != out" in syslog) and the pipeline hangs
-    -- silently.  Verified working on PW5 firmware 5.x (2025-04).
-    os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
+    -- silently.  Focus is NOT set here: it is taken once per session by
+    -- the keepalive (per-sentence setFocus re-ramped gain and reset the
+    -- headset volume); new streams inherit it from audiomgrd's focus cache.
     local gst_log = "/tmp/.gst_system_last.log"
     local cmd = string.format(
         "gst-launch-0.10 filesrc location='%s' ! capsfilter caps='%s' ! mixersink stream-type=Music sync=true >%s 2>&1 & echo $!",

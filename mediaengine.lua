@@ -68,6 +68,10 @@ function MediaEngine:new(o)
     o._media_fifo = "/tmp/audiobook_media_fifo"
     o._media_script = "/tmp/audiobook_media_pipeline.sh"
     o._current_pcm_file = nil
+    -- Digital playback volume (0.0..1.0).  Applied as an ffmpeg `volume`
+    -- filter in the decode pipeline, so it works without depending on
+    -- Amazon's (model-specific) LIPC volume property.  1.0 = unchanged.
+    o._volume = 1.0
     return o
 end
 
@@ -81,6 +85,16 @@ function MediaEngine:commandExists(cmd)
     local result = handle:read("*l")
     handle:close()
     return result ~= nil and result ~= ""
+end
+
+--- Take audiomgrd 'Music' focus once per KOReader session.
+-- Every setFocus makes audiomgrd re-ramp gain to its stored level, which
+-- resets the headset volume on each call -- so seeks and track switches
+-- must not re-issue it.  New streams inherit focus from audiomgrd's cache.
+function MediaEngine._takeMusicFocusOnce()
+    if MediaEngine._focus_taken then return end
+    os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
+    MediaEngine._focus_taken = true
 end
 
 --[[--
@@ -717,6 +731,8 @@ function MediaEngine:load(path)
     self.is_playing = false
     self.is_paused = false
     self._seek_offset = 0
+    self._use_progress_position = false
+    self._progress_file = nil
 
     logger.warn("MediaEngine: loaded", path,
         "backend=", self.backend,
@@ -770,6 +786,56 @@ function MediaEngine:play(on_complete, on_fail)
     logger.err("MediaEngine: unknown backend", self.backend)
     if on_fail then on_fail("unknown backend") end
     return false
+end
+
+--[[--
+Spawn a backend command in the background, capture its PID, and start the
+position poller + completion watcher.  Every spawning backend shares this
+boilerplate; only the command string and a few shell knobs differ.
+
+@param cmd   string  the shell command to run inside `sh -c`
+@param gen   number  the play generation guarding the deferred PID read
+@param opts  table   optional:
+  name   string   label for the temp PID file and logs (default "audio")
+  exec   bool     prefix the command with `exec` (default true).  Use false
+                  for pipelines: `exec a | b` would replace the shell with the
+                  last stage, losing the PID we just echoed.
+  setsid bool     run under setsid so kill(-pid) reaches the whole group
+                  (needed for ffmpeg|gst pipelines)
+  quiet  bool     redirect the wrapper's stdout/stderr to /dev/null
+  delay  number   seconds to wait before reading the PID file (default 0.3)
+@return true
+--]]
+function MediaEngine:_spawnTracked(cmd, gen, opts)
+    opts = opts or {}
+    local name = opts.name or "audio"
+    local pid_file = self:_getTempDir() .. "/" .. name .. "-pid-" .. gen
+    os.remove(pid_file)
+
+    local setsid = ""
+    if opts.setsid and self:commandExists("setsid") then setsid = "setsid " end
+    local exec = (opts.exec ~= false) and "exec " or ""
+    local redirect = opts.quiet and " >/dev/null 2>&1" or ""
+    local wrapper = string.format(
+        "%ssh -c 'echo $$ > %s; %s%s'%s &",
+        setsid, pid_file, exec, cmd:gsub("'", "'\\''"), redirect)
+    os.execute(wrapper)
+
+    UIManager:scheduleIn(opts.delay or 0.3, function()
+        if self.play_generation ~= gen then return end
+        local pf = io.open(pid_file, "r")
+        if pf then
+            local pid_str = pf:read("*l")
+            pf:close()
+            self.audio_pid = tonumber(pid_str)
+            logger.warn("MediaEngine: " .. name .. " PID =", self.audio_pid)
+        end
+        os.remove(pid_file)
+        self:_startPositionPoller(gen)
+        self:_startCompletionWatcher(gen)
+    end)
+
+    return true
 end
 
 function MediaEngine:_playMpv(gen)
@@ -871,6 +937,16 @@ function MediaEngine:_playFfmpegPipe(gen)
     end
 
     local atempo = self:_atempoFilterString(self._playback_speed)
+    -- Splice the digital volume gain into the audio filter chain.
+    local vol = self._volume or 1.0
+    if math.abs(vol - 1.0) >= 0.001 then
+        local vf = string.format("volume=%.3f", vol)
+        if atempo == "" then
+            atempo = ' -filter:a "' .. vf .. '"'
+        else
+            atempo = atempo:gsub('"$', "," .. vf .. '"')
+        end
+    end
     local cmd
     if offset > 0 then
         cmd = string.format(
@@ -894,30 +970,9 @@ function MediaEngine:_playFfmpegPipe(gen)
     -- Bluetooth socket, causing "Address already in use" errors.
     os.execute("killall -9 ffmpeg gst-launch-1.0 2>/dev/null")
 
-    -- Spawn in background and capture PID.
-    -- Do NOT use 'exec' here: in POSIX sh, 'exec cmd1 | cmd2' replaces the
-    -- shell with the last pipeline stage (gst-launch), so the original PID
-    -- disappears and the completion watcher thinks playback finished.
-    local pid_file = self:_getTempDir() .. "/ffmpeg-pid-" .. gen
-    os.remove(pid_file)
-    local wrapper = string.format("sh -c 'echo $$ > %s; %s' &", pid_file, cmd)
-    os.execute(wrapper)
-
-    UIManager:scheduleIn(0.3, function()
-        if self.play_generation ~= gen then return end
-        local pf = io.open(pid_file, "r")
-        if pf then
-            local pid_str = pf:read("*l")
-            pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: ffmpeg-pipe PID =", self.audio_pid)
-        end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
-    end)
-
-    return true
+    -- exec=false: `exec a | b` would replace the shell with the last pipeline
+    -- stage (gst-launch), losing the PID we capture.
+    return self:_spawnTracked(cmd, gen, { name = "ffmpeg", exec = false })
 end
 
 function MediaEngine:_playGstPlay(gen)
@@ -944,27 +999,7 @@ function MediaEngine:_playGstPlay(gen)
         "seek_offset=", self._seek_offset or 0,
         "sink=", sink_arg ~= "" and "mtkbtmwrpcaudiosink" or "auto")
 
-    -- Spawn in background and capture PID
-    local pid_file = self:_getTempDir() .. "/gst-play-pid-" .. gen
-    os.remove(pid_file)
-    local wrapper = string.format("sh -c 'echo $$ > %s; exec %s' &", pid_file, cmd)
-    os.execute(wrapper)
-
-    UIManager:scheduleIn(0.3, function()
-        if self.play_generation ~= gen then return end
-        local pf = io.open(pid_file, "r")
-        if pf then
-            local pid_str = pf:read("*l")
-            pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: gst-play PID =", self.audio_pid)
-        end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
-    end)
-
-    return true
+    return self:_spawnTracked(cmd, gen, { name = "gst-play" })
 end
 
 function MediaEngine:_playGstPipeline(gen)
@@ -1001,27 +1036,7 @@ function MediaEngine:_playGstPipeline(gen)
     logger.warn("MediaEngine: gst-pipeline launch gen=", gen,
         "seek_offset=", self._seek_offset or 0)
 
-    -- Spawn in background and capture PID
-    local pid_file = self:_getTempDir() .. "/gst-pipe-pid-" .. gen
-    os.remove(pid_file)
-    local wrapper = string.format("sh -c 'echo $$ > %s; exec %s' &", pid_file, cmd)
-    os.execute(wrapper)
-
-    UIManager:scheduleIn(0.3, function()
-        if self.play_generation ~= gen then return end
-        local pf = io.open(pid_file, "r")
-        if pf then
-            local pid_str = pf:read("*l")
-            pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: gst-pipeline PID =", self.audio_pid)
-        end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
-    end)
-
-    return true
+    return self:_spawnTracked(cmd, gen, { name = "gst-pipe" })
 end
 
 function MediaEngine:_playAplay(gen)
@@ -1036,27 +1051,7 @@ function MediaEngine:_playAplay(gen)
     -- Set aplay start time for elapsed-time tracking
     self._aplay_start_time = UIManager:getTime()
 
-    -- Spawn in background and capture PID
-    local pid_file = self:_getTempDir() .. "/aplay-pid-" .. gen
-    os.remove(pid_file)
-    local wrapper = string.format("sh -c 'echo $$ > %s; exec %s' &", pid_file, cmd)
-    os.execute(wrapper)
-
-    UIManager:scheduleIn(0.3, function()
-        if self.play_generation ~= gen then return end
-        local pf = io.open(pid_file, "r")
-        if pf then
-            local pid_str = pf:read("*l")
-            pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: aplay PID =", self.audio_pid)
-        end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
-    end)
-
-    return true
+    return self:_spawnTracked(cmd, gen, { name = "aplay" })
 end
 
 -- ---------------------------------------------------------------------------
@@ -1137,12 +1132,16 @@ function MediaEngine:_playSystemGstLaunch(gen)
         return nil
     end
     self._system_raw_file = raw_file
+    -- What the user hears lags wall-clock position by the lead-in pad plus
+    -- the mixer ring (~0.9 s) and BT chain (~0.3 s); the sync loop
+    -- subtracts this so highlights match the audible audio.
+    self.position_latency_s = 1.7
 
     -- Sweep shm stream files orphaned by pipelines killed mid-play
     -- (pause/seek), then take audio focus before the stream attaches.
     os.execute("for f in /dev/shm/mstream*; do p=${f#/dev/shm/mstream}; p=${p%%_*};"
         .. " [ -d /proc/$p ] || rm -f \"$f\"; done 2>/dev/null")
-    os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
+    MediaEngine._takeMusicFocusOnce()
 
     local caps = string.format(
         "audio/x-raw-int,endianness=1234,signed=true,width=%d,depth=%d,rate=%d,channels=%d",
@@ -1154,27 +1153,7 @@ function MediaEngine:_playSystemGstLaunch(gen)
     logger.warn("MediaEngine: system gst-launch gen=", gen,
         "rate=", rate, "ch=", channels, "seek_offset=", self._seek_offset or 0)
 
-    local pid_file = self:_getTempDir() .. "/kindle-gst-pid-" .. gen
-    os.remove(pid_file)
-    local wrapper = string.format("sh -c 'echo $$ > %s; exec %s' >/dev/null 2>&1 &",
-        pid_file, cmd)
-    os.execute(wrapper)
-
-    UIManager:scheduleIn(0.3, function()
-        if self.play_generation ~= gen then return end
-        local pf = io.open(pid_file, "r")
-        if pf then
-            local pid_str = pf:read("*l")
-            pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: system gst-launch PID =", self.audio_pid)
-        end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
-    end)
-
-    return true
+    return self:_spawnTracked(cmd, gen, { name = "kindle-gst", quiet = true })
 end
 
 --[[--
@@ -1199,52 +1178,63 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
         return nil
     end
 
+    -- Guarantee a single audiobook pipeline: kill any still-running ffmpeg
+    -- stream before starting a new one.  PID capture is asynchronous, so a
+    -- rapid restart (seek / volume change) that lands inside that window never
+    -- tracks the freshly spawned pipeline; stop() then can't kill it and it
+    -- keeps playing -> overlapping audio.  Our ffmpeg is uniquely identifiable
+    -- by its -progress file path, so this targets only our own strays (not the
+    -- TTS keepalive, which streams /dev/zero).  killing ffmpeg closes the pipe
+    -- and its gst-launch child exits on EOS.
+    os.execute("pkill -9 -f abk-progress 2>/dev/null")
     os.execute("for f in /dev/shm/mstream*; do p=${f#/dev/shm/mstream}; p=${p%%_*};"
         .. " [ -d /proc/$p ] || rm -f \"$f\"; done 2>/dev/null")
-    os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
+    MediaEngine._takeMusicFocusOnce()
 
     local seek = self._seek_offset or 0
+
+    -- Position is read from ffmpeg's own -progress feed (out_time) instead of
+    -- wall-clock.  Because the downstream mixersink (sync=true) throttles
+    -- consumption to realtime, ffmpeg is back-pressured to realtime and its
+    -- out_time reflects exactly how far the decoded stream has been pushed --
+    -- immune to the variable spawn/decode startup delay and to CPU stalls
+    -- (if ffmpeg stalls, out_time freezes and the highlight waits instead of
+    -- creeping ahead).  See getPosition() / _readLastOutTime().
+    local progress_file = self:_getTempDir() .. "/abk-progress-" .. gen
+    os.remove(progress_file)
+    self._progress_file = progress_file
+    self._use_progress_position = true
+    -- adelay prepends 0.5 s of silence inside the decoded stream, so out_time
+    -- is 0.5 s larger than the real content time; getPosition() subtracts it.
+    self._progress_adelay_s = 0.5
+
     -- adelay=500: lead-in silence absorbing the A2DP datapath resume
     -- (which otherwise swallows the start); apad: tail silence covering
     -- the ring/BT buffers at EOS (which otherwise clip the end).
     local pipeline = string.format(
-        "%s -loglevel error -ss %.3f -i '%s' -f s16le -ar 22050 -ac 1"
-        .. " -af adelay=500,apad=pad_dur=1 - 2>/dev/null"
+        "%s -loglevel error -progress '%s' -nostats -ss %.3f -i '%s'"
+        .. " -f s16le -ar 22050 -ac 1"
+        .. " -af adelay=500%s,apad=pad_dur=1 - 2>/dev/null"
         .. " | gst-launch-0.10 fdsrc"
         .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
         .. " ! mixersink stream-type=Music sync=true",
-        ffmpeg:gsub("'", "'\\''"), seek,
-        self.current_path:gsub("'", "'\\''"))
+        ffmpeg:gsub("'", "'\\''"), progress_file:gsub("'", "'\\''"), seek,
+        self.current_path:gsub("'", "'\\''"), self:_volumeFilterPart())
+    -- out_time is the PRODUCER side: it leads what the listener hears by the
+    -- whole downstream buffer -- OS pipe (~1.5 s when full) + gst/mixersink
+    -- ring (~0.9 s) + BT chain (~0.3 s) ~= 2.7 s.  The sync loop subtracts
+    -- this so highlights match the audible audio.  Single stable constant
+    -- now (no variable startup mixed in); tune here if needed, the user's
+    -- live nudge handles any residual.
+    self.position_latency_s = 2.7
     logger.warn("MediaEngine: system gst-launch (ffmpeg stream) gen=", gen,
-        "seek_offset=", seek)
+        "seek_offset=", seek, "progress=", progress_file)
 
-    local pid_file = self:_getTempDir() .. "/kindle-gst-pid-" .. gen
-    os.remove(pid_file)
-    -- setsid makes the wrapper shell a process-group leader so that
-    -- stop()'s kill(-pid) takes down ffmpeg AND gst-launch; without it
-    -- killing the shell would orphan the pipeline and audio would keep
-    -- playing.
-    local setsid = self:commandExists("setsid") and "setsid " or ""
-    local wrapper = string.format(
-        "%ssh -c 'echo $$ > %s; %s' >/dev/null 2>&1 &",
-        setsid, pid_file, pipeline:gsub("'", "'\\''"))
-    os.execute(wrapper)
-
-    UIManager:scheduleIn(0.3, function()
-        if self.play_generation ~= gen then return end
-        local pf = io.open(pid_file, "r")
-        if pf then
-            local pid_str = pf:read("*l")
-            pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: ffmpeg-stream PID =", self.audio_pid)
-        end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
-    end)
-
-    return true
+    -- setsid: the wrapper shell becomes a process-group leader so stop()'s
+    -- kill(-pid) takes down ffmpeg AND gst-launch; without it the pipeline
+    -- would be orphaned and keep playing.  exec=false: it's a pipeline.
+    return self:_spawnTracked(pipeline, gen,
+        { name = "kindle-gst", setsid = true, exec = false, quiet = true })
 end
 
 -- ---------------------------------------------------------------------------
@@ -1524,27 +1514,7 @@ function MediaEngine:_playKindleGstPlay(gen)
     logger.warn("MediaEngine: kindle-gst-play launch gen=", gen,
         "seek_offset=", self._seek_offset or 0)
 
-    -- Spawn in background and capture PID
-    local pid_file = self:_getTempDir() .. "/kindle-gst-pid-" .. gen
-    os.remove(pid_file)
-    local wrapper = string.format("sh -c 'echo $$ > %s; exec %s' &", pid_file, cmd)
-    os.execute(wrapper)
-
-    UIManager:scheduleIn(0.3, function()
-        if self.play_generation ~= gen then return end
-        local pf = io.open(pid_file, "r")
-        if pf then
-            local pid_str = pf:read("*l")
-            pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: kindle-gst-play PID =", self.audio_pid)
-        end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
-    end)
-
-    return true
+    return self:_spawnTracked(cmd, gen, { name = "kindle-gst" })
 end
 
 function MediaEngine:_playKindleLipc(gen)
@@ -1754,10 +1724,16 @@ function MediaEngine:_startCompletionWatcher(gen)
             h:close()
         end
 
-        -- For backends without IPC, estimate completion from elapsed time
+        -- For backends without IPC, estimate completion from elapsed time.
+        -- Skip this on the ffmpeg -progress path: out_time is the producer
+        -- side and reaches the end while ~the downstream buffer is still
+        -- draining, so a position>=duration test would clip each chapter's
+        -- tail.  There, completion is driven purely by PID exit above (the
+        -- wrapper shell lives until gst-launch finishes actual playout).
         if (self.backend == self.BACKENDS.APLAY or self.backend == self.BACKENDS.WAV_PLAY
             or self.backend == self.BACKENDS.GST_PLAY or self.backend == self.BACKENDS.GST_PIPELINE
             or self.backend == self.BACKENDS.KINDLE_GST_PLAY)
+            and not self._use_progress_position
             and self._play_start_time and self.current_duration then
             local pos = self:getPosition()
             if pos >= self.current_duration then
@@ -1810,7 +1786,11 @@ function MediaEngine:pause()
             end
         end
     elseif self.audio_pid and ffi.C.kill then
-        ffi.C.kill(self.audio_pid, 19) -- SIGSTOP
+        -- Signal the whole process group: for the ffmpeg|gst-launch
+        -- pipeline audio_pid is a setsid'd wrapper shell, and stopping
+        -- only the shell leaves both pipeline halves playing.
+        ffi.C.kill(-self.audio_pid, 19) -- SIGSTOP group
+        ffi.C.kill(self.audio_pid, 19)  -- SIGSTOP pid (non-leader case)
     end
 end
 
@@ -1852,12 +1832,14 @@ function MediaEngine:resume()
         or self.backend == self.BACKENDS.KINDLE_GST_PLAY then
         -- After a paused seek the process was killed; restart it.
         if self.audio_pid and ffi.C.kill then
-            ffi.C.kill(self.audio_pid, 18) -- SIGCONT
+            ffi.C.kill(-self.audio_pid, 18) -- SIGCONT group
+        ffi.C.kill(self.audio_pid, 18)  -- SIGCONT pid
         else
             self:play(self._on_complete, self._on_fail)
         end
     elseif self.audio_pid and ffi.C.kill then
-        ffi.C.kill(self.audio_pid, 18) -- SIGCONT
+        ffi.C.kill(-self.audio_pid, 18) -- SIGCONT group
+        ffi.C.kill(self.audio_pid, 18)  -- SIGCONT pid
     end
 end
 
@@ -1901,6 +1883,14 @@ function MediaEngine:stop()
         os.remove(self._system_raw_file)
         self._system_raw_file = nil
     end
+
+    -- Remove the ffmpeg -progress feed and disable progress-based position
+    -- tracking; the next play() re-enables it if it takes that path.
+    if self._progress_file then
+        os.remove(self._progress_file)
+        self._progress_file = nil
+    end
+    self._use_progress_position = false
 
     -- For mplayer, also send quit command
     if self.backend == self.BACKENDS.MPLAYER and self._ipc_file then
@@ -2039,10 +2029,14 @@ function MediaEngine:seek(seconds, mode)
         self._play_start_time = UIManager:getTime()
         self._total_pause_ms = 0
         self._pause_start_time = nil
-        -- Capture generation before stop() increments it, so we can cancel the
-        -- scheduled restart if the user stops playback before it fires.
-        local restart_gen = self.play_generation
         self:stop()
+        -- Capture the generation AFTER stop() (stop bumps it).  The scheduled
+        -- restart fires unless something else supersedes it in the 0.5 s gap
+        -- (another seek/stop/play, which bumps the generation again).  NOTE:
+        -- capturing before stop() made this guard always true -> the restart
+        -- was always cancelled, so seeks (and volume changes, which seek to
+        -- re-apply the gain) silently killed playback.
+        local restart_gen = self.play_generation
         -- Only restart playback if we were actually playing before the seek.
         -- When paused, restore the paused state so resume() can restart us.
         if was_playing then
@@ -2079,8 +2073,9 @@ function MediaEngine:seek(seconds, mode)
         self._play_start_time = UIManager:getTime()
         self._total_pause_ms = 0
         self._pause_start_time = nil
-        local lipc_restart_gen = self.play_generation
         self:stop()
+        -- Capture generation AFTER stop() (see the GST branch above for why).
+        local lipc_restart_gen = self.play_generation
         -- Restart playback at new position
         if was_playing then
             UIManager:scheduleIn(0.5, function()
@@ -2108,6 +2103,31 @@ end
 -- Position / Duration queries
 -- ---------------------------------------------------------------------------
 
+--- Read the latest out_time from ffmpeg's -progress feed (see
+--- _playSystemGstLaunchFfmpeg).  Tails the file so it stays cheap even for a
+--- multi-hour book.  Returns seconds into the decoded stream, or nil if the
+--- feed has not produced a numeric timestamp yet.
+function MediaEngine:_readLastOutTime()
+    local path = self._progress_file
+    if not path then return nil end
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local size = f:seek("end")
+    if not size or size == 0 then f:close(); return nil end
+    local back = (size > 4096) and 4096 or size
+    f:seek("set", size - back)
+    local tail = f:read("*a") or ""
+    f:close()
+    -- ffmpeg emits "out_time=HH:MM:SS.ffffff" per progress block (and
+    -- "out_time=N/A" before the first frame, which the numeric pattern skips).
+    -- Take the LAST match.
+    local last
+    for h, m, s in tail:gmatch("out_time=(%d+):(%d+):([%d%.]+)") do
+        last = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+    end
+    return last
+end
+
 function MediaEngine:getPosition()
     -- During a seek gap (after stop, before play restarts), return the seek
     -- offset so the UI doesn't flicker back to zero.
@@ -2116,6 +2136,30 @@ function MediaEngine:getPosition()
             return self._seek_offset
         end
         return 0
+    end
+
+    -- ffmpeg -progress backed position (EPUB read-along path): anchored to the
+    -- actual decoded-stream progress rather than wall-clock, so startup jitter
+    -- and stalls don't leak into the highlight.
+    if self._use_progress_position then
+        local ot = self:_readLastOutTime()
+        if ot then
+            return (self._seek_offset or 0)
+                + math.max(0, ot - (self._progress_adelay_s or 0))
+        end
+        -- No numeric out_time yet.  Hold at seek_offset during the brief
+        -- intro/startup (mirrors the iPad sitting on the first line until
+        -- narration begins).  If ffmpeg never produces a feed (e.g. a build
+        -- without -progress), fall through to the wall-clock estimate after a
+        -- grace period so the UI never freezes permanently.
+        local ok, elapsed_ms = pcall(function()
+            return time.to_ms(UIManager:getTime()
+                - (self._play_start_time or UIManager:getTime()))
+        end)
+        if not (ok and elapsed_ms and elapsed_ms > 3000) then
+            return self._seek_offset or 0
+        end
+        -- else: fall through to wall-clock below
     end
 
     -- For backends without IPC (gst-play, aplay, ffmpeg-pipe), estimate from elapsed time.
@@ -2232,6 +2276,61 @@ end
 
 function MediaEngine:getSpeed()
     return self._playback_speed or 1.0
+end
+
+-- ---------------------------------------------------------------------------
+-- Playback volume (digital gain)
+-- ---------------------------------------------------------------------------
+
+--- Comma-prefixed ffmpeg `volume` filter fragment, or "" at unity gain.
+-- Meant to be spliced into an existing -af / -filter:a chain.
+function MediaEngine:_volumeFilterPart()
+    local v = self._volume or 1.0
+    if math.abs(v - 1.0) < 0.001 then return "" end
+    return string.format(",volume=%.3f", v)
+end
+
+--- Set playback volume as a percentage (0..100).
+-- mpv/mplayer adjust live; the pipeline backends (ffmpeg/gst/kindle) restart
+-- at the current position so the new gain takes effect, mirroring how speed
+-- changes are handled.  Called before play() it just records the level, so the
+-- initial spawn already carries it (no restart).
+function MediaEngine:setVolume(pct)
+    pct = tonumber(pct) or 100
+    if pct < 0 then pct = 0 end
+    if pct > 100 then pct = 100 end
+    local v = pct / 100
+    if math.abs(v - (self._volume or 1.0)) < 0.001 then return end
+    self._volume = v
+
+    if not self.is_playing then return end
+
+    if self.backend == self.BACKENDS.MPV then
+        if self:_hasLuaSocket() and self._socket_path then
+            self:_mpvSendIpc({command = {"set_property", "volume", pct}})
+        elseif self._fifo_path then
+            self:_mpvSendFifo(string.format("set volume %d", pct))
+        end
+    elseif self.backend == self.BACKENDS.MPLAYER then
+        if self._ipc_file then
+            local f = io.open(self._ipc_file, "w")
+            if f then f:write(string.format("volume %d 1\n", pct)); f:close() end
+        end
+    else
+        -- ffmpeg-pipe / gst / kindle: the gain is baked into the decode
+        -- pipeline, so restart to apply it.  Restart at the AUDIBLE position:
+        -- getPosition() is the producer/decode position, which leads the
+        -- listener by position_latency_s, so seeking to the raw value would
+        -- skip the audio still in flight (~2.7 s jump forward every change).
+        if not self.is_paused then
+            local pos = (self:getPosition() or 0) - (self.position_latency_s or 0)
+            self:seek(math.max(0, pos), "absolute")
+        end
+    end
+end
+
+function MediaEngine:getVolume()
+    return math.floor((self._volume or 1.0) * 100 + 0.5)
 end
 
 -- ---------------------------------------------------------------------------

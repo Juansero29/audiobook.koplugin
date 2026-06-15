@@ -42,6 +42,18 @@ function Audiobook:init()
         InfoMessage = require("ui/widget/infomessage")
         T = require("ffi/util").template
 
+        -- Kill audio pipelines orphaned by a previous KOReader instance.
+        -- Playback (and the A2DP keepalive, which is infinite) runs as
+        -- detached background processes: if KOReader is killed or crashes
+        -- they keep playing, and the next session's audio mixes on top.
+        -- The patterns are specific to this plugin's pipelines.
+        if Device:isKindle() then
+            -- [c]/[f] character classes keep the pattern from matching the
+            -- pkill wrapper shell's own cmdline.
+            os.execute("pkill -f 'mixersink stream-type=Musi[c]' 2>/dev/null")
+            os.execute("pkill -f 'audiobook.koplugin/bin/[f]fmpeg' 2>/dev/null")
+        end
+
         -- Resolve plugin directory from self.path (set by KOReader's plugin
         -- loader) with a debug.getinfo fallback for dev/testing.
         local _utils_dir = self.path and (self.path .. "/")
@@ -342,6 +354,33 @@ function Audiobook:addToMainMenu(menu_items)
                 callback = function()
                     self:startMediaPlayback()
                 end,
+            },
+            {
+                text_func = function()
+                    local off = self:getSetting("smil_sync_offset_ms", 0)
+                    return T(_("Overlay sync offset: %1 s"), string.format("%+.1f", off / 1000))
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local cur = self:getSetting("smil_sync_offset_ms", 0)
+                    UIManager:show(SpinWidget:new{
+                        title_text = _("Overlay sync offset"),
+                        info_text = _("Positive values delay the highlight (use when the highlight runs ahead of the narration); negative values advance it."),
+                        value = cur / 1000,
+                        value_min = -60,
+                        value_max = 60,
+                        value_step = 0.5,
+                        value_hold_step = 5,
+                        precision = "%.1f",
+                        ok_text = _("Set"),
+                        callback = function(spin)
+                            self:setSetting("smil_sync_offset_ms", math.floor(spin.value * 1000))
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    })
+                end,
+                help_text = _("Shifts EPUB Media Overlay sentence highlighting relative to the audio. Some audiobooks (e.g. with publisher intros) have timing tables offset from the embedded audio."),
             },
             {
                 text = _("Open audiobook..."),
@@ -719,6 +758,7 @@ end
 
 function Audiobook:startReadAlong(text, start_pos)
     if not self._init_ok then self:_showInitError(); return end
+    if not self:_audioOutputReady() then return end
     local page_text = text or self:getCurrentPageText()
     if not page_text or page_text == "" then
         UIManager:show(InfoMessage:new{
@@ -848,11 +888,38 @@ function Audiobook:_hasMediaOverlays()
     return false
 end
 
+--- On Kindle there is no speaker/ALSA: audio only plays over Bluetooth A2DP.
+--- Returns true if playback can proceed; otherwise prompts and returns false.
+--- Non-Kindle devices always pass (their audio paths differ).
+function Audiobook:_audioOutputReady()
+    if not (Device.isKindle and Device:isKindle()) then return true end
+    local connected = false
+    local h = io.popen("lipc-get-prop com.lab126.audiomgrd audioOutputConnected 2>/dev/null")
+    if h then
+        local out = h:read("*a") or ""
+        h:close()
+        connected = tonumber(out:match("(%d+)")) == 1
+    end
+    if not connected then
+        -- Nudge the Kindle BT stack to (re)connect the last-used device
+        -- (KinAMP trick), then ask the user to retry once it is up.
+        os.execute("lipc-set-prop com.lab126.btfd ensureBTconnection 1 2>/dev/null")
+        os.execute("lipc-set-prop com.lab126.btfd BTenable '1:1' 2>/dev/null")
+        UIManager:show(InfoMessage:new{
+            text = _("No Bluetooth audio device connected.\n\nReconnecting your headphones\226\128\166 once connected, try again."),
+            timeout = 5,
+        })
+        return false
+    end
+    return true
+end
+
 function Audiobook:startMediaPlayback()
     if not self._init_ok or not self.media_sync then
         self:_showInitError()
         return
     end
+    if not self:_audioOutputReady() then return end
 
     local doc_path = self.ui and self.ui.document and (self.ui.document.file_path or self.ui.document.file)
     if not doc_path then
@@ -917,29 +984,23 @@ function Audiobook:_startSmilPlayback(doc_path)
         return
     end
 
-    -- Build chapter list from timing_data if no separate chapters
-    local chapters = {}
-    if timing_data[1] and timing_data[1].audio_path then
-        local ext = timing_data[1].audio_path:match("%.([^.]+)$") or ""
-        if ext:lower() == "m4b" then
-            local ok_m4b, M4bParser = pcall(dofile, PLUGIN_PATH .. "m4bparser.lua")
-            if ok_m4b and M4bParser then
-                local m4b = M4bParser:new()
-                chapters = m4b:parse(timing_data[1].audio_path)
-            end
-        end
-    end
-
-    -- Find the first audio file with a real path
-    local audio_path = nil
+    -- Group timing entries by audio file, preserving narrative order.
+    -- Clip times restart at zero for every audio file, so each file plays
+    -- with its own timing slice; the playlist mechanism chains the files
+    -- and _playAudioFile installs the matching slice on every switch.
+    local files, by_file = {}, {}
     for _, entry in ipairs(timing_data) do
-        if entry.audio_path then
-            audio_path = entry.audio_path
-            break
+        local p = entry.audio_path
+        if p then
+            if not by_file[p] then
+                by_file[p] = { timing = {}, chapters = {} }
+                table.insert(files, p)
+            end
+            table.insert(by_file[p].timing, entry)
         end
     end
 
-    if not audio_path then
+    if #files == 0 then
         UIManager:show(InfoMessage:new{
             text = _("Could not extract audio from EPUB."),
             timeout = 3,
@@ -947,7 +1008,77 @@ function Audiobook:_startSmilPlayback(doc_path)
         return
     end
 
-    self.media_sync:start(audio_path, timing_data, chapters)
+    -- Chapters: a boundary wherever the source content document changes,
+    -- titled from the NCX when available.
+    local titles = parser._chapter_titles or {}
+    for _, p in ipairs(files) do
+        local slot = by_file[p]
+        local last_doc = nil
+        for _, e in ipairs(slot.timing) do
+            if e.text_doc and e.text_doc ~= last_doc then
+                last_doc = e.text_doc
+                local base = e.text_doc:match("([^/]+)$") or e.text_doc
+                table.insert(slot.chapters, {
+                    title = titles[base] or base,
+                    start_time = e.start_time,
+                })
+            end
+        end
+    end
+
+    local playlist = {}
+    for _, p in ipairs(files) do
+        local slot = by_file[p]
+        local nm = (slot.chapters[1] and slot.chapters[1].title)
+            or p:match("([^/]+)$") or p
+        table.insert(playlist, { name = nm, path = p })
+    end
+
+    -- Start from the reader's current position: map the current crengine
+    -- DocFragment index through the spine to a content document, then to
+    -- that document's first timing entry (scanning forward past front
+    -- matter that has no narration).
+    local start_file, start_time
+    local cur_xp = self.ui and self.ui.document
+        and self.ui.document:getXPointer()
+    local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+    local spine = parser._spine_hrefs or {}
+    if frag_idx and spine[frag_idx] then
+        for si = frag_idx, #spine do
+            local base = spine[si]
+            for _, e in ipairs(timing_data) do
+                if e.audio_path and e.text_doc
+                    and (e.text_doc:match("([^/]+)$") == base) then
+                    start_file, start_time = e.audio_path, e.start_time
+                    break
+                end
+            end
+            if start_file then break end
+        end
+    end
+    logger.warn("Audiobook: SMIL start-position cur_xp=", tostring(cur_xp),
+        "frag_idx=", frag_idx, "#spine=", #spine,
+        "start_file=", start_file and start_file:match("([^/]+)$") or "nil",
+        "start_time=", start_time)
+
+    pcall(function()
+        if self:getSetting("bt_media_control", true) and BtMediaControl then
+            BtMediaControl.start(self)
+        end
+    end)
+
+    self._smil_by_file = by_file
+    local first = start_file or files[1]
+    local started = self.media_sync:start(first, by_file[first].timing,
+        by_file[first].chapters, nil, playlist, first)
+    if started and start_time and start_time > 1 then
+        local ms = self.media_sync
+        UIManager:scheduleIn(1.5, function()
+            if ms.state == "playing" then
+                ms:seekToTime(start_time)
+            end
+        end)
+    end
 end
 
 function Audiobook:_findMatchingAudiobook(doc_path)
@@ -973,6 +1104,7 @@ function Audiobook:openAudioFile()
         self:_showInitError()
         return
     end
+    if not self:_audioOutputReady() then return end
     local PathChooser = require("ui/widget/pathchooser")
     local home_dir = require("datastorage").getDataDir() or "/mnt"
     UIManager:show(PathChooser:new{
@@ -993,6 +1125,7 @@ function Audiobook:openMusicPlaylist()
         self:_showInitError()
         return
     end
+    if not self:_audioOutputReady() then return end
     local PathChooser = require("ui/widget/pathchooser")
     local home_dir = require("datastorage").getDataDir() or "/mnt"
     UIManager:show(PathChooser:new{
@@ -1045,6 +1178,21 @@ end
 
 function Audiobook:_playAudioFile(file_path, playlist_files)
     if not file_path or not self.media_sync then return end
+
+    -- EPUB Media Overlay playlist transition: install this file's timing
+    -- slice and chapters directly, skipping the resume prompt so chained
+    -- chapter files flow without interruption.
+    if self._smil_by_file and self._smil_by_file[file_path] then
+        local slot = self._smil_by_file[file_path]
+        self.media_sync:start(file_path, slot.timing, slot.chapters, nil,
+            playlist_files or self.media_sync.playlist_files, file_path)
+        pcall(function()
+            if self:getSetting("bt_media_control", true) and BtMediaControl then
+                BtMediaControl.start(self)
+            end
+        end)
+        return
+    end
 
     -- Check for saved position and prompt to resume
     local saved_pos, saved_time = self:_getSavedPosition(file_path)

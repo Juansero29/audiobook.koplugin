@@ -79,6 +79,9 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     self.timing_data = timing_data
     self.chapters = chapters or {}
     self.cover_path = cover_path
+    -- EPUB Media Overlay entries carry SMIL fragment ids; their presence
+    -- switches the UI into read-along mode (minimized player, page-follow).
+    self.overlay_mode = (timing_data[1] and timing_data[1].fragment_id) and true or false
 
     -- Detect same-playlist BEFORE overwriting self.playlist_files,
     -- otherwise same_playlist is always true on first load and
@@ -142,6 +145,14 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
                 self._chapter_menu.item_table.current = self.current_playlist_idx
                 self._chapter_menu:updateItems()
             end
+        end)
+    end
+
+    -- Apply the persisted volume BEFORE play() so the initial decode spawn
+    -- already carries the gain (setVolume is a no-op restart when not playing).
+    if self.plugin and self.plugin.getSetting then
+        pcall(function()
+            self.media_engine:setVolume(self.plugin:getSetting("media_volume_pct", 100))
         end)
     end
 
@@ -228,6 +239,14 @@ function MediaSync:resume(auto)
     if self.playback_bar then
         pcall(function() self.playback_bar:setPlaying(true) end)
     end
+    -- The sync loop self-terminates while paused: its tick bails out without
+    -- rescheduling once state != PLAYING.  Restart it (and the position
+    -- poller, for symmetry) so the highlight tracks the audio again instead of
+    -- staying frozen at the pause point -- otherwise it looks badly desynced
+    -- after every resume.  Reading getPosition() (ffmpeg out_time) re-snaps
+    -- the highlight to where the audio actually is.
+    self:_startSyncLoop(self._chain_generation)
+    self:_startPositionPoller(self._chain_generation)
     logger.dbg("MediaSync: resumed", auto and "(auto)" or "")
 end
 
@@ -246,6 +265,26 @@ function MediaSync:setSpeed(speed)
     if self.playback_bar then
         pcall(function() self.playback_bar:updateSpeed(speed) end)
     end
+end
+
+function MediaSync:setVolume(pct)
+    if self.media_engine then
+        pcall(function() self.media_engine:setVolume(pct) end)
+    end
+    -- Persist so the level carries across tracks and sessions.
+    if self.plugin and self.plugin.setSetting then
+        self.plugin:setSetting("media_volume_pct", pct)
+    end
+    if self.playback_bar then
+        pcall(function() self.playback_bar:updateVolume(pct) end)
+    end
+end
+
+function MediaSync:getVolume()
+    if self.plugin and self.plugin.getSetting then
+        return self.plugin:getSetting("media_volume_pct", 100)
+    end
+    return self.media_engine and self.media_engine:getVolume() or 100
 end
 
 -- ---------------------------------------------------------------------------
@@ -439,6 +478,12 @@ end
 -- ---------------------------------------------------------------------------
 
 function MediaSync:_startSyncLoop(gen)
+    -- Idempotent: drop any existing timer so resume() can safely restart us
+    -- without leaving two ticks running.
+    if self._sync_timer then
+        UIManager:unschedule(self._sync_timer)
+        self._sync_timer = nil
+    end
     local function tick()
         if self._chain_generation ~= gen or self.state ~= self.STATE.PLAYING then
             return
@@ -451,7 +496,14 @@ function MediaSync:_startSyncLoop(gen)
             return
         end
 
-        self:_updateHighlightAtTime(pos)
+        -- Compensate for audio in flight (pads + mixer ring + BT chain):
+        -- the listener hears position pos - latency.
+        local lat = (self.media_engine and self.media_engine.position_latency_s) or 0
+        local off = 0
+        if self.plugin and self.plugin.getSetting then
+            off = (self.plugin:getSetting("smil_sync_offset_ms", 0) or 0) / 1000
+        end
+        self:_updateHighlightAtTime(math.max(0, pos - lat - off))
 
         -- Check for sentence/chapter boundary advancement
         self:_checkAutoAdvance(pos)
@@ -476,6 +528,27 @@ function MediaSync:_updateHighlightAtTime(pos)
     if sent_idx ~= self._current_sentence_idx then
         self._current_sentence_idx = sent_idx
         self._current_word_idx = 1
+        -- EPUB Media Overlay: keep the book view following the narration.
+        -- The SMIL fragment id resolves as a "#id" xpointer in crengine;
+        -- turn the page before highlighting so the text-matching
+        -- highlighter can find the sentence on the visible page.
+        if sentence.fragment_id then
+            local ui = self.plugin and self.plugin.ui
+            if ui and ui.rolling and ui.document then
+                pcall(function()
+                    local xp = "#" .. sentence.fragment_id
+                    local target = ui.document:getPageFromXPointer(xp)
+                    local cur = ui.document:getCurrentPage()
+                    logger.dbg("MediaSync: page-follow", xp, "->", target, "cur", cur)
+                    -- target == 1 is almost always a failed "#id" lookup
+                    -- (crengine falls back to the start of the book, i.e.
+                    -- the cover) -- never auto-turn there.
+                    if target and target > 1 and target ~= cur then
+                        ui.rolling:onGotoXPointer(xp)
+                    end
+                end)
+            end
+        end
         if self.highlight_manager and sentence.text then
             -- Build a synthetic sentence object for HighlightManager
             local sent_obj = {
@@ -483,9 +556,26 @@ function MediaSync:_updateHighlightAtTime(pos)
                 start_pos = sentence.start_pos or 0,
                 end_pos = sentence.end_pos or #sentence.text,
             }
+            local hl_ok = false
             pcall(function()
-                self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                hl_ok = self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
             end)
+            -- Read-along page advancement: narration flows forward, so when
+            -- the next sequential sentence is not on the visible page it is
+            -- on the following one -- turn and retry once.  Only for
+            -- sequential advancement (not seeks), so a failed text match
+            -- can never page away from where the user is reading.
+            if not hl_ok and self.overlay_mode
+                and sent_idx == (self._last_hl_idx or 0) + 1 then
+                local ui = self.plugin and self.plugin.ui
+                if ui then
+                    pcall(function()
+                        ui:handleEvent(Event:new("GotoViewRel", 1))
+                        self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                    end)
+                end
+            end
+            self._last_hl_idx = sent_idx
         end
     end
 
@@ -586,6 +676,12 @@ end
 -- ---------------------------------------------------------------------------
 
 function MediaSync:_startPositionPoller(gen)
+    -- Idempotent: the poller keeps running while paused, so guard against a
+    -- second concurrent loop when resume() restarts it.
+    if self._position_timer then
+        UIManager:unschedule(self._position_timer)
+        self._position_timer = nil
+    end
     local function poll()
         if self._chain_generation ~= gen then return end
         if self.state ~= self.STATE.PLAYING and self.state ~= self.STATE.PAUSED then
@@ -714,10 +810,22 @@ function MediaSync:showPlaybackBar()
         title = title,
         output_name = output_name,
         cover_image_path = self.cover_path,
+        -- Read-along (EPUB overlay) mode: start minimized so the book page
+        -- stays visible; highlighting and page-follow are the primary UI.
+        start_minimized = self.overlay_mode or nil,
+        on_sync_nudge = self.overlay_mode and function(delta_ms)
+            local p = self.plugin
+            if not (p and p.getSetting) then return nil end
+            local v = (p:getSetting("smil_sync_offset_ms", 0) or 0) + delta_ms
+            p:setSetting("smil_sync_offset_ms", v)
+            return v
+        end or nil,
         show_shuffle = self.playlist_files and #self.playlist_files > 0,
         shuffle_active = self.is_shuffled,
         show_loop = self.playlist_files and #self.playlist_files > 0,
         loop_active = self.loop_enabled,
+        volume_pct = self:getVolume(),
+        on_volume = function(pct) self:setVolume(pct) end,
         ui_widget = self.plugin and self.plugin.ui,
         on_play_pause = function()
             if self.state == self.STATE.PLAYING then
@@ -785,6 +893,86 @@ function MediaSync:hidePlaybackBar()
     end
 end
 
+--- Close the modal chapter/playlist menu and clear its references.
+function MediaSync:_closeModalMenu()
+    local window = self._chapter_menu_window
+    self._chapter_menu = nil
+    self._chapter_menu_window = nil
+    if window then
+        pcall(function() UIManager:close(window) end)
+    end
+end
+
+--[[--
+Show a modal list menu centered over the reader, with a full-screen wrapper
+that closes the menu when the user taps/swipes outside it (and swallows
+hold/pan outside so they don't fall through to the page underneath).  Shared
+by showChapterList() and showPlaylist().
+
+@param opts table  { title = string, items = item_table, current = number }
+  Each item's `callback` decides whether to close the menu (call
+  self:_closeModalMenu()) -- chapters close on select, the playlist stays open.
+--]]
+function MediaSync:_showModalMenu(opts)
+    local Menu = require("ui/widget/menu")
+    local CenterContainer = require("ui/widget/container/centercontainer")
+    local InputContainer = require("ui/widget/container/inputcontainer")
+
+    local menu_w = Screen:getWidth() * 0.8
+    local menu_h = Screen:getHeight() * 0.7
+
+    local items = opts.items
+    items.current = opts.current or 1
+
+    local menu = Menu:new{
+        title = opts.title,
+        item_table = items,
+        width = menu_w,
+        height = menu_h,
+    }
+    self._chapter_menu = menu
+
+    local window = InputContainer:new{
+        dimen = Screen:getSize(),
+        CenterContainer:new{
+            dimen = Screen:getSize(),
+            menu,
+        },
+    }
+    self._chapter_menu_window = window
+
+    local menu_rect = Geom:new{
+        x = math.floor((Screen:getWidth() - menu_w) / 2),
+        y = math.floor((Screen:getHeight() - menu_h) / 2),
+        w = menu_w,
+        h = menu_h,
+    }
+
+    local ms = self
+    local function outside(ges_ev)
+        return ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect)
+    end
+    function window:onTap(arg, ges_ev)
+        if outside(ges_ev) then ms:_closeModalMenu(); return true end
+        return false
+    end
+    function window:onSwipe(arg, ges_ev)
+        if outside(ges_ev) then ms:_closeModalMenu(); return true end
+        return false
+    end
+    function window:onHold(arg, ges_ev)
+        return outside(ges_ev) and true or false
+    end
+    function window:onPan(arg, ges_ev)
+        return outside(ges_ev) and true or false
+    end
+
+    menu.close_callback = function() ms:_closeModalMenu() end
+
+    UIManager:show(window)
+    return menu
+end
+
 function MediaSync:showChapterList()
     if self.playlist_files and #self.playlist_files > 0 then
         self:showPlaylist()
@@ -797,195 +985,42 @@ function MediaSync:showChapterList()
         })
         return
     end
-    local Menu = require("ui/widget/menu")
-    local CenterContainer = require("ui/widget/container/centercontainer")
-    local InputContainer = require("ui/widget/container/inputcontainer")
 
-    -- Determine which chapter is currently playing
-    local current_chapter, current_idx = self:getCurrentChapter()
-
-    -- Build menu items first so callbacks can reference the wrapper
-    local menu_items = {}
+    local _, current_idx = self:getCurrentChapter()
+    local items = {}
     for i, ch in ipairs(self.chapters) do
-        table.insert(menu_items, {
-            text = (ch.title or _("Chapter") .. " " .. i) .. "  (" .. self:_formatTime(ch.start_time) .. ")",
+        table.insert(items, {
+            text = (ch.title or _("Chapter") .. " " .. i)
+                .. "  (" .. self:_formatTime(ch.start_time) .. ")",
             callback = function()
-                self._chapter_menu = nil
-                UIManager:close(chapter_window)
+                self:_closeModalMenu()
                 self:seekToChapter(i)
             end,
         })
     end
-    -- Highlight the current chapter in bold
-    menu_items.current = current_idx or 1
-
-    local menu = Menu:new{
-        title = _("Chapters"),
-        item_table = menu_items,
-        width = Screen:getWidth() * 0.8,
-        height = Screen:getHeight() * 0.7,
-    }
-    self._chapter_menu = menu
-
-    local centered = CenterContainer:new{
-        dimen = Screen:getSize(),
-        menu,
-    }
-
-    -- Full-screen wrapper that catches taps outside the menu
-    local chapter_window = InputContainer:new{
-        dimen = Screen:getSize(),
-        centered,
-    }
-    self._chapter_menu_window = chapter_window
-
-    -- Calculate menu's on-screen rectangle for tap-outside detection
-    local menu_w = Screen:getWidth() * 0.8
-    local menu_h = Screen:getHeight() * 0.7
-    local menu_rect = Geom:new{
-        x = math.floor((Screen:getWidth() - menu_w) / 2),
-        y = math.floor((Screen:getHeight() - menu_h) / 2),
-        w = menu_w,
-        h = menu_h,
-    }
-
-    -- Back-reference so onTap can clear MediaSync._chapter_menu
-    chapter_window._mediasync = self
-    local function _closeChapterWindow(wrapper)
-        if wrapper._mediasync then
-            wrapper._mediasync._chapter_menu = nil
-            wrapper._mediasync._chapter_menu_window = nil
-        end
-        UIManager:close(wrapper)
-    end
-    function chapter_window:onTap(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            _closeChapterWindow(self)
-            return true
-        end
-        return false
-    end
-    function chapter_window:onSwipe(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            _closeChapterWindow(self)
-            return true
-        end
-        return false
-    end
-    function chapter_window:onHold(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            return true
-        end
-        return false
-    end
-    function chapter_window:onPan(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            return true
-        end
-        return false
-    end
-
-    -- Wire the Menu's X button to close the wrapper and clear the reference
-    menu.close_callback = function()
-        self._chapter_menu = nil
-        self._chapter_menu_window = nil
-        UIManager:close(chapter_window)
-    end
-
-    UIManager:show(chapter_window)
+    self:_showModalMenu{ title = _("Chapters"), items = items, current = current_idx }
 end
 
 function MediaSync:showPlaylist()
     if not self.playlist_files or #self.playlist_files == 0 then
         return
     end
-    local Menu = require("ui/widget/menu")
-    local CenterContainer = require("ui/widget/container/centercontainer")
-    local InputContainer = require("ui/widget/container/inputcontainer")
 
-    local menu_items = {}
+    local items = {}
     for i, f in ipairs(self.playlist_files) do
-        table.insert(menu_items, {
+        table.insert(items, {
             text = f.name,
             callback = function()
-                -- Keep playlist window open when switching tracks
+                -- Keep the playlist open when switching tracks.
                 self:switchToPlaylistFile(i)
             end,
         })
     end
-    menu_items.current = self.current_playlist_idx or 1
-
-    local menu = Menu:new{
+    self:_showModalMenu{
         title = _("Playlist"),
-        item_table = menu_items,
-        width = Screen:getWidth() * 0.8,
-        height = Screen:getHeight() * 0.7,
+        items = items,
+        current = self.current_playlist_idx or 1,
     }
-    self._chapter_menu = menu
-
-    local centered = CenterContainer:new{
-        dimen = Screen:getSize(),
-        menu,
-    }
-
-    local playlist_window = InputContainer:new{
-        dimen = Screen:getSize(),
-        centered,
-    }
-    self._chapter_menu_window = playlist_window
-
-    local menu_w = Screen:getWidth() * 0.8
-    local menu_h = Screen:getHeight() * 0.7
-    local menu_rect = Geom:new{
-        x = math.floor((Screen:getWidth() - menu_w) / 2),
-        y = math.floor((Screen:getHeight() - menu_h) / 2),
-        w = menu_w,
-        h = menu_h,
-    }
-
-    -- Back-reference so onTap can clear MediaSync._chapter_menu
-    playlist_window._mediasync = self
-    local function _closePlaylistWindow(wrapper)
-        if wrapper._mediasync then
-            wrapper._mediasync._chapter_menu = nil
-            wrapper._mediasync._chapter_menu_window = nil
-        end
-        UIManager:close(wrapper)
-    end
-    function playlist_window:onTap(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            _closePlaylistWindow(self)
-            return true
-        end
-        return false
-    end
-    function playlist_window:onSwipe(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            _closePlaylistWindow(self)
-            return true
-        end
-        return false
-    end
-    function playlist_window:onHold(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            return true
-        end
-        return false
-    end
-    function playlist_window:onPan(arg, ges_ev)
-        if ges_ev and ges_ev.pos and ges_ev.pos:notIntersectWith(menu_rect) then
-            return true
-        end
-        return false
-    end
-
-    menu.close_callback = function()
-        self._chapter_menu = nil
-        self._chapter_menu_window = nil
-        UIManager:close(playlist_window)
-    end
-
-    UIManager:show(playlist_window)
 end
 
 -- ---------------------------------------------------------------------------
