@@ -70,6 +70,9 @@ local AudiobookPlayer = InputContainer:extend{
     on_loop = nil,
     show_loop = false,
     loop_active = false,
+    -- Digital playback volume (0..100); on_volume(pct) applies it.
+    on_volume = nil,
+    volume_pct = 100,
     -- Reference to the underlying ReaderUI or FileManager widget for event
     -- forwarding when minimized (since UIManager only dispatches to the top
     -- widget, we must manually forward events to the UI below).
@@ -370,6 +373,43 @@ function AudiobookPlayer:setupUI()
         HorizontalSpan:new{ width = spacing },
     }
 
+    -- ── Volume row: [−]  ♪ NN%  [+] ──
+    self.volume_widget = TextWidget:new{
+        text = self:_volumeText(),
+        face = Font:getFace("cfont", 16),
+    }
+    self.vol_minus_button = Button:new{
+        text = "−",
+        width = button_size,
+        height = button_size,
+        text_font_size = 24,
+        callback = function() self:_applyVolume(-10) end,
+        bordersize = Size.border.thin,
+        radius = Screen:scaleBySize(6),
+        show_parent = self,
+    }
+    self.vol_plus_button = Button:new{
+        text = "+",
+        width = button_size,
+        height = button_size,
+        text_font_size = 24,
+        callback = function() self:_applyVolume(10) end,
+        bordersize = Size.border.thin,
+        radius = Screen:scaleBySize(6),
+        show_parent = self,
+    }
+    local volume_row = HorizontalGroup:new{
+        align = "center",
+        self.vol_minus_button,
+        HorizontalSpan:new{ width = spacing * 2 },
+        CenterContainer:new{
+            dimen = Geom:new{ w = button_size * 2, h = button_size },
+            self.volume_widget,
+        },
+        HorizontalSpan:new{ width = spacing * 2 },
+        self.vol_plus_button,
+    }
+
     -- ── Assemble full layout ──
     local content = VerticalGroup:new{
         align = "center",
@@ -404,6 +444,11 @@ function AudiobookPlayer:setupUI()
         CenterContainer:new{
             dimen = Geom:new{ w = self.width, h = button_size },
             control_row,
+        },
+        VerticalSpan:new{ width = self.height * 0.02 },
+        CenterContainer:new{
+            dimen = Geom:new{ w = self.width, h = button_size },
+            volume_row,
         },
         VerticalSpan:new{ width = Size.padding.small },
     }
@@ -467,15 +512,97 @@ function AudiobookPlayer:setupUI()
         self._mini_time,
     }
 
+    -- Read-along: live sync-offset nudge buttons.  The sync loop reads the
+    -- setting every tick, so each press shifts the highlight immediately;
+    -- the new value flashes in the mini time display until the next
+    -- regular time update overwrites it.
+    local nudge_group = {}
+    if self.on_sync_nudge then
+        local function nudge(delta_ms)
+            local v = self.on_sync_nudge(delta_ms)
+            if v then
+                self._mini_time:setText(string.format("sync %+.1f s", v / 1000))
+                UIManager:setDirty(self, function()
+                    return "ui", self._minimized and self.dimen or nil
+                end)
+            end
+        end
+        self._mini_sync_minus = Button:new{
+            text = "−",
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 16,
+            callback = function() nudge(-100) end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        self._mini_sync_plus = Button:new{
+            text = "+",
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 16,
+            callback = function() nudge(100) end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        center_max_width = center_max_width - (mini_btn_size + spacing) * 2
+        nudge_group = {
+            self._mini_sync_minus,
+            HorizontalSpan:new{ width = spacing },
+            self._mini_sync_plus,
+            HorizontalSpan:new{ width = spacing },
+        }
+    end
+
+    -- Volume nudge buttons (♪− / ♪+), shown on the left of the mini bar so
+    -- they sit apart from the sync buttons on the right.  Reuses _applyVolume,
+    -- which flashes the level in the time slot and debounces the apply.
+    local vol_group = {}
+    if self.on_volume then
+        self._mini_vol_minus = Button:new{
+            text = "♪−",
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 13,
+            callback = function() self:_applyVolume(-10) end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        self._mini_vol_plus = Button:new{
+            text = "♪+",
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 13,
+            callback = function() self:_applyVolume(10) end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        center_max_width = center_max_width - (mini_btn_size + spacing) * 2
+        vol_group = {
+            self._mini_vol_minus,
+            HorizontalSpan:new{ width = spacing },
+            self._mini_vol_plus,
+            HorizontalSpan:new{ width = spacing },
+        }
+    end
+
     local mini_row = HorizontalGroup:new{
         align = "center",
         HorizontalSpan:new{ width = spacing },
         self._mini_play_pause,
         HorizontalSpan:new{ width = spacing },
+        vol_group[1] or HorizontalSpan:new{ width = 0 },
+        vol_group[2] or HorizontalSpan:new{ width = 0 },
+        vol_group[3] or HorizontalSpan:new{ width = 0 },
+        vol_group[4] or HorizontalSpan:new{ width = 0 },
         CenterContainer:new{
             dimen = Geom:new{ w = center_max_width, h = self._mini_height },
             mini_center,
         },
+        nudge_group[1] or HorizontalSpan:new{ width = 0 },
+        nudge_group[2] or HorizontalSpan:new{ width = 0 },
+        nudge_group[3] or HorizontalSpan:new{ width = 0 },
+        nudge_group[4] or HorizontalSpan:new{ width = 0 },
         HorizontalSpan:new{ width = spacing },
         self._mini_close,
         HorizontalSpan:new{ width = spacing },
@@ -488,6 +615,13 @@ function AudiobookPlayer:setupUI()
         padding = 0,
         mini_row,
     }
+
+    -- EPUB read-along mode: stay on the book page (highlights + page
+    -- follow are the UI) with only the mini bar for transport control,
+    -- instead of covering the text with the full-screen player.
+    if self.start_minimized then
+        self:onMinimize()
+    end
 end
 
 -- Callback handlers
@@ -568,6 +702,11 @@ function AudiobookPlayer:setPlaying(is_playing)
         self.play_pause_button:setText(txt, self.play_pause_button.width)
         self._mini_play_pause:setText(txt, self._mini_play_pause.width)
         UIManager:setDirty(self, function()
+            -- When minimized only the mini bar is on screen; its area is
+            -- exactly self.dimen (shrunk by onMinimize).
+            if self._minimized then
+                return "ui", self.dimen
+            end
             return "ui", self.play_pause_button.dimen
         end)
     end
@@ -833,6 +972,54 @@ function AudiobookPlayer:updateSpeed(speed)
     end
 end
 
+function AudiobookPlayer:_volumeText()
+    return string.format("♪ %d%%", self.volume_pct or 100)
+end
+
+--- Nudge the volume by delta percent.  The on-screen value updates instantly;
+--- the actual apply (which restarts the decode pipeline) is debounced so a
+--- burst of taps coalesces into a single restart.
+function AudiobookPlayer:_applyVolume(delta)
+    local pct = (self.volume_pct or 100) + delta
+    if pct < 0 then pct = 0 end
+    if pct > 100 then pct = 100 end
+    if pct == self.volume_pct then return end
+    self.volume_pct = pct
+
+    if self.volume_widget then
+        self.volume_widget:setText(self:_volumeText())
+    end
+    -- Mini bar: flash the level in the time slot, like the sync nudge.
+    if self._mini_time then
+        self._mini_time:setText(string.format("vol %d%%", pct))
+    end
+    UIManager:setDirty(self, function()
+        if self._minimized then return "ui", self.dimen end
+        return "ui", self.volume_widget and self.volume_widget.dimen or nil
+    end)
+
+    if self._vol_apply_timer then
+        UIManager:unschedule(self._vol_apply_timer)
+    end
+    self._vol_apply_timer = UIManager:scheduleIn(0.6, function()
+        self._vol_apply_timer = nil
+        if self.on_volume then self.on_volume(self.volume_pct) end
+    end)
+end
+
+--- External sync of the displayed volume (e.g. when restored from settings).
+function AudiobookPlayer:updateVolume(pct)
+    pct = tonumber(pct)
+    if not pct then return end
+    self.volume_pct = pct
+    if self.volume_widget then
+        self.volume_widget:setText(self:_volumeText())
+        UIManager:setDirty(self, function()
+            return "ui", self.volume_widget.dimen
+        end)
+    end
+end
+
 function AudiobookPlayer:_speedText()
     local s = self.playback_speed or 1.0
     if s == 1.0 then return "1×" end
@@ -997,6 +1184,40 @@ function AudiobookPlayer:handleEvent(event)
                         self:onClose()
                         return true
                     end
+                    -- Tap on the read-along sync-nudge buttons?  These only
+                    -- exist on the mini bar (read-along is always minimized),
+                    -- so without handling them here the tap would fall through
+                    -- to _restore() and the buttons would appear dead.  Invoke
+                    -- the same callback the Button carries.
+                    if self._mini_sync_minus
+                        and self:_isTapOnWidget(ges.pos, self._mini_sync_minus) then
+                        if self._mini_sync_minus.callback then
+                            self._mini_sync_minus.callback()
+                        end
+                        return true
+                    end
+                    if self._mini_sync_plus
+                        and self:_isTapOnWidget(ges.pos, self._mini_sync_plus) then
+                        if self._mini_sync_plus.callback then
+                            self._mini_sync_plus.callback()
+                        end
+                        return true
+                    end
+                    -- Tap on the volume buttons?
+                    if self._mini_vol_minus
+                        and self:_isTapOnWidget(ges.pos, self._mini_vol_minus) then
+                        if self._mini_vol_minus.callback then
+                            self._mini_vol_minus.callback()
+                        end
+                        return true
+                    end
+                    if self._mini_vol_plus
+                        and self:_isTapOnWidget(ges.pos, self._mini_vol_plus) then
+                        if self._mini_vol_plus.callback then
+                            self._mini_vol_plus.callback()
+                        end
+                        return true
+                    end
                     -- Tap anywhere else on the mini bar -> restore full player
                     self:_restore()
                     return true
@@ -1106,6 +1327,7 @@ function AudiobookPlayer:handleEvent(event)
                 self.prev_chapter_button, self.next_chapter_button,
                 self.speed_button, self.close_button, self.minimize_button,
                 self.chapter_list_button,
+                self.vol_minus_button, self.vol_plus_button,
             }
             if self.show_shuffle and self.shuffle_button then
                 table.insert(buttons, self.shuffle_button)
