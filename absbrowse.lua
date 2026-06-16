@@ -44,6 +44,11 @@ function ABSBrowse.buildMainMenu(plugin)
     local is_logged_in = plugin:getSetting("abs_api_token", "") ~= ""
     local server_url = plugin:getSetting("abs_server_url", "")
 
+    local cache = nil
+    if ABSCache then
+        cache = ABSCache:new{ plugin_dir = pp:sub(1, -2) }
+    end
+
     -- ── Server status / settings ──
     table.insert(menu, {
         text_func = function()
@@ -62,7 +67,18 @@ function ABSBrowse.buildMainMenu(plugin)
         end,
     })
 
-    -- ── Login / Logout ──
+    -- ── Sync now ──
+    if is_logged_in and cache and cache:count() > 0 then
+        table.insert(menu, {
+            text = _("Sync progress now"),
+            keep_menu_open = true,
+            callback = function()
+                ABSBrowse._manualSync(plugin)
+            end,
+        })
+    end
+
+    -- ── Log in ──
     if not is_logged_in then
         table.insert(menu, {
             text = _("Log in…"),
@@ -74,22 +90,7 @@ function ABSBrowse.buildMainMenu(plugin)
                 ABSBrowse._showLoginDialog(plugin, touchmenu_instance)
             end,
         })
-    else
-        table.insert(menu, {
-            text = _("Log out"),
-            keep_menu_open = true,
-            callback = function()
-                plugin:setSetting("abs_api_token", "")
-                plugin:setSetting("abs_user_id", "")
-                UIManager:show(InfoMessage:new{
-                    text = _("Logged out from Audiobookshelf."),
-                    timeout = 2,
-                })
-            end,
-        })
     end
-
-    table.insert(menu, { text = "─", enabled = false })
 
     -- ── Browse libraries ──
     if is_logged_in then
@@ -103,11 +104,6 @@ function ABSBrowse.buildMainMenu(plugin)
     end
 
     -- ── Downloaded items ──
-    local cache = nil
-    if ABSCache then
-        cache = ABSCache:new{ plugin_dir = pp:sub(1, -2) }
-    end
-
     table.insert(menu, {
         text_func = function()
             local n = cache and cache:count() or 0
@@ -141,13 +137,18 @@ function ABSBrowse.buildMainMenu(plugin)
         end,
     })
 
-    -- ── Sync now ──
-    if is_logged_in and cache and cache:count() > 0 then
+    -- ── Log out ──
+    if is_logged_in then
         table.insert(menu, {
-            text = _("Sync progress now"),
+            text = _("Log out"),
             keep_menu_open = true,
             callback = function()
-                ABSBrowse._manualSync(plugin)
+                plugin:setSetting("abs_api_token", "")
+                plugin:setSetting("abs_user_id", "")
+                UIManager:show(InfoMessage:new{
+                    text = _("Logged out from Audiobookshelf."),
+                    timeout = 2,
+                })
             end,
         })
     end

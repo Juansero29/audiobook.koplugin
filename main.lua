@@ -356,33 +356,6 @@ function Audiobook:addToMainMenu(menu_items)
                 end,
             },
             {
-                text_func = function()
-                    local off = self:getSetting("smil_sync_offset_ms", 0)
-                    return T(_("Overlay sync offset: %1 s"), string.format("%+.1f", off / 1000))
-                end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    local SpinWidget = require("ui/widget/spinwidget")
-                    local cur = self:getSetting("smil_sync_offset_ms", 0)
-                    UIManager:show(SpinWidget:new{
-                        title_text = _("Overlay sync offset"),
-                        info_text = _("Positive values delay the highlight (use when the highlight runs ahead of the narration); negative values advance it."),
-                        value = cur / 1000,
-                        value_min = -60,
-                        value_max = 60,
-                        value_step = 0.5,
-                        value_hold_step = 5,
-                        precision = "%.1f",
-                        ok_text = _("Set"),
-                        callback = function(spin)
-                            self:setSetting("smil_sync_offset_ms", math.floor(spin.value * 1000))
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                    })
-                end,
-                help_text = _("Shifts EPUB Media Overlay sentence highlighting relative to the audio. Some audiobooks (e.g. with publisher intros) have timing tables offset from the embedded audio."),
-            },
-            {
                 text = _("Open audiobook..."),
                 enabled_func = function()
                     return (self._init_ok and self.media_sync ~= nil) or false
@@ -613,6 +586,33 @@ function Audiobook:addToMainMenu(menu_items)
                             },
                         },
                         help_text = _("Automatically pause playback after the selected time. Useful for listening before sleep."),
+                    },
+                    {
+                        text_func = function()
+                            local off = self:getSetting("smil_sync_offset_ms", 0)
+                            return T(_("Overlay sync offset: %1 s"), string.format("%+.1f", off / 1000))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            local SpinWidget = require("ui/widget/spinwidget")
+                            local cur = self:getSetting("smil_sync_offset_ms", 0)
+                            UIManager:show(SpinWidget:new{
+                                title_text = _("Overlay sync offset"),
+                                info_text = _("Positive values delay the highlight (use when the highlight runs ahead of the narration); negative values advance it."),
+                                value = cur / 1000,
+                                value_min = -60,
+                                value_max = 60,
+                                value_step = 0.5,
+                                value_hold_step = 5,
+                                precision = "%.1f",
+                                ok_text = _("Set"),
+                                callback = function(spin)
+                                    self:setSetting("smil_sync_offset_ms", math.floor(spin.value * 1000))
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            })
+                        end,
+                        help_text = _("Shifts EPUB Media Overlay sentence highlighting relative to the audio. Some audiobooks (e.g. with publisher intros) have timing tables offset from the embedded audio."),
                     },
                 },
             },
@@ -1198,19 +1198,42 @@ function Audiobook:_playAudioFile(file_path, playlist_files)
     local saved_pos, saved_time = self:_getSavedPosition(file_path)
     if saved_pos and saved_pos > 30 then
         local ConfirmBox = require("ui/widget/confirmbox")
+        local book_title = file_path:match("([^/]+)%.[^./]+$") or file_path:match("([^/]+)$") or _("Unknown book")
+        local chapters = {}
+        local ok_mp, MetadataParser = pcall(dofile, PLUGIN_PATH .. "m4bparser.lua")
+        if ok_mp and MetadataParser then
+            local parser = MetadataParser:new{plugin_dir = PLUGIN_PATH}
+            local parsed = parser:parse(file_path)
+            if parsed then chapters = parsed end
+        end
+        local chapter_title = self:_findChapterTitle(chapters, saved_pos)
+        local lines = {
+            T(_("Resume from %1?"), self:_formatAudioTime(saved_pos)),
+            "",
+            T(_("Book: %1"), book_title),
+        }
+        if chapter_title then
+            table.insert(lines, T(_("Chapter: %1"), chapter_title))
+        end
+        table.insert(lines, "")
+        table.insert(lines, T(_("Last played: %1"), os.date("%Y-%m-%d %H:%M", saved_time)))
         UIManager:show(ConfirmBox:new{
-            text = T(_("Resume from %1?\n\nLast played: %2"),
-                self:_formatAudioTime(saved_pos),
-                os.date("%Y-%m-%d %H:%M", saved_time)),
+            text = table.concat(lines, "\n"),
             ok_text = _("Resume"),
-            cancel_text = _("From start"),
+            cancel_text = _("Cancel"),
             ok_callback = function()
                 self:_doPlayAudioFile(file_path, playlist_files, saved_pos)
             end,
-            cancel_callback = function()
-                self:_clearPosition(file_path)
-                self:_doPlayAudioFile(file_path, playlist_files, 0)
-            end,
+            cancel_callback = function() end,
+            other_buttons = {{
+                {
+                    text = _("From start"),
+                    callback = function()
+                        self:_clearPosition(file_path)
+                        self:_doPlayAudioFile(file_path, playlist_files, 0)
+                    end,
+                },
+            }},
         })
         return
     end
@@ -1339,6 +1362,21 @@ function Audiobook:_formatAudioTime(seconds)
         return string.format("%d:%02d:%02d", hours, mins, secs)
     end
     return string.format("%d:%02d", mins, secs)
+end
+
+function Audiobook:_findChapterTitle(chapters, position)
+    if not chapters or #chapters == 0 or not position then
+        return nil
+    end
+    local title = nil
+    for _, ch in ipairs(chapters) do
+        if ch.start_time and position >= ch.start_time then
+            title = ch.title or title
+        else
+            break
+        end
+    end
+    return title
 end
 
 -- ---------------------------------------------------------------------------
@@ -2240,19 +2278,36 @@ function Audiobook:_playAbsItem(item_id, audio_path, metadata)
 
     if saved_pos and saved_pos > 30 then
         local ConfirmBox = require("ui/widget/confirmbox")
+        local book_title = metadata and metadata.title
+            or audio_path:match("([^/]+)%.[^./]+$") or audio_path:match("([^/]+)$") or _("Unknown book")
+        local chapter_title = self:_findChapterTitle(metadata and metadata.chapters, saved_pos)
+        local lines = {
+            T(_("Resume from %1?"), self:_formatAudioTime(saved_pos)),
+            "",
+            T(_("Book: %1"), book_title),
+        }
+        if chapter_title then
+            table.insert(lines, T(_("Chapter: %1"), chapter_title))
+        end
+        table.insert(lines, "")
+        table.insert(lines, T(_("Last played: %1"), os.date("%Y-%m-%d %H:%M", saved_time or os.time())))
         UIManager:show(ConfirmBox:new{
-            text = T(_("Resume from %1?\n\nLast played: %2"),
-                self:_formatAudioTime(saved_pos),
-                os.date("%Y-%m-%d %H:%M", saved_time or os.time())),
+            text = table.concat(lines, "\n"),
             ok_text = _("Resume"),
-            cancel_text = _("From start"),
+            cancel_text = _("Cancel"),
             ok_callback = function()
                 self:_doPlayAudioFile(audio_path, nil, saved_pos, item_id, metadata)
             end,
-            cancel_callback = function()
-                self:_clearPosition(audio_path)
-                self:_doPlayAudioFile(audio_path, nil, 0, item_id, metadata)
-            end,
+            cancel_callback = function() end,
+            other_buttons = {{
+                {
+                    text = _("From start"),
+                    callback = function()
+                        self:_clearPosition(audio_path)
+                        self:_doPlayAudioFile(audio_path, nil, 0, item_id, metadata)
+                    end,
+                },
+            }},
         })
         return
     end
