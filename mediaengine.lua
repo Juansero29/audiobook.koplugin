@@ -417,10 +417,13 @@ function MediaEngine:_detectKindleGstPlay()
         if ph then
             local probe = ph:read("*a") or ""
             ph:close()
+            -- Accept the binary as long as mixersink is present and usable.
+            -- GStreamer warnings about unrelated plugins (e.g. ttssrc failing
+            -- to load because libIvonaEInkAPI.so is stripped on newer
+            -- firmware) do not affect our WAV playback path.
             if probe:match("mixersink=found")
-                and not (probe:match("Failed to load plugin")
-                    or probe:match("undefined symbol")
-                    or probe:match("GStreamer%-WARNING")) then
+                and not probe:match("mixersink=broken")
+                and not probe:match("gstreamer=not_found") then
                 gst_play_cmd = cand
                 break
             end
@@ -1485,8 +1488,29 @@ function MediaEngine:_playKindleGstPlay(gen)
     end
 
     if not (self._gst_play_cmd or self.backend_cmd) then
-        logger.err("MediaEngine: no bundled gst-play and system pipeline failed")
-        if self._on_fail then self._on_fail("no usable Kindle audio pipeline") end
+        -- Diagnose the most common Kindle failure: the file is not a plain
+        -- PCM WAV and the bundled ffmpeg decoder is missing.  The system
+        -- GStreamer on these devices has no mp3/aac/wavparse plugins, so
+        -- without ffmpeg there is no way to decode Audiobookshelf tracks.
+        local is_wav = false
+        local fh = io.open(self.current_path, "rb")
+        if fh then
+            local header = fh:read(12)
+            fh:close()
+            is_wav = header and #header >= 12
+                and header:sub(1, 4) == "RIFF"
+                and header:sub(9, 12) == "WAVE"
+        end
+        local has_ffmpeg = self:_findFfmpeg() ~= nil
+        logger.err("MediaEngine: no bundled gst-play and system pipeline failed",
+            "is_wav=", is_wav, "has_ffmpeg=", has_ffmpeg)
+        if self._on_fail then
+            if not is_wav and not has_ffmpeg then
+                self._on_fail(_("Cannot play this audio file. Kindle's GStreamer can only play raw PCM WAV files; MP3/M4B/AAC files need the bundled ffmpeg decoder. Please install the release .zip (not 'Source code') from GitHub so plugins/audiobook.koplugin/bin/ffmpeg is present."))
+            else
+                self._on_fail("no usable Kindle audio pipeline")
+            end
+        end
         return false
     end
 

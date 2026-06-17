@@ -210,6 +210,12 @@ local function collectPluginInfo(plugin)
     info.has_bundled_piper = fileExists(piper_path) or fileExists(piper_path .. ".bin")
     local wav_play_path = plugin_dir .. "/wav-play/wav-play"
     info.has_bundled_wav_play = fileExists(wav_play_path) or fileExists(wav_play_path .. ".bin")
+    -- ffmpeg is required on Kindle to decode MP3/M4B audiobooks because the
+    -- system GStreamer is stripped (no mp3/wavparse decoder).  Report whether
+    -- the release-zip binary is actually present.
+    local ffmpeg_path = plugin_dir .. "/bin/ffmpeg"
+    info.has_bundled_ffmpeg = fileExists(ffmpeg_path) or fileExists(ffmpeg_path .. ".bin")
+    info.ffmpeg_bin_ls = shellCapture("ls -la '" .. plugin_dir .. "/bin/' 2>/dev/null", 3)
     -- Show what's on disk in the binary directories
     info.espeak_bin_ls = shellCapture("ls -la '" .. plugin_dir .. "/espeak-ng/bin/' 2>/dev/null", 3)
     info.piper_bin_ls = shellCapture("ls -la '" .. plugin_dir .. "/piper/' 2>/dev/null | head -10", 3)
