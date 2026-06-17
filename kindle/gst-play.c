@@ -480,6 +480,28 @@ static int do_play(const char *wav_path)
  * This bypasses playermgr entirely, which is needed on Colorsoft
  * firmware where playermgr Open/PlayParameter does not trigger TTS.
  */
+
+/* Escape a user-supplied sentence so it can safely appear inside a
+ * GStreamer string property value (between double quotes).  We only
+ * need to escape backslash and the quote itself; everything else is
+ * passed through as UTF-8. */
+static char *escape_gst_string(const char *text)
+{
+    size_t len = strlen(text);
+    char *out = malloc(len * 2 + 1);
+    if (!out)
+        return NULL;
+
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] == '\\' || text[i] == '"')
+            out[j++] = '\\';
+        out[j++] = text[i];
+    }
+    out[j] = '\0';
+    return out;
+}
+
 static int do_ttssrc(const char *text)
 {
     if (load_gstreamer() != 0)
@@ -497,36 +519,47 @@ static int do_ttssrc(const char *text)
         }
     }
 
+    char *escaped = escape_gst_string(text);
+    if (!escaped) {
+        fprintf(stderr, "gst-play: out of memory escaping TTS text\n");
+        return 3;
+    }
+
     /* Build a simple ttssrc pipeline.
-     * Try ttssrc with a text property first; if the element expects a
-     * URI, the parse will fail and we report the error.
-     * GStreamer 0.10 caps for raw audio from ttssrc:
+     * The Colorsoft ttssrc element expects its input in the
+     * "content-texts" property (plural), not the generic "text"
+     * property.  Older firmware only understands "text", so if the
+     * "content-texts" pipeline fails to parse we fall back to "text".
+     *
+     * Caps match the ttssrc pad template exactly:
      *   audio/x-raw-int,rate=24000,channels=1,width=16,depth=16,signed=true
-     * GStreamer 1.0 equivalent:
-     *   audio/x-raw,format=S16LE,rate=24000,channels=1
+     * and mixersink needs stream-type=Music + sync=true, just like the
+     * WAV playback path, or audiomgrd rejects the stream.
      */
-    char desc[1024];
+    char desc[2048];
+    const char *prop_name = "content-texts";
     if (gst_version_minor == 10) {
         snprintf(desc, sizeof(desc),
-            "ttssrc text=\"%s\" ! "
+            "ttssrc %s=\"%s\" ! "
             "audio/x-raw-int,"
-            "rate=(int)22050,"
-            "channels=(int)1,"
+            "endianness=(int)1234,"
+            "signed=(boolean)true,"
             "width=(int)16,"
             "depth=(int)16,"
-            "signed=(boolean)true"
-            " ! mixersink",
-            text);
+            "rate=(int)24000,"
+            "channels=(int)1"
+            " ! mixersink stream-type=Music sync=true",
+            prop_name, escaped);
     } else {
         snprintf(desc, sizeof(desc),
-            "ttssrc text=\"%s\" ! "
+            "ttssrc %s=\"%s\" ! "
             "audio/x-raw,"
             "format=(string)S16LE,"
-            "rate=(int)22050,"
+            "rate=(int)24000,"
             "channels=(int)1,"
             "layout=(string)interleaved"
-            " ! mixersink",
-            text);
+            " ! mixersink stream-type=Music sync=true",
+            prop_name, escaped);
     }
 
     fprintf(stderr, "gst-play: ttssrc pipeline: %s\n", desc);
@@ -534,9 +567,41 @@ static int do_ttssrc(const char *text)
     void *error = NULL;
     void *pipeline = gst_parse_launch_(desc, &error);
     if (!pipeline) {
-        fprintf(stderr, "gst-play: ttssrc pipeline creation failed\n");
-        return 3;
+        /* "content-texts" may not exist on older firmware.  Try the
+         * legacy "text" property as a last resort. */
+        fprintf(stderr, "gst-play: content-texts pipeline failed, trying text property\n");
+        if (gst_version_minor == 10) {
+            snprintf(desc, sizeof(desc),
+                "ttssrc text=\"%s\" ! "
+                "audio/x-raw-int,"
+                "endianness=(int)1234,"
+                "signed=(boolean)true,"
+                "width=(int)16,"
+                "depth=(int)16,"
+                "rate=(int)24000,"
+                "channels=(int)1"
+                " ! mixersink stream-type=Music sync=true",
+                escaped);
+        } else {
+            snprintf(desc, sizeof(desc),
+                "ttssrc text=\"%s\" ! "
+                "audio/x-raw,"
+                "format=(string)S16LE,"
+                "rate=(int)24000,"
+                "channels=(int)1,"
+                "layout=(string)interleaved"
+                " ! mixersink stream-type=Music sync=true",
+                escaped);
+        }
+        fprintf(stderr, "gst-play: ttssrc fallback pipeline: %s\n", desc);
+        pipeline = gst_parse_launch_(desc, &error);
+        if (!pipeline) {
+            fprintf(stderr, "gst-play: ttssrc pipeline creation failed\n");
+            free(escaped);
+            return 3;
+        }
     }
+    free(escaped);
     pipeline_g = pipeline;
 
     struct sigaction sa;
