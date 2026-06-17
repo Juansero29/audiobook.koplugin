@@ -3601,16 +3601,19 @@ function TTSEngine:findAudioPlayer()
                     return "kindle-native-tts-fallback"
                 end
 
-                -- Fall through: no wavparse AND no gst-play helper (or
-                -- mixersink not found) AND no Ivona SDK.  Select kindle-lipc
-                -- anyway but flag that audio will fail so rapid-fail detection
-                -- kicks in.
-                self.audio_player_type = "kindle-lipc"
+                -- No wavparse AND no gst-play helper (or mixersink not found)
+                -- AND no Ivona SDK.  Do NOT select kindle-lipc here; on this
+                -- firmware it cannot decode WAV files, so it would only fail
+                -- (and previously crashed when the fallback used a nil global).
+                -- Fall through to the Kindle rescue probe and generic players
+                -- instead: aplay may see an ALSA PCM after audiomgrd focus
+                -- (issue #28).
+                self.audio_player_type = nil
                 self._no_real_audio_output = true
                 logger.warn("TTSEngine: Kindle playermgr found but GStreamer lacks wavparse and no gst-play helper")
-                logger.warn("TTSEngine: Found Kindle LIPC playermgr service, InPlayback=", val,
+                logger.warn("TTSEngine: Falling through to rescue probe / generic players, InPlayback=", val,
                     "wavparse=false, gst_play=not_found")
-                return "kindle-lipc"
+                -- fall through
             else
                 logger.warn("TTSEngine: lipc-get-prop playermgr InPlayback returned:", val)
             end
@@ -4093,7 +4096,7 @@ function TTSEngine:_kindleRescueProbe()
         if h then
             local v = h:read("*a") or ""
             h:close()
-            if v:match("%d") then
+            if v:match("^%s*1") then
                 self.audio_player_type = "kindle-lipc"
                 self._no_real_audio_output = false
                 logger.warn("TTSEngine: Rescue probe selected kindle-lipc after setFocus=tts")
@@ -4108,7 +4111,7 @@ function TTSEngine:_kindleRescueProbe()
         if h then
             local v = h:read("*a") or ""
             h:close()
-            if v:match("%d") then
+            if v:match("^%s*1") then
                 self.audio_player_type = "kindle-lipc"
                 self._no_real_audio_output = false
                 logger.warn("TTSEngine: Rescue probe selected kindle-lipc after setFocus=playermgr")
@@ -4123,7 +4126,7 @@ function TTSEngine:_kindleRescueProbe()
         if h then
             local v = h:read("*a") or ""
             h:close()
-            if v:match("%d") then
+            if v:match("^%s*1") then
                 self.audio_player_type = "kindle-lipc"
                 self._no_real_audio_output = false
                 logger.warn("TTSEngine: Rescue probe selected kindle-lipc after setFocus=com.lab126.playermgr")
@@ -4172,7 +4175,7 @@ function TTSEngine:_kindleRescueProbe()
     if h then
         local v = h:read("*a") or ""
         h:close()
-        if v:match("%d") then
+        if v:match("^%s*1") then
             self.audio_player_type = "kindle-lipc"
             self._no_real_audio_output = false
             logger.warn("TTSEngine: Rescue probe selected kindle-lipc after Open wake-up")
