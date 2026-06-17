@@ -2555,32 +2555,32 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             self._lipc_consec_fails = (self._lipc_consec_fails or 0) + 1
             if self._lipc_consec_fails >= 2 then
                 -- Try auto-fallback to kindle-gst-play once
-                if engine._kindle_gst_play_bin and not engine._lipc_gst_fallback_tried then
-                    engine._lipc_gst_fallback_tried = true
+                if self._kindle_gst_play_bin and not self._lipc_gst_fallback_tried then
+                    self._lipc_gst_fallback_tried = true
                     logger.warn("TTSEngine: kindle-lipc failed twice (no InPlayback), falling back to kindle-gst-play")
-                    engine.audio_player_type = "kindle-gst-play"
-                    engine._cached_player = nil
-                    engine._no_real_audio_output = false
-                    engine._lipc_consec_fails = 0
-                    engine.is_speaking = false
-                    engine:play(engine.word_callback, engine.completion_callback,
-                        engine.on_fail_callback, engine._concat_files)
+                    self.audio_player_type = "kindle-gst-play"
+                    self._cached_player = nil
+                    self._no_real_audio_output = false
+                    self._lipc_consec_fails = 0
+                    self.is_speaking = false
+                    self:play(self.on_word_callback, self.on_complete_callback,
+                        self.on_fail_callback, concat_files)
                     return true
                 end
-                engine.is_speaking = false
-                engine.play_generation = (engine.play_generation or 0) + 1
-                engine:cleanup()
+                self.is_speaking = false
+                self.play_generation = (self.play_generation or 0) + 1
+                self:cleanup()
                 local msg = _("Kindle audio playback failed.\n\nThe playermgr service accepted commands but audio never started.\n\nPossible causes:\n1. GStreamer cannot find the wavparse plugin on this firmware\n2. audiomgrd denied audio focus to the plugin\n3. No audio sink is configured (built-in speaker absent, BT not connected)\n\nTry: Connect Bluetooth headphones via Kindle Settings first, then start read-along.\n\nIf this persists, please generate a bug report (Audiobook > Generate bug report) and share it on GitHub.")
                 -- If we have kindle-gst-play available, suggest falling back
-                if engine._kindle_gst_play_bin then
+                if self._kindle_gst_play_bin then
                     msg = msg .. "\n\nAlternatively, try switching to 'gst-play' audio player in Audiobook settings (if available)."
                 end
                 UIManager:show(InfoMessage:new{
                     text = msg,
                     timeout = 10,
                 })
-                if engine.on_fail_callback then
-                    engine.on_fail_callback()
+                if self.on_fail_callback then
+                    self.on_fail_callback()
                 end
                 return true  -- return true so play() doesn't continue to polling
             end
@@ -2653,8 +2653,8 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                                     engine._lipc_consec_fails = 0
                                     engine.is_speaking = false
                                     -- Replay current audio via gst-play
-                                    engine:play(engine.word_callback, engine.completion_callback,
-                                        engine.on_fail_callback, engine._concat_files)
+                                    engine:play(engine.on_word_callback, engine.on_complete_callback,
+                                        engine.on_fail_callback, concat_files)
                                     return
                                 end
                                 -- Stop after 2 consecutive failures
