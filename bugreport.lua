@@ -914,18 +914,27 @@ rm -f /tmp/.pcm_test.wav /tmp/.pcm_test.raw
                 "/mnt/us/koreader/plugins/audiobook.koplugin/kindle/gst-play",
                 "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin/kindle/gst-play",
             }) do
-                if p and fileExists(p) then gst_play_path = p; break end
+                if p and fileExists(p) then
+                    gst_play_path = p
+                    break
+                elseif p and fileExists(p .. ".bin") then
+                    -- Release zips ship ELF binaries with a .bin suffix.
+                    gst_play_path = p .. ".bin"
+                    break
+                end
             end
             if gst_play_path then
-                local espeak_lib = gst_play_path:gsub("/kindle/gst%-play$", "/espeak-ng/lib")
+                local espeak_lib = gst_play_path:gsub("/kindle/gst%-play(%.bin)?$", "/espeak-ng/lib")
                 local ld_linux = espeak_lib .. "/ld-linux-armhf.so.3"
                 local gst_cmd = gst_play_path
+                -- ttssrc depends on libIvonaEInkAPI.so.1.0 in /usr/lib/tts.
+                local ivona_env = "LD_LIBRARY_PATH=/usr/lib/tts:$LD_LIBRARY_PATH "
                 if fileExists(ld_linux) then
-                    gst_cmd = ld_linux .. " --library-path " .. espeak_lib .. ":/usr/lib:/lib " .. gst_play_path
+                    gst_cmd = ld_linux .. " --library-path " .. espeak_lib .. ":/usr/lib/tts:/usr/lib:/lib " .. gst_play_path
                 end
                 info.kindle_gst_ttssrc_test = shellCapture(
                     "echo '--- kindle-gst-play --ttssrc ---'; "
-                    .. gst_cmd .. " --ttssrc 'hello world' 2>&1; "
+                    .. ivona_env .. gst_cmd .. " --ttssrc 'hello world' 2>&1; "
                     .. "echo 'exit_code=$?'",
                     15) or "failed"
             else
@@ -960,10 +969,11 @@ dd if=/dev/zero bs=44100 count=1 2>/dev/null | {
 
 dd if=/tmp/.gst_raw_test.wav of=/tmp/.gst_raw_test.raw bs=1 skip=44 2>/dev/null
 if [ -s /tmp/.gst_raw_test.raw ]; then
+  lipc-set-prop com.lab126.audiomgrd setFocus Music 2>/dev/null || true
   echo "--- filesrc + capsfilter raw PCM ---"
-  timeout 3 gst-launch-0.10 -v filesrc location=/tmp/.gst_raw_test.raw ! capsfilter caps="audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234" ! mixersink 2>&1 | head -15
+  timeout 3 gst-launch-0.10 -v filesrc location=/tmp/.gst_raw_test.raw ! capsfilter caps="audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234" ! mixersink stream-type=Music sync=true 2>&1 | head -15
   echo "--- fdsrc + capsfilter raw PCM ---"
-  timeout 3 gst-launch-0.10 -v fdsrc location=/tmp/.gst_raw_test.raw ! capsfilter caps="audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234" ! mixersink 2>&1 | head -15
+  timeout 3 gst-launch-0.10 -v fdsrc location=/tmp/.gst_raw_test.raw ! capsfilter caps="audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234" ! mixersink stream-type=Music sync=true 2>&1 | head -15
 else
   echo "raw_file_missing=/var_full?"
 fi
@@ -1448,11 +1458,11 @@ echo "focus_rc=$focus_rc"
 sleep 1 2>/dev/null || usleep 1000000 2>/dev/null
 -- Test 1: system gst-launch-0.10 with raw PCM + capsfilter
 echo "--- gst-launch-0.10 raw PCM ---"
-timeout 3 gst-launch-0.10 -v filesrc location=/tmp/.pcm_focus_test.raw ! capsfilter caps="audio/x-raw-int,endianness=1234,signed=true,width=16,depth=16,rate=22050,channels=1" ! mixersink 2>&1 | head -20
+timeout 3 gst-launch-0.10 -v filesrc location=/tmp/.pcm_focus_test.raw ! capsfilter caps="audio/x-raw-int,endianness=1234,signed=true,width=16,depth=16,rate=22050,channels=1" ! mixersink stream-type=Music sync=true 2>&1 | head -20
 echo "gst_exit=$?"
 -- Test 2: try without capsfilter (let mixersink negotiate)
 echo "--- gst-launch-0.10 raw PCM no capsfilter ---"
-timeout 3 gst-launch-0.10 -v filesrc location=/tmp/.pcm_focus_test.raw ! mixersink 2>&1 | head -15
+timeout 3 gst-launch-0.10 -v filesrc location=/tmp/.pcm_focus_test.raw ! mixersink stream-type=Music sync=true 2>&1 | head -15
 echo "gst2_exit=$?"
 rm -f /tmp/.pcm_focus_test.raw /tmp/.pcm_focus_test.wav
 ]], 18) or "failed"

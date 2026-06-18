@@ -184,6 +184,29 @@ static int load_gstreamer(void)
     return 0;
 }
 
+/* Pre-load Kindle Ivona TTS libraries so GStreamer's ttssrc plugin can
+ * find them even when the bundled ld-linux's search path does not match
+ * the system ld.so.cache (issue #11).  RTLD_GLOBAL makes the symbols
+ * visible to plugins loaded afterwards.
+ */
+static void preload_ivona_libs(void)
+{
+    static const char *libs[] = {
+        "/usr/lib/tts/libIvonaEInkAPI.so.1.0",
+        "/usr/lib/tts/libIvonaEInkCommon.so.1.0",
+        NULL
+    };
+    for (int i = 0; libs[i]; i++) {
+        void *h = dlopen(libs[i], RTLD_LAZY | RTLD_GLOBAL);
+        if (h) {
+            fprintf(stderr, "gst-play: preloaded %s\n", libs[i]);
+        } else {
+            fprintf(stderr, "gst-play: cannot preload %s: %s\n",
+                    libs[i], dlerror());
+        }
+    }
+}
+
 /* ---- Probe mode ---- */
 static int do_probe(void)
 {
@@ -199,6 +222,9 @@ static int do_probe(void)
     } else {
         printf("glibc=not_found\n");
     }
+
+    /* Make Ivona symbols available before GStreamer tries to load ttssrc. */
+    preload_ivona_libs();
 
     if (load_gstreamer() != 0) {
         printf("gstreamer=not_found\n");
@@ -504,6 +530,9 @@ static char *escape_gst_string(const char *text)
 
 static int do_ttssrc(const char *text)
 {
+    /* Make Ivona symbols available before GStreamer tries to load ttssrc. */
+    preload_ivona_libs();
+
     if (load_gstreamer() != 0)
         return 3;
 

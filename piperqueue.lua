@@ -276,13 +276,12 @@ function PiperQueue:buildBaseCommand()
     end
     local exec_prefix = ""
     if engine.piper_model_dir then
+        -- Newer Piper tarballs keep .so files in piper/lib/; older ones are flat.
         local piper_lib = engine.piper_model_dir .. "/lib"
-        local probe = io.open(piper_lib .. "/libonnxruntime.so.1.14.1", "r")
-        if not probe then
-            probe = io.open(engine.piper_model_dir .. "/libonnxruntime.so.1.14.1", "r")
-            if probe then piper_lib = engine.piper_model_dir end
+        local dir_ok = os.execute('test -d "' .. piper_lib .. '" 2>/dev/null')
+        if not (dir_ok == 0 or dir_ok == true) then
+            piper_lib = engine.piper_model_dir
         end
-        if probe then probe:close() end
         local plugin_dir = engine.plugin_dir
             or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin"
         local espeak_lib = plugin_dir .. "/espeak-ng/lib"
@@ -290,7 +289,10 @@ function PiperQueue:buildBaseCommand()
         local ld_f = io.open(ld_linux, "r")
         if ld_f then
             ld_f:close()
-            local lib_path = piper_lib .. ":" .. espeak_lib
+            -- Include /usr/lib:/lib as a final fallback so Piper can find
+            -- libpthread, libm, libc etc. on Kindles where espeak-ng/lib does
+            -- not bundle every glibc dependency (issue #11).
+            local lib_path = piper_lib .. ":" .. espeak_lib .. ":/usr/lib:/lib"
             exec_prefix = string.format('"%s" --library-path "%s" ',
                 ld_linux, lib_path)
             local espeak_data_dir = engine.piper_model_dir .. "/espeak-ng-data"
@@ -302,8 +304,8 @@ function PiperQueue:buildBaseCommand()
             end
         else
             exec_prefix = string.format(
-                'LD_LIBRARY_PATH="%s" ESPEAK_DATA_PATH="%s" ',
-                piper_lib, engine.piper_model_dir)
+                'LD_LIBRARY_PATH="%s:%s:/usr/lib:/lib" ESPEAK_DATA_PATH="%s" ',
+                piper_lib, espeak_lib, engine.piper_model_dir)
         end
     end
     return string.format('nice -n 19 %s%s%s%s%s',
