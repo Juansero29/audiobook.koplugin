@@ -246,6 +246,7 @@ function Audiobook:_initSubmodules()
     end)
     if not ok_media then
         logger.warn("Audiobook: media modules failed to load:", err_media)
+        self._media_modules_error = tostring(err_media)
         self.media_engine = nil
         self.media_sync = nil
         self.transcoder = nil
@@ -374,10 +375,14 @@ function Audiobook:addToMainMenu(menu_items)
                 end,
             },
             -- ── Audiobookshelf ──
+            -- Configuration/log-in should be reachable even if the media
+            -- player failed to initialize on a particular firmware.  Playback
+            -- actions inside the submenu still guard against a missing
+            -- media_sync.
             {
                 text = _("Audiobookshelf"),
                 enabled_func = function()
-                    return self._init_ok and self.media_sync ~= nil
+                    return self._init_ok
                 end,
                 sub_item_table_func = function()
                     return self:_buildAudiobookshelfMenu()

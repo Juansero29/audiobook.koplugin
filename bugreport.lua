@@ -166,44 +166,55 @@ local function collectPluginInfo(plugin)
     info.plugin_dir = sanitizePath(_utils_dir)
     info.cwd = shellCapture("pwd", 2)
 
+    -- Initialization state.  Several menus (Audiobookshelf, Open audiobook,
+    -- etc.) depend on these flags, so report them explicitly.
+    info.init_ok = (plugin and plugin._init_ok) and "yes" or "no"
+    info.init_error = plugin and plugin._init_error or nil
+    info.has_tts_engine = (plugin and plugin.tts_engine) and "yes" or "no"
+    info.has_media_engine = (plugin and plugin.media_engine) and "yes" or "no"
+    info.has_media_sync = (plugin and plugin.media_sync) and "yes" or "no"
+    info.has_transcoder = (plugin and plugin.transcoder) and "yes" or "no"
+    info.has_abs_sync = (plugin and plugin._abs_sync) and "yes" or "no"
+    info.media_modules_error = plugin and plugin._media_modules_error or nil
+
     if not engine then
         info.tts_backend = "engine not initialized"
-        return info
-    end
-
-    -- TTS state
-    info.tts_backend = engine.backend or "nil (none detected)"
-    info.tts_backend_cmd = engine.backend_cmd and sanitizePath(engine.backend_cmd) or "nil"
-    info.tts_backend_error = engine.backend_error or "none"
-    info.player_error = engine.player_error and "yes" or "no"
-    info.audio_player_type = engine.audio_player_type or "not set"
-    info.audio_player_cached = engine._cached_player or "not set"
-    info.no_real_audio_output = engine._no_real_audio_output and "yes" or "no"
-
-    -- PocketBook pre-flight snapshot from the most recent play() attempt
-    -- (BT-adapter gate that prevents direct ALSA on PB632/PB700c).
-    if engine._pb_pre_flight_state then
-        local s = engine._pb_pre_flight_state
-        info.pb_pre_flight = string.format(
-            "is_pb=%s has_bt_adapter=%s has_tts_sm=%s no_real_audio=%s player_type=%s pt_is_bt_routed=%s",
-            tostring(s.is_pb), tostring(s.has_bt_adapter),
-            tostring(s.has_tts_sm), tostring(s.no_real_audio),
-            tostring(s.player_type), tostring(s.pt_is_bt_routed))
+        -- Continue so the init-state fields above are still returned.
     else
-        info.pb_pre_flight = "not yet evaluated"
-    end
-    -- Raw sysfs read used by the pre-flight to detect the BT adapter.
-    local hci_f = io.open("/sys/class/bluetooth/hci0/address", "r")
-    if hci_f then
-        info.bt_hci0_address = (hci_f:read("*l") or ""):gsub("[^%w:]+", "")
-        hci_f:close()
-        if info.bt_hci0_address == "" then info.bt_hci0_address = "empty" end
-    else
-        info.bt_hci0_address = "missing"
+        -- TTS state
+        info.tts_backend = engine.backend or "nil (none detected)"
+        info.tts_backend_cmd = engine.backend_cmd and sanitizePath(engine.backend_cmd) or "nil"
+        info.tts_backend_error = engine.backend_error or "none"
+        info.player_error = engine.player_error and "yes" or "no"
+        info.audio_player_type = engine.audio_player_type or "not set"
+        info.audio_player_cached = engine._cached_player or "not set"
+        info.no_real_audio_output = engine._no_real_audio_output and "yes" or "no"
+
+        -- PocketBook pre-flight snapshot from the most recent play() attempt
+        -- (BT-adapter gate that prevents direct ALSA on PB632/PB700c).
+        if engine._pb_pre_flight_state then
+            local s = engine._pb_pre_flight_state
+            info.pb_pre_flight = string.format(
+                "is_pb=%s has_bt_adapter=%s has_tts_sm=%s no_real_audio=%s player_type=%s pt_is_bt_routed=%s",
+                tostring(s.is_pb), tostring(s.has_bt_adapter),
+                tostring(s.has_tts_sm), tostring(s.no_real_audio),
+                tostring(s.player_type), tostring(s.pt_is_bt_routed))
+        else
+            info.pb_pre_flight = "not yet evaluated"
+        end
+        -- Raw sysfs read used by the pre-flight to detect the BT adapter.
+        local hci_f = io.open("/sys/class/bluetooth/hci0/address", "r")
+        if hci_f then
+            info.bt_hci0_address = (hci_f:read("*l") or ""):gsub("[^%w:]+", "")
+            hci_f:close()
+            if info.bt_hci0_address == "" then info.bt_hci0_address = "empty" end
+        else
+            info.bt_hci0_address = "missing"
+        end
     end
 
     -- Bundled binaries presence (check both original and .bin-renamed variants)
-    local plugin_dir = engine.plugin_dir or _utils_dir:sub(1, -2)
+    local plugin_dir = (engine and engine.plugin_dir) or _utils_dir:sub(1, -2)
     local espeak_path = plugin_dir .. "/espeak-ng/bin/espeak-ng"
     local piper_path = plugin_dir .. "/piper/piper"
     info.has_bundled_espeak = fileExists(espeak_path) or fileExists(espeak_path .. ".bin")

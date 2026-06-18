@@ -983,6 +983,17 @@ function ABSBrowse._playCachedItem(plugin, cache, item_id)
         return
     end
 
+    -- The media player can fail to initialize on some firmware.  Surfacing
+    -- the error here lets the user know why playback is unavailable instead
+    -- of silently doing nothing.
+    if not plugin._init_ok or not plugin.media_sync then
+        UIManager:show(InfoMessage:new{
+            text = _("Playback unavailable. The media player failed to initialize. Please restart KOReader and, if the problem persists, generate a bug report."),
+            timeout = 5,
+        })
+        return
+    end
+
     local item = cache:getItem(item_id)
     if not item then
         UIManager:show(InfoMessage:new{

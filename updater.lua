@@ -227,6 +227,15 @@ function Updater._performUpdate(plugin, release)
             tmp_dir = parent
         end
     end
+    -- On Kindle /tmp is a 64 MB tmpfs under /var/tmp, far too small for
+    -- release zips that include ffmpeg/Piper binaries (issue #38 update
+    -- failure). Put temp files on user storage next to the plugin dir.
+    if Device:isKindle() then
+        local parent = _dir:gsub("/$", ""):match("^(.+)/[^/]+$")
+        if parent then
+            tmp_dir = parent
+        end
+    end
     -- Verify the chosen temp directory is actually writable.
     local test_file = tmp_dir .. "/.audiobook_update_test"
     local test_fh = io.open(test_file, "w")
