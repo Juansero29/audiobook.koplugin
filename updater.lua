@@ -203,7 +203,6 @@ function Updater._performUpdate(plugin, release)
 
     -- Use external storage on PocketBook: /tmp is a tiny tmpfs that
     -- fills up and destabilises the device when large zips are written.
-    -- On Android /tmp does not exist, so fall back to the plugin dir.
     local tmp_dir = os.getenv("TMPDIR") or "/tmp"
     local created_ext_tmp = false
     local Device = require("device")
@@ -231,6 +230,14 @@ function Updater._performUpdate(plugin, release)
     -- release zips that include ffmpeg/Piper binaries (issue #38 update
     -- failure). Put temp files on user storage next to the plugin dir.
     if Device:isKindle() then
+        local parent = _dir:gsub("/$", ""):match("^(.+)/[^/]+$")
+        if parent then
+            tmp_dir = parent
+        end
+    end
+    -- Android has no /tmp in the app sandbox; writing there fails with
+    -- "No such file or directory". Use user storage next to the plugin dir.
+    if Device:isAndroid() then
         local parent = _dir:gsub("/$", ""):match("^(.+)/[^/]+$")
         if parent then
             tmp_dir = parent
