@@ -824,18 +824,38 @@ function MediaEngine:_spawnTracked(cmd, gen, opts)
         setsid, pid_file, exec, cmd:gsub("'", "'\\''"), redirect)
     os.execute(wrapper)
 
-    UIManager:scheduleIn(opts.delay or 0.3, function()
+    -- Retry PID capture a few times: on slow Kindle devices the wrapper shell
+    -- may not have written the PID file within the first 0.3 s, leaving the
+    -- old pipeline untracked.  An untracked pipeline keeps playing across seeks
+    -- and sounds like audio looping/stuttering.
+    local function try_capture_pid(attempt)
         if self.play_generation ~= gen then return end
         local pf = io.open(pid_file, "r")
+        local pid
         if pf then
             local pid_str = pf:read("*l")
             pf:close()
-            self.audio_pid = tonumber(pid_str)
-            logger.warn("MediaEngine: " .. name .. " PID =", self.audio_pid)
+            pid = tonumber(pid_str)
         end
-        os.remove(pid_file)
-        self:_startPositionPoller(gen)
-        self:_startCompletionWatcher(gen)
+        if pid then
+            self.audio_pid = pid
+            logger.warn("MediaEngine: " .. name .. " PID =", self.audio_pid)
+            os.remove(pid_file)
+            self:_startPositionPoller(gen)
+            self:_startCompletionWatcher(gen)
+        elseif attempt < 3 then
+            UIManager:scheduleIn(0.2, function()
+                try_capture_pid(attempt + 1)
+            end)
+        else
+            logger.warn("MediaEngine: " .. name .. " PID capture failed after retries")
+            os.remove(pid_file)
+            self:_startPositionPoller(gen)
+            self:_startCompletionWatcher(gen)
+        end
+    end
+    UIManager:scheduleIn(opts.delay or 0.3, function()
+        try_capture_pid(1)
     end)
 
     return true
@@ -1900,6 +1920,14 @@ function MediaEngine:stop()
             end)
         end
         self.audio_pid = nil
+    end
+
+    -- Fallback for slow Kindle boots where PID capture failed: nuke any orphan
+    -- pipelines we may have spawned, otherwise seek-by-restart leaves the old
+    -- audio running and the user hears overlapping/looping audio.
+    if self.backend == self.BACKENDS.KINDLE_GST_PLAY then
+        os.execute("pkill -9 -f 'abk-progress' 2>/dev/null")
+        os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
     end
 
     -- Remove the raw PCM temp file created by _playSystemGstLaunch

@@ -425,7 +425,19 @@ function ABSBrowse._browseLibraries(plugin)
                 UIManager:close(self)
                 return true
             end
-            return false
+            -- Drive Menu pagination explicitly and force a full-screen refresh.
+            -- Letting the event propagate sometimes leaves the new page invisible
+            -- on e-ink until the next suspend/resume cycle.
+            local direction = ges_ev.direction
+            if direction == "west" then
+                menu:onNextPage()
+            elseif direction == "east" then
+                menu:onPrevPage()
+            else
+                return false
+            end
+            UIManager:setDirty(nil, "ui")
+            return true
         end
 
         menu.close_callback = function()
@@ -567,7 +579,19 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, p
                 UIManager:close(self)
                 return true
             end
-            return false
+            -- Drive Menu pagination explicitly and force a full-screen refresh.
+            -- Letting the event propagate sometimes leaves the new page invisible
+            -- on e-ink until the next suspend/resume cycle.
+            local direction = ges_ev.direction
+            if direction == "west" then
+                menu:onNextPage()
+            elseif direction == "east" then
+                menu:onPrevPage()
+            else
+                return false
+            end
+            UIManager:setDirty(nil, "ui")
+            return true
         end
 
         menu.close_callback = function()
@@ -684,7 +708,19 @@ function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded)
             UIManager:close(self)
             return true
         end
-        return false
+        -- Drive Menu pagination explicitly and force a full-screen refresh.
+        -- Letting the event propagate sometimes leaves the new page invisible
+        -- on e-ink until the next suspend/resume cycle.
+        local direction = ges_ev.direction
+        if direction == "west" then
+            menu:onNextPage()
+        elseif direction == "east" then
+            menu:onPrevPage()
+        else
+            return false
+        end
+        UIManager:setDirty(nil, "ui")
+        return true
     end
 
     menu.close_callback = function()
@@ -820,7 +856,19 @@ function ABSBrowse._showDownloadedItems(plugin, cache, touchmenu_instance)
             UIManager:close(self)
             return true
         end
-        return false
+        -- Drive Menu pagination explicitly and force a full-screen refresh.
+        -- Letting the event propagate sometimes leaves the new page invisible
+        -- on e-ink until the next suspend/resume cycle.
+        local direction = ges_ev.direction
+        if direction == "west" then
+            menu:onNextPage()
+        elseif direction == "east" then
+            menu:onPrevPage()
+        else
+            return false
+        end
+        UIManager:setDirty(nil, "ui")
+        return true
     end
 
     menu.close_callback = function()

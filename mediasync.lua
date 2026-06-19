@@ -958,7 +958,19 @@ function MediaSync:_showModalMenu(opts)
     end
     function window:onSwipe(arg, ges_ev)
         if outside(ges_ev) then ms:_closeModalMenu(); return true end
-        return false
+        -- Drive Menu pagination explicitly and force a full-screen refresh.
+        -- Letting the event propagate sometimes leaves the new page invisible
+        -- on e-ink until the next suspend/resume cycle.
+        local direction = ges_ev.direction
+        if direction == "west" then
+            menu:onNextPage()
+        elseif direction == "east" then
+            menu:onPrevPage()
+        else
+            return false
+        end
+        UIManager:setDirty(nil, "ui")
+        return true
     end
     function window:onHold(arg, ges_ev)
         return outside(ges_ev) and true or false
