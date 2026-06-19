@@ -420,6 +420,14 @@ function ABSBrowse._browseLibraries(plugin)
             return false
         end
 
+        function window:onSwipe(arg, ges_ev)
+            if ges_ev.pos:notIntersectWith(menu_rect) then
+                UIManager:close(self)
+                return true
+            end
+            return false
+        end
+
         menu.close_callback = function()
             UIManager:close(window)
         end
@@ -432,7 +440,9 @@ end
 -- Library items list
 -- ---------------------------------------------------------------------------
 
-function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name)
+function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+    page = page or 0
+    local page_size = 50
     local busy = InfoMessage:new{
         text = _("Loading items…"),
         timeout = 0,
@@ -440,7 +450,7 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name)
     UIManager:show(busy)
 
     UIManager:scheduleIn(0.1, function()
-        local data, err = client:getLibraryItems(library_id, 50, 0)
+        local data, err = client:getLibraryItems(library_id, page_size, page)
         UIManager:close(busy)
 
         if not data then
@@ -468,7 +478,21 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name)
         end)
         local cache = ABSCache and ABSCache:new{ plugin_dir = pp:sub(1, -2) }
 
+        -- Forward declaration so page-turn closures can close over the window.
+        local window
         local menu_items = {}
+
+        -- Previous page entry
+        if page > 0 then
+            table.insert(menu_items, {
+                text = _("← Previous page"),
+                callback = function()
+                    UIManager:close(window)
+                    ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page - 1)
+                end,
+            })
+        end
+
         for idx, item in ipairs(items) do
             local meta = item.media and item.media.metadata or {}
             local title = meta.title or _("Untitled")
@@ -492,6 +516,18 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name)
             })
         end
 
+        -- Next page entry
+        local total = tonumber(data.total) or #items
+        if (page + 1) * page_size < total then
+            table.insert(menu_items, {
+                text = _("Next page →"),
+                callback = function()
+                    UIManager:close(window)
+                    ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page + 1)
+                end,
+            })
+        end
+
         local menu = Menu:new{
             title = library_name or _("Library Items"),
             item_table = menu_items,
@@ -504,7 +540,7 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name)
             menu,
         }
 
-        local window = InputContainer:new{
+        window = InputContainer:new{
             dimen = Screen:getSize(),
             centered,
         }
@@ -519,6 +555,14 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name)
         }
 
         function window:onTap(arg, ges_ev)
+            if ges_ev.pos:notIntersectWith(menu_rect) then
+                UIManager:close(self)
+                return true
+            end
+            return false
+        end
+
+        function window:onSwipe(arg, ges_ev)
             if ges_ev.pos:notIntersectWith(menu_rect) then
                 UIManager:close(self)
                 return true
@@ -628,6 +672,14 @@ function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded)
     }
 
     function window:onTap(arg, ges_ev)
+        if ges_ev.pos:notIntersectWith(menu_rect) then
+            UIManager:close(self)
+            return true
+        end
+        return false
+    end
+
+    function window:onSwipe(arg, ges_ev)
         if ges_ev.pos:notIntersectWith(menu_rect) then
             UIManager:close(self)
             return true
@@ -756,6 +808,14 @@ function ABSBrowse._showDownloadedItems(plugin, cache, touchmenu_instance)
     }
 
     function window:onTap(arg, ges_ev)
+        if ges_ev.pos:notIntersectWith(menu_rect) then
+            UIManager:close(self)
+            return true
+        end
+        return false
+    end
+
+    function window:onSwipe(arg, ges_ev)
         if ges_ev.pos:notIntersectWith(menu_rect) then
             UIManager:close(self)
             return true

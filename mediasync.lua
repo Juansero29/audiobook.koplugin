@@ -986,7 +986,7 @@ function MediaSync:showChapterList()
         return
     end
 
-    local _, current_idx = self:getCurrentChapter()
+    local current_chapter, current_idx = self:getCurrentChapter()
     local items = {}
     for i, ch in ipairs(self.chapters) do
         table.insert(items, {
