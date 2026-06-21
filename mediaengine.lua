@@ -1082,6 +1082,31 @@ end
 -- ---------------------------------------------------------------------------
 
 --[[--
+Kill any previous audiobook pipeline spawned for the Kindle gst-launch-0.10
+backends.  The ffmpeg path is identifiable by its -progress file path
+containing "abk-progress", and every audiobook pipeline ends in
+"mixersink stream-type=Music".  Calling this before starting a new stream
+prevents two streams from mixing in mixersink, which the user hears as an
+echo/loop.
+--]]
+function MediaEngine:_killOrphanKindleGstPipelines(name, wait_us)
+    name = name or "kindle-gst"
+    logger.warn("MediaEngine: killing orphan Kindle audiobook pipelines (", name, ")")
+    -- ffmpeg side of the ffmpeg|gst-launch pipeline
+    os.execute("pkill -9 -f 'abk-progress' 2>/dev/null")
+    -- gst-launch-0.10 side: every audiobook pipeline uses mixersink with this
+    -- exact stream-type.  This also kills the TTS keepalive, which restarts
+    -- automatically when TTS is used again.
+    os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
+    -- Give the mixer a moment to release the old stream before the new one
+    -- attaches; without this the new stream can still overlap the tail of the
+    -- dying one.
+    if wait_us and wait_us > 0 then
+        os.execute("usleep " .. tostring(wait_us))
+    end
+end
+
+--[[--
 Play a WAV through the system gst-launch-0.10 with the pipeline verified
 working on PW5/PW6 firmware:
 
@@ -1166,6 +1191,12 @@ function MediaEngine:_playSystemGstLaunch(gen)
         .. " [ -d /proc/$p ] || rm -f \"$f\"; done 2>/dev/null")
     MediaEngine._takeMusicFocusOnce()
 
+    -- Nuke any previous audiobook gst-launch-0.10 pipeline before attaching
+    -- a new stream to mixersink.  If the old pipeline is still draining its
+    -- ring buffer while the new one starts, the user hears both streams as an
+    -- echo/loop ("this is this is an an example example").
+    self:_killOrphanKindleGstPipelines("kindle-gst-wav", 150000)
+
     local caps = string.format(
         "audio/x-raw-int,endianness=1234,signed=true,width=%d,depth=%d,rate=%d,channels=%d",
         bits, bits, rate, channels)
@@ -1205,13 +1236,10 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     -- stream before starting a new one.  PID capture is asynchronous, so a
     -- rapid restart (seek / volume change) that lands inside that window never
     -- tracks the freshly spawned pipeline; stop() then can't kill it and it
-    -- keeps playing -> overlapping audio.  Our ffmpeg is uniquely identifiable
-    -- by its -progress file path, so this targets only our own strays (not the
-    -- TTS keepalive, which streams /dev/zero).  killing ffmpeg closes the pipe
-    -- and its gst-launch child exits on EOS.
-    os.execute("pkill -9 -f abk-progress 2>/dev/null")
-    os.execute("for f in /dev/shm/mstream*; do p=${f#/dev/shm/mstream}; p=${p%%_*};"
-        .. " [ -d /proc/$p ] || rm -f \"$f\"; done 2>/dev/null")
+    -- keeps playing -> overlapping audio.
+    self:_killOrphanKindleGstPipelines("kindle-gst-ffmpeg", 150000)
+
+    -- Take focus after the old pipeline has had a moment to tear down.
     MediaEngine._takeMusicFocusOnce()
 
     local seek = self._seek_offset or 0
@@ -1926,8 +1954,10 @@ function MediaEngine:stop()
     -- pipelines we may have spawned, otherwise seek-by-restart leaves the old
     -- audio running and the user hears overlapping/looping audio.
     if self.backend == self.BACKENDS.KINDLE_GST_PLAY then
-        os.execute("pkill -9 -f 'abk-progress' 2>/dev/null")
-        os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
+        if not dying_pid and not ffi.C.kill then
+            logger.warn("MediaEngine: ffi.C.kill unavailable; relying on pkill fallback for Kindle gst")
+        end
+        self:_killOrphanKindleGstPipelines("stop")
     end
 
     -- Remove the raw PCM temp file created by _playSystemGstLaunch
