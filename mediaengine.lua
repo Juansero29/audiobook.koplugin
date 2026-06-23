@@ -750,6 +750,14 @@ function MediaEngine:play(on_complete, on_fail)
         return false
     end
 
+    -- Defensive: on Kindle the mixersink can hold a dying stream across a
+    -- stop/play cycle and mix it with the new one, producing an echo/loop.
+    -- Nuke any orphan pipelines before stop() bumps the generation, then
+    -- stop() will also run the same cleanup as a fallback.
+    if self:_isKindle() then
+        self:_killOrphanKindleGstPipelines("play-preflight", 300000)
+    end
+
     self:stop()
     local gen = self:_nextGeneration()
     self._on_complete = on_complete
@@ -849,6 +857,11 @@ function MediaEngine:_spawnTracked(cmd, gen, opts)
             end)
         else
             logger.warn("MediaEngine: " .. name .. " PID capture failed after retries")
+            -- Untracked Kindle gst pipelines are exactly what causes the
+            -- echo/loop; kill them now before they overlap the next seek.
+            if name == "kindle-gst" and self:_isKindle() then
+                self:_killOrphanKindleGstPipelines("spawn-fallback", 300000)
+            end
             os.remove(pid_file)
             self:_startPositionPoller(gen)
             self:_startCompletionWatcher(gen)
@@ -1092,18 +1105,26 @@ echo/loop.
 function MediaEngine:_killOrphanKindleGstPipelines(name, wait_us)
     name = name or "kindle-gst"
     logger.warn("MediaEngine: killing orphan Kindle audiobook pipelines (", name, ")")
-    -- ffmpeg side of the ffmpeg|gst-launch pipeline
+    -- ffmpeg side of the ffmpeg|gst-launch pipeline.  Use multiple patterns
+    -- because busybox pkill on some firmwares matches the full command line
+    -- differently than procps pkill.
     os.execute("pkill -9 -f 'abk-progress' 2>/dev/null")
+    os.execute("pkill -9 -f 'ffmpeg.*abk-progress' 2>/dev/null")
+    os.execute("killall -9 ffmpeg 2>/dev/null")
     -- gst-launch-0.10 side: every audiobook pipeline uses mixersink with this
     -- exact stream-type.  This also kills the TTS keepalive, which restarts
     -- automatically when TTS is used again.
     os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
+    os.execute("pkill -9 -f 'gst-launch-0.10 fdsrc' 2>/dev/null")
+    os.execute("killall -9 gst-launch-0.10 2>/dev/null")
     -- Give the mixer a moment to release the old stream before the new one
     -- attaches; without this the new stream can still overlap the tail of the
     -- dying one.
+    wait_us = wait_us or 300000
     if wait_us and wait_us > 0 then
         os.execute("usleep " .. tostring(wait_us))
     end
+    logger.warn("MediaEngine: orphan Kindle audiobook pipeline cleanup done (", name, ")")
 end
 
 --[[--
@@ -1953,7 +1974,9 @@ function MediaEngine:stop()
     -- Fallback for slow Kindle boots where PID capture failed: nuke any orphan
     -- pipelines we may have spawned, otherwise seek-by-restart leaves the old
     -- audio running and the user hears overlapping/looping audio.
-    if self.backend == self.BACKENDS.KINDLE_GST_PLAY then
+    -- Run unconditionally on Kindle hardware even if the current backend was
+    -- not (yet) detected as KINDLE_GST_PLAY.
+    if self:_isKindle() then
         if not dying_pid and not ffi.C.kill then
             logger.warn("MediaEngine: ffi.C.kill unavailable; relying on pkill fallback for Kindle gst")
         end
