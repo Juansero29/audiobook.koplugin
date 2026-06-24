@@ -1320,10 +1320,17 @@ function MediaEngine:_writePersistentPipelineScript()
     local channels = 2
     local silence_samples = math.floor(sr * 0.05)
     local silence_bytes = silence_samples * channels * 2
+    -- Use the same ffmpeg binary that backend detection selected (usually the
+    -- bundled one in plugins/audiobook.koplugin/bin/ffmpeg).  The bare 'ffmpeg'
+    -- command is not in PATH on Kobo, so the script silently failed to decode
+    -- any audio and users heard silence while TTS (which does not use ffmpeg)
+    -- worked fine.
+    local ffmpeg = self.backend_cmd or "ffmpeg"
     local script = string.format([=[
 #!/bin/sh
 CTRL="%s"
 FIFO="%s"
+FFMPEG="%s"
 mkdir -p "$CTRL"
 rm -f "$CTRL/stop" "$CTRL/play" "$CTRL/done" "$CTRL/gst_pid" "$CTRL/pipeline_stderr"
 rm -f "$FIFO"
@@ -1354,9 +1361,9 @@ while kill -0 $GST_PID 2>/dev/null && [ ! -f "$CTRL/stop" ]; do
       CURRENT_FFMPEG_PID=""
     fi
     if [ -n "$FILT" ]; then
-      ffmpeg -ss "$OFFSET" -i "$FILE" -filter:a "$FILT" -f s16le -ar 44100 -ac 2 - >&3 2>/dev/null &
+      "$FFMPEG" -ss "$OFFSET" -i "$FILE" -filter:a "$FILT" -f s16le -ar 44100 -ac 2 - >&3 2>>"$CTRL/pipeline_stderr" &
     else
-      ffmpeg -ss "$OFFSET" -i "$FILE" -f s16le -ar 44100 -ac 2 - >&3 2>/dev/null &
+      "$FFMPEG" -ss "$OFFSET" -i "$FILE" -f s16le -ar 44100 -ac 2 - >&3 2>>"$CTRL/pipeline_stderr" &
     fi
     CURRENT_FFMPEG_PID=$!
   fi
@@ -1370,7 +1377,7 @@ if [ -n "$CURRENT_FFMPEG_PID" ]; then
   kill $CURRENT_FFMPEG_PID 2>/dev/null || true
   wait $CURRENT_FFMPEG_PID 2>/dev/null || true
 fi
-]=], self._media_ctrl_dir, self._media_fifo, sr, silence_bytes, silence_bytes, sr, channels)
+]=], self._media_ctrl_dir, self._media_fifo, ffmpeg:gsub("'", "'\\''"), sr, silence_bytes, silence_bytes, sr, channels)
     local f = io.open(self._media_script, "w")
     if not f then return false end
     f:write(script)
