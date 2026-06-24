@@ -1332,7 +1332,7 @@ CTRL="%s"
 FIFO="%s"
 FFMPEG="%s"
 mkdir -p "$CTRL"
-rm -f "$CTRL/stop" "$CTRL/play" "$CTRL/done" "$CTRL/gst_pid" "$CTRL/pipeline_stderr"
+rm -f "$CTRL/stop" "$CTRL/play" "$CTRL/pause" "$CTRL/done" "$CTRL/gst_pid" "$CTRL/pipeline_stderr"
 rm -f "$FIFO"
 mkfifo "$FIFO"
 # Silence chunk: ~50ms at %dHz 16-bit stereo = %d bytes
@@ -1346,17 +1346,28 @@ gst-launch-1.0 filesrc location="$FIFO" \
 GST_PID=$!
 exec 3>"$FIFO"
 echo $GST_PID > "$CTRL/gst_pid"
-cleanup() { exec 3>&- 2>/dev/null; kill $GST_PID 2>/dev/null; rm -f "$FIFO" "$CTRL/s.raw" "$CTRL/gst_pid" "$CTRL/pipeline_stderr"; }
+cleanup() { exec 3>&- 2>/dev/null; kill $GST_PID 2>/dev/null; rm -f "$FIFO" "$CTRL/s.raw" "$CTRL/gst_pid" "$CTRL/pipeline_stderr" "$CTRL/pause"; }
 trap cleanup EXIT TERM
 CURRENT_FFMPEG_PID=""
 while kill -0 $GST_PID 2>/dev/null && [ ! -f "$CTRL/stop" ]; do
+  if [ -f "$CTRL/pause" ]; then
+    rm -f "$CTRL/pause"
+    if [ -n "$CURRENT_FFMPEG_PID" ]; then
+      kill -9 $CURRENT_FFMPEG_PID 2>/dev/null || true
+      wait $CURRENT_FFMPEG_PID 2>/dev/null || true
+      CURRENT_FFMPEG_PID=""
+    fi
+  fi
   if [ -f "$CTRL/play" ]; then
     FILE=$(sed -n '1p' "$CTRL/play")
     OFFSET=$(sed -n '2p' "$CTRL/play")
     FILT=$(sed -n '3p' "$CTRL/play")
     rm -f "$CTRL/play" "$CTRL/done"
     if [ -n "$CURRENT_FFMPEG_PID" ]; then
-      kill $CURRENT_FFMPEG_PID 2>/dev/null || true
+      # SIGKILL and a tiny wait so the new ffmpeg starts quickly; a lingering
+      # tail of old-volume audio is less jarring than a long pause while we
+      # politely wait for SIGTERM shutdown.
+      kill -9 $CURRENT_FFMPEG_PID 2>/dev/null || true
       wait $CURRENT_FFMPEG_PID 2>/dev/null || true
       CURRENT_FFMPEG_PID=""
     fi
@@ -1411,9 +1422,13 @@ function MediaEngine:_startPersistentPipeline()
         return false
     end
 
-    os.execute("rm -f " .. self._media_ctrl_dir .. "/stop " .. self._media_ctrl_dir .. "/play " .. self._media_ctrl_dir .. "/done")
+    os.execute("rm -f " .. self._media_ctrl_dir .. "/stop " .. self._media_ctrl_dir .. "/play " .. self._media_ctrl_dir .. "/pause " .. self._media_ctrl_dir .. "/done")
 
-    local h = io.popen(self._media_script .. " >/dev/null 2>/dev/null & echo $!")
+    -- Launch the wrapper in its own session/process group (setsid) so that
+    -- stop() can reliably kill the wrapper and its ffmpeg/gst-launch children
+    -- without affecting KOReader itself.
+    local setsid_prefix = self:commandExists("setsid") and "setsid " or ""
+    local h = io.popen(setsid_prefix .. self._media_script .. " >/dev/null 2>/dev/null & echo $!")
     local pid_str = h and h:read("*a") or ""
     if h then h:close() end
     self._pipeline_wrapper_pid = tonumber(pid_str:match("(%d+)"))
@@ -1433,8 +1448,33 @@ function MediaEngine:_startPersistentPipeline()
     self._pipeline_gst_pid = gst_pid
     self.audio_pid = gst_pid
     self._persistent_pipeline_active = true
-    -- Conservative pipe-buffer delay: assume 64KB FIFO at 44100Hz stereo 16-bit (~371ms).
+
+    -- Shrink the FIFO pipe buffer from 64KB to 16KB.  At 44100Hz stereo 16-bit
+    -- (~176KB/s) a 64KB buffer holds ~370ms of decoded audio; when switching
+    -- ffmpeg (volume change / seek) that old audio plays at the old level before
+    -- the new stream reaches the sink, causing a audible stutter.  16KB is
+    -- ~90ms, enough to absorb CPU stalls but short enough to keep switching
+    -- artifacts brief.
     self._pipe_buffer_delay_ms = 400
+    if gst_pid then
+        local bit = require("bit")
+        local O_WRONLY = 1
+        local O_NONBLOCK = 2048
+        local F_SETPIPE_SZ = 1031
+        local fd = ffi.C.open(self._media_fifo, bit.bor(O_WRONLY, O_NONBLOCK))
+        if fd >= 0 then
+            local ret = ffi.C.fcntl(fd, F_SETPIPE_SZ, ffi.new("int", 16384))
+            if ret >= 0 then
+                self._pipe_buffer_delay_ms = 90
+                logger.warn("MediaEngine: persistent pipeline FIFO shrunk to 16KB")
+            else
+                logger.warn("MediaEngine: fcntl F_SETPIPE_SZ failed, errno=", ffi.errno())
+            end
+            ffi.C.close(fd)
+        else
+            logger.warn("MediaEngine: could not open FIFO for pipe resize, errno=", ffi.errno())
+        end
+    end
 
     if gst_pid then
         logger.warn("MediaEngine: persistent pipeline started, wrapper=", self._pipeline_wrapper_pid, "gst=", gst_pid)
@@ -1880,10 +1920,14 @@ function MediaEngine:pause()
     self._pause_start_time = UIManager:getTime()
 
     if self._persistent_pipeline_active then
-        if self._pipeline_gst_pid and ffi.C.kill then
-            ffi.C.kill(self._pipeline_gst_pid, 19) -- SIGSTOP on gst-launch only
-            logger.warn("MediaEngine: paused persistent pipeline, gst=", self._pipeline_gst_pid)
-        end
+        -- Ask the wrapper to kill the ffmpeg feeder while keeping gst-launch
+        -- alive.  Stopping the whole group with SIGSTOP freezes GStreamer's
+        -- clock and the MTK sink; on resume the buffered burst stutters for
+        -- several seconds.  Killing only the decoder lets the pipeline drain
+        -- cleanly and keeps the exclusive MTK socket open.
+        local pf = io.open(self._media_ctrl_dir .. "/pause", "w")
+        if pf then pf:write("1"); pf:close() end
+        logger.warn("MediaEngine: paused persistent pipeline (ffmpeg feeder), wrapper=", self._pipeline_wrapper_pid)
         return
     end
 
@@ -1912,18 +1956,36 @@ end
 
 function MediaEngine:resume()
     if not self.is_playing or not self.is_paused then return end
+
+    if self._persistent_pipeline_active then
+        -- Restart the ffmpeg feeder at the position where we paused.  The
+        -- wrapper kept gst-launch alive and fed silence while we were paused,
+        -- so the MTK socket never closed and the clock never jumped.
+        -- Read the position while still paused so we resume exactly where we
+        -- left off, then update the pause bookkeeping.
+        local resume_pos = self:getPosition()
+        self.is_paused = false
+        if self._pause_start_time then
+            self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
+            self._pause_start_time = nil
+        end
+        local filter_chain = self:_persistentFilterChain()
+        os.remove(self._media_ctrl_dir .. "/done")
+        local f = io.open(self._media_ctrl_dir .. "/play", "w")
+        if f then
+            f:write(self.current_path .. "\n")
+            f:write(tostring(resume_pos) .. "\n")
+            f:write(filter_chain .. "\n")
+            f:close()
+        end
+        logger.warn("MediaEngine: resumed persistent pipeline at", resume_pos, "wrapper=", self._pipeline_wrapper_pid)
+        return
+    end
+
     self.is_paused = false
     if self._pause_start_time then
         self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
         self._pause_start_time = nil
-    end
-
-    if self._persistent_pipeline_active then
-        if self._pipeline_gst_pid and ffi.C.kill then
-            ffi.C.kill(self._pipeline_gst_pid, 18) -- SIGCONT on gst-launch only
-            logger.warn("MediaEngine: resumed persistent pipeline, gst=", self._pipeline_gst_pid)
-        end
-        return
     end
 
     if self.backend == self.BACKENDS.MPV then
@@ -2122,24 +2184,29 @@ function MediaEngine:seek(seconds, mode)
             -- Cancel old completion watcher.
             self:_nextGeneration()
             local new_gen = self.play_generation
-            -- Write new play control with the target offset.
             local filter_chain = self:_persistentFilterChain()
-            os.remove(self._media_ctrl_dir .. "/done")
-            local f = io.open(self._media_ctrl_dir .. "/play", "w")
-            if f then
-                f:write(self.current_path .. "\n")
-                f:write(tostring(target) .. "\n")
-                f:write(filter_chain .. "\n")
-                f:close()
-            end
-            -- Preserve paused state.
-            if not was_playing then
+            if was_playing then
+                -- Write new play control with the target offset; the wrapper
+                -- will kill the old ffmpeg and restart at the new position.
+                os.remove(self._media_ctrl_dir .. "/done")
+                local f = io.open(self._media_ctrl_dir .. "/play", "w")
+                if f then
+                    f:write(self.current_path .. "\n")
+                    f:write(tostring(target) .. "\n")
+                    f:write(filter_chain .. "\n")
+                    f:close()
+                end
+                self.is_playing = true
+                self.is_paused = false
+            else
+                -- Seeking while paused must not start audio.  Tell the wrapper
+                -- to keep the ffmpeg feeder killed; resume() will issue the
+                -- play command from the new offset.
+                local pf = io.open(self._media_ctrl_dir .. "/pause", "w")
+                if pf then pf:write("1"); pf:close() end
                 self.is_playing = true
                 self.is_paused = true
                 self._pause_start_time = UIManager:getTime()
-            else
-                self.is_playing = true
-                self.is_paused = false
             end
             self:_startPersistentCompletionWatcher(new_gen, self.current_duration)
             return true
