@@ -358,22 +358,7 @@ function AudiobookPlayer:setupUI()
         show_parent = self,
     }
 
-    local control_row = HorizontalGroup:new{
-        align = "center",
-        HorizontalSpan:new{ width = spacing },
-        self.skip_back_button,
-        HorizontalSpan:new{ width = spacing },
-        self.prev_chapter_button,
-        HorizontalSpan:new{ width = spacing * 2 },
-        self.play_pause_button,
-        HorizontalSpan:new{ width = spacing * 2 },
-        self.next_chapter_button,
-        HorizontalSpan:new{ width = spacing },
-        self.skip_forward_button,
-        HorizontalSpan:new{ width = spacing },
-    }
-
-    -- ── Volume row: [−]  ♪ NN%  [+] ──
+    -- ── Volume controls (used in both orientations) ──
     self.volume_widget = TextWidget:new{
         text = self:_volumeText(),
         face = Font:getFace("cfont", 16),
@@ -398,17 +383,69 @@ function AudiobookPlayer:setupUI()
         radius = Screen:scaleBySize(6),
         show_parent = self,
     }
-    local volume_row = HorizontalGroup:new{
-        align = "center",
-        self.vol_minus_button,
-        HorizontalSpan:new{ width = spacing * 2 },
-        CenterContainer:new{
-            dimen = Geom:new{ w = button_size * 2, h = button_size },
+
+    local is_landscape = self.width > self.height
+    local control_row, volume_row
+    if is_landscape then
+        -- Landscape: single row [-] [<30] [<<] [play] [>>] [30>] [+] [90%]
+        -- Transport/volume buttons are centered on the full screen width;
+        -- the percentage label sits at the right edge and does not shift the center.
+        local inner_span = math.floor(spacing / 2)
+        local button_group_w = button_size * 7
+            + inner_span * 2
+            + spacing * 6
+        local vol_w = self.volume_widget:getSize().w
+        local right_span = spacing
+        local left_span = math.max(0, math.floor((self.width - button_group_w) / 2))
+        local mid_span = math.max(0, self.width - left_span - button_group_w - vol_w - right_span)
+        control_row = HorizontalGroup:new{
+            align = "center",
+            HorizontalSpan:new{ width = left_span },
+            self.vol_minus_button,
+            HorizontalSpan:new{ width = inner_span },
+            self.skip_back_button,
+            HorizontalSpan:new{ width = spacing },
+            self.prev_chapter_button,
+            HorizontalSpan:new{ width = spacing * 2 },
+            self.play_pause_button,
+            HorizontalSpan:new{ width = spacing * 2 },
+            self.next_chapter_button,
+            HorizontalSpan:new{ width = spacing },
+            self.skip_forward_button,
+            HorizontalSpan:new{ width = inner_span },
+            self.vol_plus_button,
+            HorizontalSpan:new{ width = mid_span },
             self.volume_widget,
-        },
-        HorizontalSpan:new{ width = spacing * 2 },
-        self.vol_plus_button,
-    }
+            HorizontalSpan:new{ width = right_span },
+        }
+    else
+        -- Portrait: separate transport and volume rows
+        control_row = HorizontalGroup:new{
+            align = "center",
+            HorizontalSpan:new{ width = spacing },
+            self.skip_back_button,
+            HorizontalSpan:new{ width = spacing },
+            self.prev_chapter_button,
+            HorizontalSpan:new{ width = spacing * 2 },
+            self.play_pause_button,
+            HorizontalSpan:new{ width = spacing * 2 },
+            self.next_chapter_button,
+            HorizontalSpan:new{ width = spacing },
+            self.skip_forward_button,
+            HorizontalSpan:new{ width = spacing },
+        }
+        volume_row = HorizontalGroup:new{
+            align = "center",
+            self.vol_minus_button,
+            HorizontalSpan:new{ width = spacing * 2 },
+            CenterContainer:new{
+                dimen = Geom:new{ w = button_size * 2, h = button_size },
+                self.volume_widget,
+            },
+            HorizontalSpan:new{ width = spacing * 2 },
+            self.vol_plus_button,
+        }
+    end
 
     -- ── Assemble full layout ──
     local content = VerticalGroup:new{
@@ -445,13 +482,17 @@ function AudiobookPlayer:setupUI()
             dimen = Geom:new{ w = self.width, h = button_size },
             control_row,
         },
-        VerticalSpan:new{ width = self.height * 0.02 },
-        CenterContainer:new{
-            dimen = Geom:new{ w = self.width, h = button_size },
-            volume_row,
-        },
-        VerticalSpan:new{ width = Size.padding.small },
     }
+    if not is_landscape then
+        table.insert(content,
+            VerticalSpan:new{ width = self.height * 0.02 })
+        table.insert(content,
+            CenterContainer:new{
+                dimen = Geom:new{ w = self.width, h = button_size },
+                volume_row,
+            })
+    end
+    table.insert(content, VerticalSpan:new{ width = Size.padding.small })
 
     -- Match the reader's configured background color so the player blends with
     -- the user's theme instead of forcing pure white.
@@ -471,7 +512,7 @@ function AudiobookPlayer:setupUI()
 
     -- ── Mini-player bar (shown when minimized) ──
     self._mini_height = Screen:scaleBySize(44)
-    local mini_btn_size = self._mini_height - 8  -- slightly smaller containing box
+    local mini_btn_size = self._mini_height - 20  -- keep clear of the mini bar border
 
     self._mini_play_pause = Button:new{
         text = self.is_playing and "⏸" or "▶",
@@ -493,24 +534,10 @@ function AudiobookPlayer:setupUI()
         show_parent = self,
     }
 
-    -- Center: title + time stacked and centered
+    -- Center: title + time stacked and centered.
+    -- Width is reduced as optional side button groups are added; the actual
+    -- TextWidgets are created after center_max_width is final.
     local center_max_width = self.width - mini_btn_size * 2 - spacing * 4
-    self._mini_title = TextWidget:new{
-        text = self.output_name or self.title or _("Audiobook"),
-        face = Font:getFace("cfont", 13),
-        max_width = center_max_width,
-        truncate_left = true,
-    }
-    self._mini_time = TextWidget:new{
-        text = self.current_time_str or "",
-        face = Font:getFace("cfont", 11),
-        max_width = center_max_width,
-    }
-    local mini_center = VerticalGroup:new{
-        align = "center",
-        self._mini_title,
-        self._mini_time,
-    }
 
     -- Read-along: live sync-offset nudge buttons.  The sync loop reads the
     -- setting every tick, so each press shifts the highlight immediately;
@@ -586,6 +613,25 @@ function AudiobookPlayer:setupUI()
         }
     end
 
+    -- Create the centered title/time stack now that side buttons have reserved
+    -- their full width, so the text cannot overlap the volume/sync buttons.
+    self._mini_title = TextWidget:new{
+        text = self.output_name or self.title or _("Audiobook"),
+        face = Font:getFace("cfont", 13),
+        max_width = center_max_width,
+        truncate_left = false,
+    }
+    self._mini_time = TextWidget:new{
+        text = self.current_time_str or "",
+        face = Font:getFace("cfont", 11),
+        max_width = center_max_width,
+    }
+    local mini_center = VerticalGroup:new{
+        align = "center",
+        self._mini_title,
+        self._mini_time,
+    }
+
     local mini_row = HorizontalGroup:new{
         align = "center",
         HorizontalSpan:new{ width = spacing },
@@ -613,7 +659,10 @@ function AudiobookPlayer:setupUI()
         background = self:_getThemeBackground(),
         bordersize = Size.border.thin,
         padding = 0,
-        mini_row,
+        CenterContainer:new{
+            dimen = Geom:new{ w = self.width, h = self._mini_height - Size.border.thin * 2 },
+            mini_row,
+        },
     }
 
     -- EPUB read-along mode: stay on the book page (highlights + page
@@ -865,6 +914,14 @@ function AudiobookPlayer:_buildCoverFrame()
     local cover_height = self._cover_height or math.floor(math.min(self.width, self.height) * 0.32)
     local cover_width = self._cover_width or math.floor(cover_height * 0.75)
 
+    -- Cache cover frames by path + dimensions so rotation does not re-decode and
+    -- re-scale the image every time.
+    local cache_key = string.format("%s|%dx%d", self.cover_image_path or "", cover_width, cover_height)
+    if self._cover_frame_cache and self._cover_frame_cache[cache_key] then
+        return self._cover_frame_cache[cache_key]
+    end
+
+    local frame
     if self.cover_image_path then
         local padding = Size.padding.small
         local max_w = cover_width - padding * 2
@@ -908,7 +965,7 @@ function AudiobookPlayer:_buildCoverFrame()
         end
 
         if ok and image_widget then
-            return FrameContainer:new{
+            frame = FrameContainer:new{
                 width = cover_width,
                 height = cover_height,
                 background = self:_getThemeBackground(),
@@ -922,27 +979,34 @@ function AudiobookPlayer:_buildCoverFrame()
         end
     end
 
-    -- Fallback: placeholder inside a framed box that blends with the theme
-    local inner_widget = TextWidget:new{
-        text = "♪",
-        face = Font:getFace("cfont", 36),
-    }
-    return FrameContainer:new{
-        width = cover_width,
-        height = cover_height,
-        background = self:_getThemeBackground(),
-        bordersize = Size.border.thin,
-        radius = Screen:scaleBySize(4),
-        padding = 0,
-        CenterContainer:new{
-            dimen = Geom:new{ w = cover_width, h = cover_height },
-            inner_widget,
-        },
-    }
+    if not frame then
+        -- Fallback: placeholder inside a framed box that blends with the theme
+        local inner_widget = TextWidget:new{
+            text = "♪",
+            face = Font:getFace("cfont", 36),
+        }
+        frame = FrameContainer:new{
+            width = cover_width,
+            height = cover_height,
+            background = self:_getThemeBackground(),
+            bordersize = Size.border.thin,
+            radius = Screen:scaleBySize(4),
+            padding = 0,
+            CenterContainer:new{
+                dimen = Geom:new{ w = cover_width, h = cover_height },
+                inner_widget,
+            },
+        }
+    end
+
+    if not self._cover_frame_cache then self._cover_frame_cache = {} end
+    self._cover_frame_cache[cache_key] = frame
+    return frame
 end
 
 function AudiobookPlayer:setCoverImage(path)
     self.cover_image_path = path
+    self._cover_frame_cache = nil
     -- Rebuild the cover frame widget
     if self.cover_frame then
         self.cover_frame = self:_buildCoverFrame()
@@ -1148,15 +1212,20 @@ function AudiobookPlayer:handleEvent(event)
         local new_mode = event.args and event.args[1]
         logger.warn("ABP onSetRotationMode event, mode=", new_mode,
             "current=", self._rotation_mode)
-        -- 1) Let ReaderUI/FileManager do its rotation handling while Screen
-        --    still reports the old mode (ReaderUI compares old vs new).
+        -- Hide our widget before the underlying UI rotates so the user never
+        -- sees the old layout stretched into the new orientation.
+        if self.visible then
+            UIManager:close(self)
+        end
+        -- Let ReaderUI/FileManager do its rotation handling while Screen
+        -- still reports the old mode (ReaderUI compares old vs new).
         if self.ui_widget then
             self.ui_widget:handleEvent(event)
         end
-        -- 2) Rotate the display atomically
+        -- Rotate the display atomically
         Screen:setRotationMode(new_mode)
         UIManager:onRotation()
-        -- 3) Rebuild our widget for the new orientation
+        -- Rebuild and show for the new orientation now that Screen is updated.
         if self.visible then
             self:onSetDimensions(nil, new_mode)
         end
@@ -1386,6 +1455,51 @@ function AudiobookPlayer:_isTapOnWidget(pos, widget)
         and pos.y >= d.y and pos.y <= d.y + d.h
 end
 
+function AudiobookPlayer:_doRebuild(new_w, new_h)
+    -- Preserve state across the rebuild
+    local was_minimized = self._minimized
+    local was_playing = self.is_playing
+    local title = self.title
+    local chapter = self.chapter_title
+    local output = self.output_name
+    local progress = self.progress
+    local time_str = self.current_time_str
+    local speed = self.playback_speed
+    local cover_path = self.cover_image_path
+    -- Re-derive dimensions from the (potentially rotated) screen
+    self.width = new_w
+    self.height = new_h
+    self._rotation_mode = Screen:getRotationMode()
+    -- Rebuild the UI tree with new dimensions
+    self:setupUI()
+    -- Restore state into the fresh widgets
+    self.is_playing = was_playing
+    self.title = title
+    self.chapter_title = chapter
+    self.output_name = output
+    self.progress = progress
+    self.current_time_str = time_str
+    self.playback_speed = speed
+    self.cover_image_path = cover_path
+    self.play_pause_button:setText(was_playing and "⏸" or "▶", self.play_pause_button.width)
+    if chapter and chapter ~= "" then self.chapter_widget:setText(chapter) end
+    if output and output ~= "" then self.output_widget = self:_buildOutputWidget(output) end
+    self.time_widget:setText(time_str or "0:00 / 0:00")
+    self.progress_bar:setPercentage((progress or 0) / 100)
+    self.speed_button:setText(self:_speedText(), self.speed_button.width)
+    self:_updateMiniWidgets()
+    -- Position at the correct coordinates for the new dimensions
+    self.visible = true
+    self._minimized = was_minimized
+    if was_minimized then
+        self.dimen.h = self._mini_height
+        self.dimen.y = self.height - self._mini_height
+    else
+        self.dimen.h = self.height
+        self.dimen.y = 0
+    end
+end
+
 -- Handle rotation mode change.  On Kobo the framebuffer size is fixed
 -- (1264x1680) and the hardware rotates the display; we must rebuild
 -- with the SAME dimensions so the framebuffer content is rotated
@@ -1413,51 +1527,11 @@ function AudiobookPlayer:onSetDimensions(size, rotation_mode)
         size and (size.w .. "x" .. size.h) or "nil",
         "rot=", rot, "using=", new_w, "x", new_h,
         "screen=", Screen:getWidth(), "x", Screen:getHeight())
-    -- Preserve state across the rebuild
-    local was_minimized = self._minimized
-    local was_playing = self.is_playing
-    local title = self.title
-    local chapter = self.chapter_title
-    local output = self.output_name
-    local progress = self.progress
-    local time_str = self.current_time_str
-    local speed = self.playback_speed
-    local cover_path = self.cover_image_path
     -- Remove from UIManager so old coordinates are discarded
     UIManager:close(self)
-    -- Re-derive dimensions from the (potentially rotated) screen
-    self.width = new_w
-    self.height = new_h
-    self._rotation_mode = Screen:getRotationMode()
-    -- Rebuild the UI tree with new dimensions
-    self:setupUI()
-    -- Restore state into the fresh widgets
-    self.is_playing = was_playing
-    self.title = title
-    self.chapter_title = chapter
-    self.output_name = output
-    self.progress = progress
-    self.current_time_str = time_str
-    self.playback_speed = speed
-    self.cover_image_path = cover_path
-    self.play_pause_button:setText(was_playing and "⏸" or "▶", self.play_pause_button.width)
-    if chapter and chapter ~= "" then self.chapter_widget:setText(chapter) end
-    if output and output ~= "" then self.output_widget = self:_buildOutputWidget(output) end
-    self.time_widget:setText(time_str or "0:00 / 0:00")
-    self.progress_bar:setPercentage((progress or 0) / 100)
-    self.speed_button:setText(self:_speedText(), self.speed_button.width)
-    self:_updateMiniWidgets()
+    self:_doRebuild(new_w, new_h)
     -- Re-show at the correct position — this registers the new x,y with
     -- UIManager so paintTo receives the right coordinates.
-    self.visible = true
-    self._minimized = was_minimized
-    if was_minimized then
-        self.dimen.h = self._mini_height
-        self.dimen.y = self.height - self._mini_height
-    else
-        self.dimen.h = self.height
-        self.dimen.y = 0
-    end
     UIManager:show(self, "ui")
     UIManager:setDirty(self, "ui")
     return true
