@@ -341,7 +341,8 @@ function Audiobook:addToMainMenu(menu_items)
             {
                 text = _("Start reading from current page"),
                 enabled_func = function() return (self.ui and self.ui.document) or false end,
-                callback = function()
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
                     if not self._init_ok then self:_showInitError(); return end
                     self:startReadAlong()
                 end,
@@ -352,7 +353,8 @@ function Audiobook:addToMainMenu(menu_items)
                 enabled_func = function()
                     return (self.ui and self.ui.document and self._init_ok and self.media_sync ~= nil) or false
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
                     self:startMediaPlayback()
                 end,
             },
@@ -361,7 +363,8 @@ function Audiobook:addToMainMenu(menu_items)
                 enabled_func = function()
                     return (self._init_ok and self.media_sync ~= nil) or false
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
                     self:openAudioFile()
                 end,
             },
@@ -370,7 +373,8 @@ function Audiobook:addToMainMenu(menu_items)
                 enabled_func = function()
                     return (self._init_ok and self.media_sync ~= nil) or false
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
                     self:openMusicPlaylist()
                 end,
             },
@@ -1338,16 +1342,7 @@ function Audiobook:_doPlayAudioFile(file_path, playlist_files, start_position, a
         end_time = known_duration or 3600,
         text = _("Audio playback"),
     }}
-    self.media_sync:start(playable_path, timing_data, chapters, cover_path, playlist_files, file_path)
-
-    -- Seek to saved position if resuming
-    if start_position and start_position > 0 then
-        UIManager:scheduleIn(0.5, function()
-            if self.media_sync then
-                self.media_sync:seekToTime(start_position)
-            end
-        end)
-    end
+    self.media_sync:start(playable_path, timing_data, chapters, cover_path, playlist_files, file_path, start_position)
 
     -- Start BT media button listener if enabled
     pcall(function()

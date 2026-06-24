@@ -128,8 +128,8 @@ function ABSBrowse.buildMainMenu(plugin)
             local lid = plugin:getSetting("abs_last_item_id", "")
             return lid ~= "" and cache and cache:isDownloaded(lid)
         end,
-        keep_menu_open = true,
-        callback = function()
+        callback = function(touchmenu_instance)
+            if touchmenu_instance then touchmenu_instance:closeMenu() end
             local lid = plugin:getSetting("abs_last_item_id", "")
             if lid ~= "" then
                 ABSBrowse._playCachedItem(plugin, cache, lid)
@@ -631,7 +631,8 @@ function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded)
     if is_downloaded then
         table.insert(menu_items, {
             text = _("Play"),
-            callback = function()
+            callback = function(touchmenu_instance)
+                if touchmenu_instance then touchmenu_instance:closeMenu() end
                 ABSBrowse._playCachedItem(plugin, cache, item.id)
             end,
         })
@@ -754,7 +755,8 @@ function ABSBrowse._showDownloadedItems(plugin, cache, touchmenu_instance)
 
         -- Capture item_id in a factory to avoid Lua 5.1 closure reuse bug
         local function make_play_callback(item_id)
-            return function()
+            return function(touchmenu_instance)
+                if touchmenu_instance then touchmenu_instance:closeMenu() end
                 ABSBrowse._playCachedItem(plugin, cache, item_id)
             end
         end

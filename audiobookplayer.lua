@@ -660,7 +660,9 @@ function AudiobookPlayer:onMinimize()
     self.dimen.y = self.height - self._mini_height
     logger.warn("AudiobookPlayer: minimized, dimen=",
         self.dimen.x, self.dimen.y, self.dimen.w, self.dimen.h)
-    UIManager:setDirty("all", "ui")
+    -- Full refresh to erase the full-screen player image and redraw only the
+    -- mini bar, avoiding a ghost of the full player controls on e-ink.
+    UIManager:setDirty("all", "full")
     if self.on_minimize then self.on_minimize() end
 end
 
@@ -671,7 +673,7 @@ function AudiobookPlayer:_restore()
     -- Restore dimen to full screen so we receive all events again
     self.dimen.h = self.height
     self.dimen.y = 0
-    UIManager:setDirty("all", "ui")
+    UIManager:setDirty("all", "full")
 end
 
 function AudiobookPlayer:onChapterList()
@@ -1114,14 +1116,17 @@ end
 function AudiobookPlayer:show()
     self.visible = true
     self._minimized = false
-    UIManager:show(self, "ui")
+    -- Use a full flash refresh when appearing; this clears any open reader
+    -- menus or config panels that would otherwise leave a ghost image on
+    -- e-ink screens behind the player overlay.
+    UIManager:show(self, "full")
 end
 
 function AudiobookPlayer:hide()
     self.visible = false
     self._minimized = false
     UIManager:close(self)
-    UIManager:setDirty("all", "ui")
+    UIManager:setDirty("all", "full")
 end
 
 function AudiobookPlayer:isVisible()

@@ -65,7 +65,7 @@ end
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
-function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path)
+function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position)
     if self.state == self.STATE.PLAYING or self.state == self.STATE.PAUSED then
         self:stop(true) -- keep chapter menu open during track transitions
     end
@@ -82,6 +82,9 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     -- EPUB Media Overlay entries carry SMIL fragment ids; their presence
     -- switches the UI into read-along mode (minimized player, page-follow).
     self.overlay_mode = (timing_data[1] and timing_data[1].fragment_id) and true or false
+    -- Resume offset: passed through to the engine so the very first decode
+    -- starts at the saved position instead of at 0:00 and then seeking.
+    self._start_position = tonumber(start_position) or 0
 
     -- Detect same-playlist BEFORE overwriting self.playlist_files,
     -- otherwise same_playlist is always true on first load and
@@ -159,11 +162,19 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     -- Show playback bar in scrubber mode
     self:showPlaybackBar()
 
+    -- Resume from saved position on initial start, if any.
+    if self._start_position and self._start_position > 0 then
+        self.media_engine._seek_offset = self._start_position
+    end
+
     local gen = self._chain_generation
     local ok = self.media_engine:play(
         function() self:_onPlaybackComplete(gen) end,
         function(err) self:_onPlaybackFail(gen, err) end
     )
+
+    -- Clear the resume offset once play() has consumed it.
+    self._start_position = nil
 
     if not ok then
         logger.err("MediaSync: media_engine:play() failed")

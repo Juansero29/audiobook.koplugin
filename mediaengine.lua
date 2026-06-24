@@ -1478,6 +1478,23 @@ function MediaEngine:_stopPersistentPipeline(reason)
     self._persistent_pipeline_active = false
 end
 
+-- Build the ffmpeg -filter:a chain used by the persistent MTK pipeline.
+-- Combines speed (atempo) and digital volume gain so both take effect
+-- without duplicating the construction logic in play() and seek().
+function MediaEngine:_persistentFilterChain()
+    local filter_arg = self:_atempoFilterString(self._playback_speed or 1.0)
+    local filter_chain = filter_arg:match('-filter:a%s*"(.-)"') or ""
+    local vol_part = self:_volumeFilterPart()
+    if vol_part ~= "" then
+        if filter_chain ~= "" then
+            filter_chain = filter_chain .. vol_part
+        else
+            filter_chain = vol_part:sub(2) -- drop leading comma
+        end
+    end
+    return filter_chain
+end
+
 function MediaEngine:_playPersistentPipeline(gen)
     if not self._persistent_pipeline_active then
         if not self:_startPersistentPipeline() then
@@ -1487,8 +1504,7 @@ function MediaEngine:_playPersistentPipeline(gen)
         end
     end
 
-    local filter_arg = self:_atempoFilterString(self._playback_speed or 1.0)
-    local filter_chain = filter_arg:match('-filter:a%s*"(.-)"') or ""
+    local filter_chain = self:_persistentFilterChain()
 
     os.remove(self._media_ctrl_dir .. "/done")
     local f = io.open(self._media_ctrl_dir .. "/play", "w")
@@ -2107,8 +2123,7 @@ function MediaEngine:seek(seconds, mode)
             self:_nextGeneration()
             local new_gen = self.play_generation
             -- Write new play control with the target offset.
-            local filter_arg = self:_atempoFilterString(self._playback_speed or 1.0)
-            local filter_chain = filter_arg:match('-filter:a%s*"(.-)"') or ""
+            local filter_chain = self:_persistentFilterChain()
             os.remove(self._media_ctrl_dir .. "/done")
             local f = io.open(self._media_ctrl_dir .. "/play", "w")
             if f then
