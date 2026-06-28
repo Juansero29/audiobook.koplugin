@@ -853,6 +853,20 @@ function Audiobook:startReadAlong(text, start_pos)
     -- Early no-audio warning: if the probe found no usable audio player
     -- and there is no BT device connected, warn before synthesis runs.
     if self.tts_engine._no_real_audio_output and not self.tts_engine._cached_player then
+        if Device.isKindle and Device:isKindle() then
+            -- A speakerless Kindle can only play over Bluetooth, routed through
+            -- the Amazon audio framework (audiomgrd) or the native Ivona voice.
+            -- When no path is found, "Start anyway" would synthesize into a dead
+            -- aplay device (pure silence), so show actionable guidance instead of
+            -- a misleading Start button.  This matches the runtime refusal in
+            -- ttsengine.lua and avoids suggesting the non-existent "native voice"
+            -- menu entry (the Ivona path is selected automatically when usable).
+            UIManager:show(InfoMessage:new{
+                text = _("No audio output available.\n\nThis Kindle has no built-in speaker, so audio must play over Bluetooth, and the plugin could not find a working audio route.\n\nTry this:\n1. Pair and connect Bluetooth headphones from the Kindle top-swipe menu (Settings), then start read-along again.\n2. If they are already connected, restart KOReader so the plugin re-detects the audio output.\n\nIf it still fails, generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue."),
+                timeout = 12,
+            })
+            return
+        end
         local ConfirmBox = require("ui/widget/confirmbox")
         UIManager:show(ConfirmBox:new{
             text = _("No audio output device found.\n\nTTS synthesis will run but audio may not play. Start anyway?"),

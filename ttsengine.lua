@@ -3299,6 +3299,41 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     return true
 end
 
+--- Try to select the Kindle native Ivona TTS as an audio fallback.
+-- Routes text -> ttssrc -> Ivona -> mixersink -> audiomgrd -> BT, which
+-- bypasses the (often stripped) GStreamer WAV plugins.  Used when no WAV
+-- playback path is available on a speakerless Kindle.  Works regardless of
+-- the selected synthesis backend because the sentence text is always stored
+-- in self._native_tts_text; the trade-off is that audio is spoken in the
+-- Ivona voice with estimated word timing.
+--
+-- Two independent signals select the fallback:
+--   * orchestratorStarted=1: the Ivona orchestrator is up and ready.
+--   * self._ttssrc_available: ttssrc was confirmed during a gst-play probe.
+--     (issue #26 / PW6: ttssrc connects to Ivona directly and works even when
+--     orchestratorStarted reports 0.)
+-- @param context string  Short tag for logging (why the fallback was tried)
+-- @treturn string|nil  "kindle-native-tts-fallback" if selected, else nil
+function TTSEngine:_tryKindleNativeTtsFallback(context)
+    if not Device:isKindle() then return nil end
+    local orch_ok = false
+    local h = io.popen("lipc-get-prop com.lab126.tts.orchestrator orchestratorStarted 2>/dev/null")
+    if h then
+        local v = h:read("*a") or ""
+        h:close()
+        if v:match("^%s*1") then orch_ok = true end
+    end
+    if orch_ok or self._ttssrc_available then
+        self.audio_player_type = "kindle-native-tts-fallback"
+        self._no_real_audio_output = false
+        logger.warn("TTSEngine: Kindle native TTS fallback selected (",
+            orch_ok and "orchestratorStarted=1" or "ttssrc available",
+            ", context=", tostring(context or "?"), ")")
+        return "kindle-native-tts-fallback"
+    end
+    return nil
+end
+
 --[[--
 Find available audio player.
 Sets self.audio_player_type to "kindle-native-tts", "kindle-lipc", "gst-bt",
@@ -3571,35 +3606,12 @@ function TTSEngine:findAudioPlayer()
                 -- bypassing ALL missing plugins.  Audio works; word timing
                 -- comes from our estimates (may be slightly off since Ivona
                 -- speaks at a different rate than espeak/Piper).
-                local h_orchestrator = io.popen("lipc-get-prop com.lab126.tts.orchestrator orchestratorStarted 2>/dev/null")
-                local orch_ok = false
-                if h_orchestrator then
-                    local orch_val = h_orchestrator:read("*a") or ""
-                    h_orchestrator:close()
-                    if orch_val:match("^%s*1") then
-                        orch_ok = true
-                    end
-                end
-
-                if orch_ok then
-                    self.audio_player_type = "kindle-native-tts-fallback"
-                    self._no_real_audio_output = false
-                    logger.warn("TTSEngine: Kindle native TTS fallback selected (Ivona SDK available, GStreamer stripped)")
-                    return "kindle-native-tts-fallback"
-                end
-
-                -- Issue #26 (PW6 Gen 12): orchestratorStarted may return 0
-                -- even though ttssrc is present and functional.  The ttssrc
-                -- GStreamer element connects to the Ivona SDK directly and
-                -- does not require the orchestrator to report "started".
-                -- If we detected ttssrc during the gst-play probe, use the
-                -- native TTS fallback anyway (it routes through --ttssrc).
-                if self._ttssrc_available then
-                    self.audio_player_type = "kindle-native-tts-fallback"
-                    self._no_real_audio_output = false
-                    logger.warn("TTSEngine: Kindle native TTS fallback selected (ttssrc available, orchestrator not started)")
-                    return "kindle-native-tts-fallback"
-                end
+                -- Covers both the orchestratorStarted=1 case and the issue #26
+                -- (PW6) ttssrc-without-orchestrator case.  The same helper is
+                -- called again after this block so the fallback is still
+                -- reachable when playermgr never answered InPlayback.
+                local native_fb = self:_tryKindleNativeTtsFallback("playermgr-no-wav-path")
+                if native_fb then return native_fb end
 
                 -- No wavparse AND no gst-play helper (or mixersink not found)
                 -- AND no Ivona SDK.  Do NOT select kindle-lipc here; on this
@@ -3629,6 +3641,21 @@ function TTSEngine:findAudioPlayer()
         if rescued then
             return rescued
         end
+    end
+
+    -- 0e) Kindle native TTS fallback when no real WAV/ALSA path was found.
+    -- On heavily stripped firmware (e.g. PW4) the playermgr InPlayback probe
+    -- can return nothing, so the orchestrator/ttssrc fallback nested inside
+    -- that block is never reached and audio silently dies even though the
+    -- Ivona path (ttssrc -> mixersink -> audiomgrd -> BT) would work.  This
+    -- runs AFTER the rescue probe on purpose: if a real ALSA/WAV path can be
+    -- found it preserves the user's selected Piper/espeak voice; only when
+    -- every WAV route fails do we accept the Ivona voice as the last resort
+    -- before giving up.  The Ivona route does not depend on playermgr.
+    if Device:isKindle() and self:commandExists("lipc-get-prop")
+        and not self.audio_player_type then
+        local native_fb = self:_tryKindleNativeTtsFallback("no-wav-path")
+        if native_fb then return native_fb end
     end
 
     -- 1) GStreamer with Kobo Bluetooth A2DP sink (primary on Kobo Libra Colour etc.)
