@@ -28,6 +28,19 @@ end
 function Transcoder:_findFfmpeg()
     if self.plugin_dir then
         local plugin_ffmpeg = self.plugin_dir .. "/bin/ffmpeg"
+        -- Release zip ships ffmpeg as ffmpeg.bin; replace any stale ffmpeg.
+        local bin_path = plugin_ffmpeg .. ".bin"
+        local b = io.open(bin_path, "r")
+        if b then
+            b:close()
+            os.remove(plugin_ffmpeg)
+            local ok = os.rename(bin_path, plugin_ffmpeg)
+            if ok then
+                logger.warn("Transcoder: renamed", bin_path, "to", plugin_ffmpeg)
+            else
+                return bin_path
+            end
+        end
         local f = io.open(plugin_ffmpeg, "r")
         if f then
             f:close()

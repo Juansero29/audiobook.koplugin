@@ -1607,6 +1607,7 @@ function Audiobook:_killOrphanProcessesFromPreviousSession()
     local dominated = false
 
     -- 1. Kill orphan gst-launch-1.0 (frees the exclusive BT A2DP socket)
+    --    and gst-launch-0.10 (Kindle mixersink pipelines).
     --    Check if any gst-launch is running before paying the killall cost.
     local h = io.popen("pgrep -c gst-launch 2>/dev/null")
     if h then
@@ -1614,8 +1615,9 @@ function Audiobook:_killOrphanProcessesFromPreviousSession()
         h:close()
         if count and count > 0 then
             os.execute("killall -9 gst-launch-1.0 2>/dev/null")
+            os.execute("killall -9 gst-launch-0.10 2>/dev/null")
             dominated = true
-            logger.warn("Audiobook: Startup cleanup — killed orphan gst-launch-1.0")
+            logger.warn("Audiobook: Startup cleanup — killed orphan gst-launch processes")
         end
     end
 

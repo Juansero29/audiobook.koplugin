@@ -128,12 +128,9 @@ Windows zip extractors; rename .bin back to the original name if needed.
 function MediaEngine:_findFfmpeg()
     if self._plugin_dir then
         local plugin_ffmpeg = self._plugin_dir .. "/bin/ffmpeg"
-        local f = io.open(plugin_ffmpeg, "r")
-        if f then
-            f:close()
-            return plugin_ffmpeg
-        end
         -- Release zip ships ffmpeg as ffmpeg.bin; rename on first use.
+        -- If both files exist (e.g. after a plugin update), replace the old
+        -- ffmpeg with the freshly shipped .bin so updates actually take effect.
         local bin_path = plugin_ffmpeg .. ".bin"
         local b = io.open(bin_path, "r")
         if b then
@@ -142,12 +139,16 @@ function MediaEngine:_findFfmpeg()
             local ok, err = os.rename(bin_path, plugin_ffmpeg)
             if ok then
                 logger.warn("MediaEngine: renamed", bin_path, "to", plugin_ffmpeg)
-                return plugin_ffmpeg
             else
                 logger.warn("MediaEngine: failed to rename", bin_path, ":", err)
                 -- Return the .bin path as a fallback so playback can still work.
                 return bin_path
             end
+        end
+        local f = io.open(plugin_ffmpeg, "r")
+        if f then
+            f:close()
+            return plugin_ffmpeg
         end
     end
     local h = io.popen("command -v ffmpeg 2>/dev/null")
@@ -457,17 +458,30 @@ end
 -- ---------------------------------------------------------------------------
 
 function MediaEngine:_findFfprobe()
-    -- Check PATH first, then plugin bin/ directory
+    -- Check bundled binary first (release zip may ship it as ffprobe.bin).
+    if self._plugin_dir then
+        local plugin_ffprobe = self._plugin_dir .. "/bin/ffprobe"
+        local bin_path = plugin_ffprobe .. ".bin"
+        local b = io.open(bin_path, "r")
+        if b then
+            b:close()
+            os.remove(plugin_ffprobe)
+            local ok = os.rename(bin_path, plugin_ffprobe)
+            if ok then
+                logger.warn("MediaEngine: renamed", bin_path, "to", plugin_ffprobe)
+            else
+                return bin_path
+            end
+        end
+        local f = io.open(plugin_ffprobe, "r")
+        if f then f:close() return plugin_ffprobe end
+    end
+    -- Fall back to PATH.
     local h = io.popen("command -v ffprobe 2>/dev/null")
     if h then
         local result = h:read("*l")
         h:close()
         if result and result ~= "" then return result end
-    end
-    if self._plugin_dir then
-        local plugin_ffprobe = self._plugin_dir .. "/bin/ffprobe"
-        local f = io.open(plugin_ffprobe, "r")
-        if f then f:close() return plugin_ffprobe end
     end
     return nil
 end
@@ -1117,12 +1131,33 @@ function MediaEngine:_killOrphanKindleGstPipelines(name, wait_us)
     os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
     os.execute("pkill -9 -f 'gst-launch-0.10 fdsrc' 2>/dev/null")
     os.execute("killall -9 gst-launch-0.10 2>/dev/null")
+    -- Wrapper shells that spawn the above pipelines write their PID to
+    -- kindle-gst-pid-* files; kill them explicitly in case pkill missed them.
+    os.execute("pkill -9 -f 'kindle-gst-pid-' 2>/dev/null")
+
     -- Give the mixer a moment to release the old stream before the new one
     -- attaches; without this the new stream can still overlap the tail of the
     -- dying one.
     wait_us = wait_us or 300000
     if wait_us and wait_us > 0 then
         os.execute("usleep " .. tostring(wait_us))
+    end
+
+    -- Verify: on some firmwares pkill/killall silently fail.  Poll until no
+    -- audiobook gst-launch-0.10 process remains, up to a short timeout.
+    local deadline = UIManager:getTime() + 1.5
+    while UIManager:getTime() < deadline do
+        local h = io.popen("pgrep -c 'gst-launch-0.10' 2>/dev/null")
+        local count
+        if h then
+            count = tonumber(h:read("*a"))
+            h:close()
+        end
+        if not count or count == 0 then break end
+        logger.warn("MediaEngine:", count, "gst-launch-0.10 still alive; re-killing")
+        os.execute("killall -9 gst-launch-0.10 2>/dev/null")
+        os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
+        os.execute("usleep 100000")
     end
     logger.warn("MediaEngine: orphan Kindle audiobook pipeline cleanup done (", name, ")")
 end
