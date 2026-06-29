@@ -1315,13 +1315,16 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     -- is 0.5 s larger than the real content time; getPosition() subtracts it.
     self._progress_adelay_s = 0.5
 
-    -- adelay=500: lead-in silence absorbing the A2DP datapath resume
+    -- adelay=500:all=1: lead-in silence absorbing the A2DP datapath resume
     -- (which otherwise swallows the start); apad: tail silence covering
     -- the ring/BT buffers at EOS (which otherwise clip the end).
+    -- :all=1 is required because the input may be stereo: without it adelay
+    -- would delay only channel 0 and -ac 1 would mix delayed left with
+    -- undelayed right, producing a persistent echo.
     local pipeline = string.format(
         "%s -loglevel error -progress '%s' -nostats -ss %.3f -i '%s'"
         .. " -f s16le -ar 22050 -ac 1"
-        .. " -af adelay=500%s,apad=pad_dur=1 - 2>/dev/null"
+        .. " -af adelay=500:all=1%s,apad=pad_dur=1 - 2>/dev/null"
         .. " | gst-launch-0.10 fdsrc"
         .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
         .. " ! mixersink stream-type=Music sync=true",
