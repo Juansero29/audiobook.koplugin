@@ -412,6 +412,22 @@ function MediaEngine:_detectKindleGstPlay()
             linker, plugin_dir, gst_play_bin))
     end
 
+    -- KinAMP-parity fallback (audio-less PW4-class Kindles): a native-glibc
+    -- gst-play built with koxtoolchain runs under the SYSTEM linker -- no glibc
+    -- mixing -- so it can load the device's old-glibc libgstmixersink.so where
+    -- the compat candidates above crash.  Run bare: its ELF interpreter is the
+    -- device's /lib/ld-linux-armhf.so.3 and it dlopens libgstreamer by absolute
+    -- path, so no linker wrapper or LD_LIBRARY_PATH is needed (KinAMP parity).
+    -- Tried LAST: the loop breaks on the first candidate that reports
+    -- mixersink=found, so devices where the compat binary works never reach this
+    -- and cannot regress.
+    local native_bin = plugin_dir .. "/kindle/gst-play-native"
+    local nf = io.open(native_bin, "r")
+    if nf then
+        nf:close()
+        table.insert(candidates, native_bin)
+    end
+
     local gst_play_cmd = nil
     for _, cand in ipairs(candidates) do
         local ph = io.popen(cand .. " --probe 2>&1")

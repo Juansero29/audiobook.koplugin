@@ -134,6 +134,7 @@ jobs:
             - Bundled Piper neural TTS + en_US-danny-low voice
             - Bundled BlueALSA (BT audio bridge for BlueZ Kobo devices)
             - Bundled kindle-gst-play (GStreamer WAV player for Cat 2 Kindles)
+            - Bundled kindle-gst-play-native (KinAMP-parity fallback for audio-less PW4-class Kindles)
             - Bundled wav-play (ALSA player for PocketBook and other devices without aplay)
             - Android TTS helper (pre-built tts_helper.dex)
 

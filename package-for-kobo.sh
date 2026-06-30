@@ -87,6 +87,17 @@ if [ -f "$SCRIPT_DIR/kindle/gst-play" ]; then
     echo "Bundled kindle/gst-play"
 fi
 
+# Native-glibc variant for audio-less Kindles (PW4-class) whose old-glibc
+# libgstmixersink.so cannot be loaded through the bundled ld-linux.  Built with
+# koxtoolchain so it runs under the system linker like KinAMP.  Only used as a
+# fallback when the compat gst-play above fails its probe (see ttsengine.lua).
+if [ -f "$SCRIPT_DIR/kindle/gst-play-native" ]; then
+    mkdir -p "$PLUGIN_DEST/kindle"
+    cp "$SCRIPT_DIR/kindle/gst-play-native" "$PLUGIN_DEST/kindle/"
+    chmod +x "$PLUGIN_DEST/kindle/gst-play-native"
+    echo "Bundled kindle/gst-play-native"
+fi
+
 # espeak-ng binary + library (inside plugin dir)
 cp "$ESPEAK_OUT/bin/espeak-ng" "$ESPEAK_DEST/bin/"
 # Find the actual versioned .so file (e.g. libespeak-ng.so.1.52.0.1) without hardcoding version

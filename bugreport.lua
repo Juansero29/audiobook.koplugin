@@ -1500,19 +1500,44 @@ find /usr /system /vendor /mnt /data -maxdepth 4 -name '*audio*.so*' 2>/dev/null
             if fileExists(candidate) then gst_play_path = candidate; break end
         end
         if gst_play_path then
-            -- Use the bundled ld-linux to bypass old system glibc
+            -- Compat binary: run through the bundled ld-linux to bypass old
+            -- system glibc.
             local gst_cmd = gst_play_path
             local espeak_lib = gst_play_path:gsub("/kindle/gst%-play$", "/espeak-ng/lib")
             local ld_linux = espeak_lib .. "/ld-linux-armhf.so.3"
             if fileExists(ld_linux) then
                 gst_cmd = ld_linux .. " --library-path " .. espeak_lib .. ":/usr/lib:/lib " .. gst_play_path
             end
+            -- Wrap in ( ... ); echo rc=$? so the EXIT CODE is always captured
+            -- even when the probe crashes producing no stdout (which previously
+            -- collapsed to a useless "binary_exists_but_probe_failed" and hid
+            -- the real failure -- e.g. a glibc-mixing "undefined symbol").
             info.kindle_gst_play_probe = shellCapture(
-                gst_cmd .. " --probe 2>&1", 5) or "binary_exists_but_probe_failed"
+                "( " .. gst_cmd .. " --probe ) 2>&1; echo \"rc=$?\"", 8) or "binary_exists_but_probe_failed"
             info.kindle_gst_play_version = shellCapture(
                 gst_cmd .. " --version 2>&1", 2) or "n/a"
+
+            -- Native-glibc variant (KinAMP parity): the fallback used on
+            -- audio-less PW4-class devices.  Probed BARE under the system linker
+            -- (its ELF interpreter is the device's /lib/ld-linux-armhf.so.3, so
+            -- no wrapper is needed).  Capturing both probes side by side lets a
+            -- follow-up report show exactly which variant reaches mixersink.
+            local native_path = gst_play_path:gsub("/kindle/gst%-play$", "/kindle/gst-play-native")
+            if fileExists(native_path) then
+                info.kindle_gst_play_native_probe = shellCapture(
+                    "( " .. native_path .. " --probe ) 2>&1; echo \"rc=$?\"", 8) or "binary_exists_but_probe_failed"
+                info.kindle_gst_play_native_version = shellCapture(
+                    native_path .. " --version 2>&1", 2) or "n/a"
+                -- ELF interpreter -- confirms it runs under the SYSTEM linker
+                -- (not a nonexistent nix path like the compat binary).
+                info.kindle_gst_play_native_interp = shellCapture(
+                    "strings -n 6 " .. native_path .. " 2>/dev/null | grep -m1 'ld-linux'", 3) or "n/a"
+            else
+                info.kindle_gst_play_native_probe = "binary_not_found"
+            end
         else
             info.kindle_gst_play_probe = "binary_not_found"
+            info.kindle_gst_play_native_probe = "binary_not_found"
         end
 
         -- Last gst-play playback log (stderr captured during actual play)

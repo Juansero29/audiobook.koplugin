@@ -40,6 +40,26 @@
 #include <errno.h>
 
 /*
+ * KGP_NATIVE_GLIBC selects the build variant:
+ *
+ *  - Default (undefined): the "compat" binary, cross-built against a modern
+ *    glibc and run on Kindle THROUGH our bundled ld-linux (glibc 2.42).  That
+ *    bundled glibc must load the device's old-glibc libgstmixersink.so, so the
+ *    two GLIBC_PRIVATE shims below are required.  This is the proven path on
+ *    PW5/Colorsoft and stays byte-for-byte identical.
+ *
+ *  - Defined: the "native" binary, built with koxtoolchain against the Kindle's
+ *    OWN (old) glibc and run under the SYSTEM /lib/ld-linux-armhf.so.3, exactly
+ *    like KinAMP.  There is no glibc mixing, so the system glibc/libresolv
+ *    already provide these symbols and the shims must NOT be re-exported
+ *    (re-exporting h_errno@GLIBC_PRIVATE with -Wl,-E can shadow/conflict).
+ *    The native build also omits -Wl,--version-script entirely.
+ *
+ * This single source therefore produces both binaries; only this block and the
+ * build flags differ.  See .github/workflows/build-gst-play.yml.
+ */
+#ifndef KGP_NATIVE_GLIBC
+/*
  * glibc 2.42 removed the h_errno@GLIBC_PRIVATE symbol that older system
  * libraries (e.g. Kindle's libresolv.so.2 built against glibc 2.20) still
  * reference.  Because gst-play runs through our bundled ld-linux (glibc 2.42),
@@ -64,8 +84,15 @@ int __res_maybe_init_compat(void *statp, int preinit) {
     return 0;
 }
 __asm__(".symver __res_maybe_init_compat, __res_maybe_init@GLIBC_PRIVATE");
+#endif /* !KGP_NATIVE_GLIBC */
 
-#define VERSION "0.4.0"
+#ifdef KGP_NATIVE_GLIBC
+#define VERSION "0.5.0-native"
+#define BUILD_VARIANT "native"
+#else
+#define VERSION "0.5.0-compat"
+#define BUILD_VARIANT "compat"
+#endif
 
 /* ---- GStreamer constants (stable across 0.10 and 1.0) ---- */
 #define GST_STATE_NULL    1
@@ -210,6 +237,9 @@ static void preload_ivona_libs(void)
 /* ---- Probe mode ---- */
 static int do_probe(void)
 {
+    /* Identify which binary produced this report (native vs compat). */
+    printf("build=%s\n", BUILD_VARIANT);
+
     /* Report system glibc version (helps diagnose GLIBC_2.34 load failures) */
     const char *(*gnu_get_libc_version_fn)(void) = NULL;
     void *libc_handle = dlopen("libc.so.6", RTLD_LAZY);
@@ -692,7 +722,7 @@ int main(int argc, char *argv[])
            "/usr/lib/gstreamer-0.10:/usr/lib/gstreamer-1.0", 0);
 
     if (strcmp(argv[1], "--version") == 0) {
-        printf("kindle-gst-play %s\n", VERSION);
+        printf("kindle-gst-play %s (%s)\n", VERSION, BUILD_VARIANT);
         return 0;
     }
     if (strcmp(argv[1], "--probe") == 0)

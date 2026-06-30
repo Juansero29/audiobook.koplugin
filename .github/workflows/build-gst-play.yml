@@ -9,7 +9,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # Existing "compat" binary: cross-built against a modern glibc and run on
+  # Kindle through the bundled ld-linux.  Unchanged -- proven on PW5/Colorsoft.
+  build-compat:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,7 +22,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Build gst-play
+      - name: Build gst-play (compat)
         run: |
           arm-linux-gnueabihf-gcc -O2 -Wall -Wextra -Wno-unused-parameter \
             -Wl,-E -Wl,--version-script=kindle/glibc_compat.map \
@@ -34,3 +36,61 @@ jobs:
         with:
           name: gst-play-armv7l
           path: kindle/gst-play
+
+  # New "native" binary: built with koxtoolchain against the Kindle's OWN (old)
+  # glibc so it runs under the system /lib/ld-linux-armhf.so.3 like KinAMP, with
+  # no glibc mixing.  Used only as a fallback when the compat probe fails
+  # (audio-less PW4-class devices).  See kindle/gst-play.c (KGP_NATIVE_GLIBC).
+  build-native:
+    runs-on: ubuntu-latest
+
+    env:
+      # Prebuilt hardfloat Kindle toolchain (glibc 2.20, system linker).
+      # Covers PW3+/PW4/PW5/Colorsoft.  Bump the tag to update.
+      KOX_TAG: "2025.05"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache prebuilt koxtoolchain (kindlehf)
+        id: cache-tc
+        uses: actions/cache@v4
+        with:
+          path: ~/x-tools
+          key: koxtoolchain-prebuilt-kindlehf-${{ env.KOX_TAG }}
+
+      - name: Fetch prebuilt koxtoolchain (kindlehf)
+        if: steps.cache-tc.outputs.cache-hit != 'true'
+        run: |
+          # The koxtoolchain release ships a ready-made toolchain (no ~1h build).
+          curl -sL "https://github.com/koreader/koxtoolchain/releases/download/${KOX_TAG}/kindlehf.tar.gz" \
+            -o /tmp/kindlehf.tar.gz
+          mkdir -p "$HOME"
+          # Archive root is x-tools/, so it lands at ~/x-tools/arm-kindlehf-...
+          tar -xzf /tmp/kindlehf.tar.gz -C "$HOME"
+          ls -la "$HOME/x-tools/arm-kindlehf-linux-gnueabihf/bin/" | head
+
+      - name: Build gst-play-native
+        run: |
+          export PATH="$HOME/x-tools/arm-kindlehf-linux-gnueabihf/bin:$PATH"
+          # Native build: define KGP_NATIVE_GLIBC (drops the GLIBC_PRIVATE shims)
+          # and DO NOT pass --version-script (the native glibc provides those
+          # symbols itself).
+          arm-kindlehf-linux-gnueabihf-gcc -O2 -Wall -Wextra -Wno-unused-parameter \
+            -DKGP_NATIVE_GLIBC \
+            -o kindle/gst-play-native \
+            kindle/gst-play.c \
+            -ldl
+          ls -lh kindle/gst-play-native
+          RE=arm-kindlehf-linux-gnueabihf-readelf
+          echo "--- interpreter (expect /lib/ld-linux-armhf.so.3) ---"
+          $RE -l kindle/gst-play-native | grep -i interpreter
+          echo "--- NEEDED + RUNPATH (expect only libc/libdl, no nix RUNPATH) ---"
+          $RE -d kindle/gst-play-native | grep -iE "NEEDED|RUNPATH|RPATH" || true
+          echo "--- max required GLIBC symbol version (must be <= 2.20) ---"
+          $RE -V kindle/gst-play-native | grep -oE "GLIBC_[0-9.]+" | sort -V | uniq | tail -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gst-play-native-armv7l
+          path: kindle/gst-play-native
