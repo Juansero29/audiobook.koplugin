@@ -8,7 +8,7 @@ local _ = require("gettext")
 
 return {
     name = "audiobook",
-    version = "0.1.16.9",
+    version = "0.1.16.10",
     fullname = _("Audiobook Read-Along"),
     description = _([[Text-to-Speech with synchronized word highlighting. Also plays pre-recorded audiobooks (mp3, m4b, m4a) with a seekable scrubber and EPUB 3 Media Overlays (Storyteller format).
 

@@ -21,6 +21,39 @@ local T = require("ffi/util").template
 
 local Updater = {}
 
+-- Files that must exist after extraction; if any are missing, the plugin
+-- will be left in a broken state (menus grayed out, media playback unavailable).
+local CRITICAL_FILES = {
+    "_meta.lua",
+    "main.lua",
+    "mediaengine.lua",
+    "mediasync.lua",
+    "transcoder.lua",
+    "abssync.lua",
+    "abscache.lua",
+    "audiobookplayer.lua",
+    "downloader.lua",
+    "mediaaligner.lua",
+    "ttsengine.lua",
+    "synccontroller.lua",
+    "menubuilder.lua",
+    "bugreport.lua",
+}
+
+--- Verify that all critical plugin files are present.
+-- @treturn bool success
+-- @treturn string|nil first missing file
+local function verifyPluginDir(plugin_dir)
+    for _, file in ipairs(CRITICAL_FILES) do
+        local f = io.open(plugin_dir .. "/" .. file, "r")
+        if not f then
+            return false, file
+        end
+        f:close()
+    end
+    return true
+end
+
 local REPO = "stradichenko/audiobook.koplugin"
 local API_URL = "https://api.github.com/repos/" .. REPO .. "/releases/latest"
 
@@ -69,12 +102,13 @@ local function fetchLatestRelease()
     end
 
     -- Find the zip asset matching our release naming convention
-    local zip_url
+    local zip_url, zip_size
     if data.assets then
         for _, asset in ipairs(data.assets) do
             if asset.browser_download_url
                 and asset.browser_download_url:match("audiobook%-koplugin.*%.zip$") then
                 zip_url = asset.browser_download_url
+                zip_size = tonumber(asset.size)
                 break
             end
         end
@@ -88,7 +122,7 @@ local function fetchLatestRelease()
     local tag = data.tag_name or ""
     local version = tag:gsub("^v", "")
 
-    return { tag = tag, version = version, zip_url = zip_url }
+    return { tag = tag, version = version, zip_url = zip_url, zip_size = zip_size }
 end
 
 --- Download a URL to a local file path.
@@ -263,6 +297,35 @@ function Updater._performUpdate(plugin, release)
         return
     end
 
+    -- Verify the downloaded zip is complete (GitHub asset size) and intact.
+    local lfs = require("libs/libkoreader-lfs")
+    if release.zip_size then
+        local attr = lfs.attributes(zip_path)
+        local actual_size = attr and attr.size or 0
+        if actual_size ~= release.zip_size then
+            logger.warn("Updater: downloaded zip size mismatch: expected", release.zip_size, "got", actual_size)
+            os.remove(zip_path)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Download incomplete: expected %1 bytes, got %2"),
+                         tostring(release.zip_size), tostring(actual_size)),
+            })
+            return
+        end
+    end
+    -- Test archive integrity with unzip -t.  Some platforms fall back to
+    -- BusyBox unzip; if the test fails here, we abort before touching the
+    -- installed plugin directory.
+    local test_cmd = 'unzip -t "' .. zip_path .. '" >/dev/null 2>&1'
+    local test_ok = os.execute(test_cmd)
+    if test_ok ~= 0 and test_ok ~= true then
+        logger.warn("Updater: zip integrity test failed for", zip_path)
+        os.remove(zip_path)
+        UIManager:show(InfoMessage:new{
+            text = _("Downloaded update archive is corrupt. Please try again."),
+        })
+        return
+    end
+
     -- Determine install target: the directory containing this plugin
     local plugin_dir = _dir:gsub("/$", "")  -- e.g. ".../plugins/audiobook.koplugin"
 
@@ -272,7 +335,6 @@ function Updater._performUpdate(plugin, release)
     -- extraction fails part-way through (issue #22: archive_read_extract2
     -- can abort mid-extraction on FAT32 Kindles, leaving the plugin
     -- directory corrupted with missing .lua files).
-    local lfs = require("libs/libkoreader-lfs")
     local backup_dir = tmp_dir .. "/audiobook.koplugin.backup"
     os.execute('rm -rf "' .. backup_dir .. '" 2>/dev/null')
     local backup_ok = os.execute('cp -rf "' .. plugin_dir .. '" "' .. backup_dir .. '" 2>/dev/null')
@@ -338,6 +400,18 @@ function Updater._performUpdate(plugin, release)
                 .. " and produced no files"
         end
         os.execute('rm -rf "' .. unzip_dir .. '" 2>/dev/null')
+    end
+
+    -- Verify extraction produced a complete plugin directory.  Partial
+    -- extraction (e.g. corrupt zip, unzip "short read") can leave critical
+    -- .lua files missing and gray out the menu items.
+    if extract_ok then
+        local verify_ok, missing_file = verifyPluginDir(plugin_dir)
+        if not verify_ok then
+            logger.warn("Updater: critical file missing after extraction:", missing_file)
+            extract_ok = false
+            extract_err = T(_("Critical file missing after extraction: %1"), missing_file)
+        end
     end
 
     -- Clean up the downloaded zip and, on PocketBook, the tmp directory if
