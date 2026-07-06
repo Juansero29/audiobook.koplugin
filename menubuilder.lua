@@ -34,6 +34,7 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 flite = _("Flite"),
                 festival = _("Festival"),
                 android = _("Android"),
+                ["platform-native"] = _("Platform-native helper"),
             }
             return T(_("TTS engine: %1"), labels[backend] or backend)
         end,
@@ -42,20 +43,67 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         end,
     })
 
-    -- MBROLA voice toggle (espeak-ng backend only).
-    -- Due to a firmware bug in the MTK Bluetooth SBC encoder, only
-    -- mb-en1 (UK English Male 1) works reliably on MTK Kobo devices.
+    -- Platform-native helper settings (only visible when that backend is active).
+    if plugin.tts_engine and plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.NATIVE then
+        table.insert(menu, {
+            text = _("Platform-native helper settings"),
+            sub_item_table_func = function()
+                return MenuBuilder.buildNativeTtsSettingsMenu(plugin)
+            end,
+        })
+    end
+
+    -- MBROLA voice selection (espeak-ng backend only).
+    -- On Kobo devices with the MTK Bluetooth chip, only mb-en1 works
+    -- reliably; all other MBROLA voices trigger mid-sentence audio repeats.
+    -- On every other device, expose the full MBROLA voice menu.
     -- See docs/MBROLA_MTK_REPEAT_BUG.md for the full diagnostic report.
     if plugin.tts_engine and plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK then
-        table.insert(menu, {
-            text = _("MBROLA voice UK English Male 1"),
-            checked_func = function()
-                return plugin:getSetting("tts_mbrola_voice", "") == "en1"
-            end,
-            callback = function()
-                local current = plugin:getSetting("tts_mbrola_voice", "")
-                if current == "en1" then
-                    -- Uncheck: disable MBROLA
+        if plugin.bt_manager and plugin.bt_manager:isMtkKobo() then
+            -- MTK Kobo: restrict to the single known-working MBROLA voice.
+            table.insert(menu, {
+                text = _("MBROLA voice UK English Male 1"),
+                checked_func = function()
+                    return plugin:getSetting("tts_mbrola_voice", "") == "en1"
+                end,
+                callback = function()
+                    local current = plugin:getSetting("tts_mbrola_voice", "")
+                    if current == "en1" then
+                        -- Uncheck: disable MBROLA
+                        plugin:setSetting("tts_mbrola_voice", "")
+                        plugin:setSetting("tts_mbrola_voice_label", "")
+                        local base = plugin:getSetting("tts_voice", "en")
+                        local var = plugin:getSetting("tts_voice_variant", "")
+                        local full = base
+                        if var ~= "" then
+                            full = base .. "+" .. var
+                        end
+                        plugin.tts_engine:setVoice(full)
+                        UIManager:show(InfoMessage:new{
+                            text = _("MBROLA disabled. Using regular espeak-ng voice."),
+                            timeout = 2,
+                        })
+                    else
+                        -- Check: enable mb-en1 only
+                        plugin:setSetting("tts_mbrola_voice", "en1")
+                        plugin:setSetting("tts_mbrola_voice_label", "UK English Male 1")
+                        plugin.tts_engine:setVoice("mb-en1")
+                        UIManager:show(InfoMessage:new{
+                            text = _(
+                                "MBROLA voice enabled: UK English Male 1.\n\n"
+                                .. "Other MBROLA voices are unavailable because they trigger "
+                                .. "a firmware bug in the MTK Bluetooth chip that causes "
+                                .. "mid-sentence audio repeats. See the full report on GitHub."
+                            ),
+                            timeout = 5,
+                        })
+                    end
+                end,
+            })
+            -- If user had a different MBROLA voice selected, migrate to disabled
+            do
+                local current_mb = plugin:getSetting("tts_mbrola_voice", "")
+                if current_mb ~= "" and current_mb ~= "en1" then
                     plugin:setSetting("tts_mbrola_voice", "")
                     plugin:setSetting("tts_mbrola_voice_label", "")
                     local base = plugin:getSetting("tts_voice", "en")
@@ -65,41 +113,27 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                         full = base .. "+" .. var
                     end
                     plugin.tts_engine:setVoice(full)
-                    UIManager:show(InfoMessage:new{
-                        text = _("MBROLA disabled. Using regular espeak-ng voice."),
-                        timeout = 2,
-                    })
-                else
-                    -- Check: enable mb-en1 only
-                    plugin:setSetting("tts_mbrola_voice", "en1")
-                    plugin:setSetting("tts_mbrola_voice_label", "UK English Male 1")
-                    plugin.tts_engine:setVoice("mb-en1")
-                    UIManager:show(InfoMessage:new{
-                        text = _(
-                            "MBROLA voice enabled: UK English Male 1.\n\n"
-                            .. "Other MBROLA voices are unavailable because they trigger "
-                            .. "a firmware bug in the MTK Bluetooth chip that causes "
-                            .. "mid-sentence audio repeats. See the full report on GitHub."
-                        ),
-                        timeout = 5,
-                    })
                 end
-            end,
-        })
-        -- If user had a different MBROLA voice selected, migrate to disabled
-        do
-            local current_mb = plugin:getSetting("tts_mbrola_voice", "")
-            if current_mb ~= "" and current_mb ~= "en1" then
-                plugin:setSetting("tts_mbrola_voice", "")
-                plugin:setSetting("tts_mbrola_voice_label", "")
-                local base = plugin:getSetting("tts_voice", "en")
-                local var = plugin:getSetting("tts_voice_variant", "")
-                local full = base
-                if var ~= "" then
-                    full = base .. "+" .. var
-                end
-                plugin.tts_engine:setVoice(full)
             end
+        else
+            -- Non-MTK devices: expose all bundled/installed MBROLA voices.
+            table.insert(menu, {
+                text_func = function()
+                    local label = plugin:getSetting("tts_mbrola_voice_label", "")
+                    if label == "" then
+                        return _("MBROLA voice")
+                    end
+                    return T(_("MBROLA voice: %1"), label)
+                end,
+                sub_item_table_func = function()
+                    return MenuBuilder.buildMbrolaVoiceMenu(plugin)
+                end,
+                help_text = _(
+                    "Select a bundled or installed MBROLA voice. "
+                    .. "Non-English MBROLA voices are available on devices "
+                    .. "that do not use the MTK Bluetooth chip."
+                ),
+            })
         end
     end
 
@@ -716,6 +750,14 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
         table.insert(available, { id = engine.BACKENDS.FESTIVAL, label = _("Festival") })
     end
 
+    -- Platform-native helper: user-supplied, device-specific engine wrapper.
+    if engine.backend == engine.BACKENDS.NATIVE or engine:_nativeHelperConfigured() then
+        table.insert(available, {
+            id = engine.BACKENDS.NATIVE,
+            label = _("Platform-native helper (user-supplied engine)"),
+        })
+    end
+
     if #available == 0 then
         table.insert(menu, {
             text = _("No TTS engines found"),
@@ -984,7 +1026,7 @@ function MenuBuilder.buildMbrolaVoiceMenu(plugin)
     end
 
     local sorted_langs = {}
-    for lang, _ in pairs(voices_by_lang) do
+    for lang in pairs(voices_by_lang) do
         table.insert(sorted_langs, lang)
     end
     table.sort(sorted_langs)
@@ -1106,6 +1148,209 @@ function MenuBuilder.buildMbrolaDownloadMenu(plugin, Downloader)
     end
 
     return menu
+end
+
+--[[--
+Build the platform-native TTS settings menu.
+--]]
+function MenuBuilder.buildNativeTtsSettingsMenu(plugin)
+    local menu = {}
+
+    -- Helper path
+    table.insert(menu, {
+        text_func = function()
+            local path = plugin:getSetting("native_helper_path", "")
+            if path == "" then
+                return _("Native helper: not set")
+            end
+            return T(_("Native helper: %1"), path)
+        end,
+        callback = function(touchmenu_instance)
+            MenuBuilder._showNativeHelperPathChooser(plugin, touchmenu_instance)
+        end,
+    })
+
+    -- Input encoding
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Input encoding: %1"), plugin:getSetting("native_input_encoding", "utf-8"):upper())
+        end,
+        sub_item_table = {
+            {
+                text = "UTF-8",
+                checked_func = function()
+                    return plugin:getSetting("native_input_encoding", "utf-8") == "utf-8"
+                end,
+                callback = function()
+                    plugin:setSetting("native_input_encoding", "utf-8")
+                end,
+            },
+            {
+                text = "CP1252",
+                checked_func = function()
+                    return plugin:getSetting("native_input_encoding", "utf-8") == "cp1252"
+                end,
+                callback = function()
+                    plugin:setSetting("native_input_encoding", "cp1252")
+                end,
+            },
+        },
+    })
+
+    -- Speed mode
+    table.insert(menu, {
+        text_func = function()
+            local mode = plugin:getSetting("native_speed_mode", "oneshot")
+            local label = (mode == "daemon") and _("daemon/FIFO") or _("one-shot")
+            return T(_("Speed mode: %1"), label)
+        end,
+        sub_item_table = {
+            {
+                text = _("One-shot (run helper per sentence)"),
+                checked_func = function()
+                    return plugin:getSetting("native_speed_mode", "oneshot") == "oneshot"
+                end,
+                callback = function()
+                    plugin:setSetting("native_speed_mode", "oneshot")
+                end,
+            },
+            {
+                text = _("Daemon/FIFO (keep helper running)"),
+                checked_func = function()
+                    return plugin:getSetting("native_speed_mode", "oneshot") == "daemon"
+                end,
+                callback = function()
+                    plugin:setSetting("native_speed_mode", "daemon")
+                end,
+            },
+        },
+    })
+
+    -- FIFO path
+    table.insert(menu, {
+        text_func = function()
+            local path = plugin:getSetting("native_fifo_path", "")
+            if path == "" then
+                return _("FIFO path: default")
+            end
+            return T(_("FIFO path: %1"), path)
+        end,
+        callback = function(touchmenu_instance)
+            MenuBuilder._showNativeFifoPathDialog(plugin, touchmenu_instance)
+        end,
+    })
+
+    -- Pre-synthesis command
+    table.insert(menu, {
+        text_func = function()
+            local cmd = plugin:getSetting("native_prestep_command", "")
+            if cmd == "" then
+                return _("Pre-synthesis command: none")
+            end
+            return T(_("Pre-synthesis command: %1"), cmd)
+        end,
+        callback = function(touchmenu_instance)
+            MenuBuilder._showNativePrestepDialog(plugin, touchmenu_instance)
+        end,
+    })
+
+    return menu
+end
+
+--[[--
+Show a PathChooser to select the platform-native helper executable.
+--]]
+function MenuBuilder._showNativeHelperPathChooser(plugin, touchmenu_instance)
+    local PathChooser = require("ui/widget/pathchooser")
+    local home_dir = require("datastorage").getDataDir() or "/mnt"
+    UIManager:show(PathChooser:new{
+        title = _("Select native TTS helper"),
+        path = home_dir,
+        select_file = true,
+        onConfirm = function(file_path)
+            plugin:setSetting("native_helper_path", file_path)
+            if plugin.tts_engine then
+                plugin.tts_engine.backend_cmd = file_path
+            end
+            if touchmenu_instance then
+                touchmenu_instance:updateItems()
+            end
+            UIManager:show(InfoMessage:new{
+                text = _("Native helper path saved."),
+                timeout = 2,
+            })
+        end,
+    })
+end
+
+--[[--
+Show an InputDialog for the native TTS FIFO path.
+--]]
+function MenuBuilder._showNativeFifoPathDialog(plugin, touchmenu_instance)
+    local InputDialog = require("ui/widget/inputdialog")
+    local current = plugin:getSetting("native_fifo_path", "")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Native TTS FIFO path"),
+        input = current,
+        input_hint = "/tmp/audiobook_native_tts.fifo",
+        description = _(
+            "Optional path to the request FIFO used in daemon mode. "
+            .. "Leave empty to use the default."
+        ),
+        buttons = {
+            {
+                { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        plugin:setSetting("native_fifo_path", dialog:getInputText())
+                        UIManager:close(dialog)
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+--[[--
+Show an InputDialog for the native TTS pre-synthesis command.
+--]]
+function MenuBuilder._showNativePrestepDialog(plugin, touchmenu_instance)
+    local InputDialog = require("ui/widget/inputdialog")
+    local current = plugin:getSetting("native_prestep_command", "")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Pre-synthesis command"),
+        input = current,
+        input_hint = "",
+        description = _(
+            "Optional shell command to run before each synthesis request "
+            .. "(for example, to wake or restart a device-specific audio path)."
+        ),
+        buttons = {
+            {
+                { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        plugin:setSetting("native_prestep_command", dialog:getInputText())
+                        UIManager:close(dialog)
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 return MenuBuilder

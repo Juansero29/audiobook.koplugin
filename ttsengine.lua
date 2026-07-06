@@ -53,12 +53,13 @@ local TTSEngine = {
     -- Supported TTS backends
     BACKENDS = {
         PICO = "pico",
-        ESPEAK = "espeak", 
+        ESPEAK = "espeak",
         FLITE = "flite",
         FESTIVAL = "festival",
         ANDROID = "android",
         PIPER = "piper",
         KINDLE_NATIVE = "kindle-native",
+        NATIVE = "platform-native",
     },
     -- Default settings
     DEFAULT_RATE = 1.0,
@@ -68,6 +69,40 @@ local TTSEngine = {
     backend_error = nil,
     player_error = nil,
 }
+
+-- CP1252 characters that differ from ISO-8859-1 (bytes 0x80-0x9F).
+-- Used by the platform-native backend when the configured helper expects
+-- CP1252 input instead of UTF-8.  This is pure encoding data.
+local CP1252_UNICODE = {
+    [0x20AC] = 0x80, -- €
+    [0x201A] = 0x82, -- ‚
+    [0x0192] = 0x83, -- ƒ
+    [0x201E] = 0x84, -- „
+    [0x2026] = 0x85, -- …
+    [0x2020] = 0x86, -- †
+    [0x2021] = 0x87, -- ‡
+    [0x02C6] = 0x88, -- ˆ
+    [0x2030] = 0x89, -- ‰
+    [0x0160] = 0x8A, -- Š
+    [0x2039] = 0x8B, -- ‹
+    [0x0152] = 0x8C, -- Œ
+    [0x017D] = 0x8E, -- Ž
+    [0x2018] = 0x91, -- ‘
+    [0x2019] = 0x92, -- ’
+    [0x201C] = 0x93, -- “
+    [0x201D] = 0x94, -- ”
+    [0x2022] = 0x95, -- •
+    [0x2013] = 0x96, -- en dash
+    [0x2014] = 0x97, -- em dash
+    [0x02DC] = 0x98, -- ˜
+    [0x2122] = 0x99, -- ™
+    [0x0161] = 0x9A, -- š
+    [0x203A] = 0x9B, -- ›
+    [0x0153] = 0x9C, -- œ
+    [0x017E] = 0x9E, -- ž
+    [0x0178] = 0x9F, -- Ÿ
+}
+
 function TTSEngine:new(o)
     o = o or {}
     setmetatable(o, self)
@@ -97,6 +132,8 @@ function TTSEngine:new(o)
     o._piper = PiperQueue:new{engine = o}
     -- Android TTS wrapper (initialized lazily in detectBackend)
     o._android_tts = nil
+    -- Platform-native TTS daemon PID (only used in daemon/FIFO mode)
+    o.native_daemon_pid = nil
     -- Load persisted "gst-play is broken" flag so we don't re-probe a
     -- hanging pipeline on every KOReader restart (issue #22, PW5).
     -- Clear broken flags when the plugin is updated so fixes can be re-tested.
@@ -147,6 +184,22 @@ function TTSEngine:new(o)
     end
     o:detectBackend()
     return o
+end
+--[[--
+Check whether a user-supplied platform-native helper is configured and exists.
+@return boolean
+--]]
+function TTSEngine:_nativeHelperConfigured()
+    local path = self.plugin and self.plugin:getSetting("native_helper_path", "")
+    if not path or path == "" then return false end
+    local f = io.open(path, "r")
+    if f then
+        f:close()
+        return true
+    end
+    -- Some devices cannot io.open executables; fall back to test -x.
+    local rc = os.execute("test -x '" .. path .. "' 2>/dev/null")
+    return rc == 0 or rc == true
 end
 --[[--
 Detect available TTS backend.
@@ -287,6 +340,16 @@ function TTSEngine:detectBackend()
         else
             logger.warn("TTSEngine: Android TTS helper .dex not available at", Utils.normalizeDirPath(self.plugin_dir or "."))
         end
+    end
+    -- Platform-native TTS: user-supplied helper that drives a device-native,
+    -- licensed engine (e.g. PocketBook ReadSpeaker).  This is a last-resort
+    -- fallback when no bundled/system engine is found, but it is intentionally
+    -- checked before Kindle native so a configured helper takes priority.
+    if self:_nativeHelperConfigured() then
+        self.backend = self.BACKENDS.NATIVE
+        self.backend_cmd = self.plugin:getSetting("native_helper_path")
+        logger.warn("TTSEngine: Using platform-native backend:", self.backend_cmd)
+        return
     end
     -- Kindle native TTS: Amazon's Ivona SDK via tts.orchestrator/playermgr.
     -- Last resort when no bundled or system TTS binaries are found.
@@ -503,6 +566,371 @@ function TTSEngine:synthesize(text, callback)
     logger.dbg("TTSEngine: Starting synthesis with backend:", self.backend)
     return self:synthesizeCommand(text, callback)
 end
+
+--[[--
+Convert a UTF-8 string to a CP1252 byte string.
+Unsupported characters are replaced with '?' (0x3F).
+@return string
+--]]
+function TTSEngine:_utf8ToCp1252(text)
+    local out = {}
+    local i = 1
+    local n = #text
+    while i <= n do
+        local b1 = text:byte(i)
+        local cp, len
+        if b1 < 0x80 then
+            cp, len = b1, 1
+        elseif b1 < 0xC0 then
+            -- Invalid continuation byte; skip it.
+            cp, len = 0xFFFD, 1
+        elseif b1 < 0xE0 then
+            cp = (b1 % 0x20) * 0x40 + ((text:byte(i + 1) or 0) % 0x40)
+            len = 2
+        elseif b1 < 0xF0 then
+            cp = (b1 % 0x10) * 0x1000
+                 + ((text:byte(i + 1) or 0) % 0x40) * 0x40
+                 + ((text:byte(i + 2) or 0) % 0x40)
+            len = 3
+        else
+            cp = (b1 % 0x08) * 0x40000
+                 + ((text:byte(i + 1) or 0) % 0x40) * 0x1000
+                 + ((text:byte(i + 2) or 0) % 0x40) * 0x40
+                 + ((text:byte(i + 3) or 0) % 0x40)
+            len = 4
+        end
+
+        local byte_val
+        if cp <= 0x7F then
+            byte_val = cp
+        elseif cp >= 0xA0 and cp <= 0xFF then
+            byte_val = cp
+        else
+            byte_val = CP1252_UNICODE[cp]
+        end
+
+        table.insert(out, string.char(byte_val or 0x3F))
+        i = i + len
+    end
+    return table.concat(out)
+end
+
+--[[--
+Synthesize using the user-supplied platform-native helper.
+@param text string Text to synthesize
+@param audio_file string Output WAV file path
+@param callback function Callback when synthesis is complete
+@return boolean|nil Success, or nil if async
+--]]
+function TTSEngine:_synthesizeNative(text, audio_file, callback)
+    -- Optional device-specific preparation (e.g. restarting alsaloop on PocketBook).
+    local pre_step = self.plugin:getSetting("native_prestep_command", "")
+    if pre_step ~= "" then
+        os.execute(pre_step .. " 2>/dev/null")
+    end
+
+    local encoding = self.plugin:getSetting("native_input_encoding", "utf-8")
+    if encoding == "cp1252" then
+        text = self:_utf8ToCp1252(text)
+    end
+
+    local speed = string.format("%.3f", self.rate or 1.0)
+    local mode = self.plugin:getSetting("native_speed_mode", "oneshot")
+
+    if mode == "daemon" then
+        return self:_synthesizeNativeDaemon(text, audio_file, speed, callback)
+    else
+        return self:_synthesizeNativeOneshot(text, audio_file, speed, callback)
+    end
+end
+
+--[[--
+Platform-native helper one-shot mode.
+Runs the helper once per sentence and polls a .done marker.
+--]]
+function TTSEngine:_synthesizeNativeOneshot(text, audio_file, speed, callback)
+    local temp_dir = "/tmp"
+    self.file_counter = (self.file_counter or 0) + 1
+    local input_file = temp_dir .. "/audiobook_native_" .. os.time() .. "_" .. self.file_counter .. ".txt"
+
+    local f = io.open(input_file, "wb")
+    if not f then
+        logger.err("TTSEngine: cannot write native input file")
+        if callback then callback(false, nil) end
+        return false
+    end
+    f:write(text)
+    f:close()
+
+    local helper = self.backend_cmd
+    if not helper or helper == "" then
+        logger.err("TTSEngine: native helper path not configured")
+        os.remove(input_file)
+        if callback then callback(false, nil) end
+        return false
+    end
+
+    local cmd = string.format(
+        "'%s' --input '%s' --output '%s' --speed '%s'",
+        helper:gsub("'", "'\\''"),
+        input_file:gsub("'", "'\\''"),
+        audio_file:gsub("'", "'\\''"),
+        speed
+    )
+    local done_marker = audio_file .. ".done"
+    local log_file = "/tmp/.native_tts_last.log"
+    local bg_cmd = string.format(
+        '(%s > "%s" 2>&1; echo $? > "%s") &',
+        cmd, log_file, done_marker
+    )
+
+    logger.dbg("TTSEngine: native one-shot command:", cmd)
+    os.execute(bg_cmd)
+
+    local engine = self
+    local poll_count = 0
+    local max_polls = 120
+    local function pollNativeDone()
+        poll_count = poll_count + 1
+        local mf = io.open(done_marker, "r")
+        if mf then
+            local exit_code = mf:read("*a"):gsub("%s+", "")
+            mf:close()
+            os.remove(done_marker)
+            os.remove(input_file)
+
+            local af = io.open(audio_file, "r")
+            local size = 0
+            if af then
+                af:seek("end", 0)
+                size = af:seek()
+                af:close()
+            end
+
+            if size > 0 then
+                engine.current_audio_file = audio_file
+                engine:generateTimingEstimates(engine._native_tts_text or text)
+                os.remove(log_file)
+                if callback then callback(true, engine.timing_data) end
+                return
+            end
+
+            logger.err("TTSEngine: native one-shot failed, exit_code:", exit_code)
+            local log_f = io.open(log_file, "r")
+            if log_f then
+                logger.err("TTSEngine: native helper log:", log_f:read("*a"))
+                log_f:close()
+            end
+            os.remove(log_file)
+            if callback then callback(false, nil) end
+            return
+        end
+
+        if poll_count < max_polls then
+            UIManager:scheduleIn(0.5, pollNativeDone)
+        else
+            logger.err("TTSEngine: native one-shot timed out")
+            os.remove(done_marker)
+            os.remove(input_file)
+            os.remove(log_file)
+            if callback then callback(false, nil) end
+        end
+    end
+
+    UIManager:scheduleIn(0.3, pollNativeDone)
+    return nil
+end
+
+--[[--
+Return the configured FIFO path for the native TTS daemon.
+--]]
+function TTSEngine:_nativeFifoPath()
+    local configured = self.plugin:getSetting("native_fifo_path", "")
+    if configured and configured ~= "" then
+        return configured
+    end
+    return "/tmp/audiobook_native_tts.fifo"
+end
+
+--[[--
+Platform-native helper daemon/FIFO mode.
+The helper is started once and kept running; requests are sent via FIFO
+and completion is signaled through a .done marker file so the UI thread
+never blocks on a FIFO read.
+--]]
+function TTSEngine:_synthesizeNativeDaemon(text, audio_file, speed, callback)
+    if not self:_ensureNativeDaemon() then
+        logger.err("TTSEngine: native daemon not available")
+        if callback then callback(false, nil) end
+        return false
+    end
+
+    local temp_dir = "/tmp"
+    self.file_counter = (self.file_counter or 0) + 1
+    local input_file = temp_dir .. "/audiobook_native_" .. os.time() .. "_" .. self.file_counter .. ".txt"
+    local f = io.open(input_file, "wb")
+    if not f then
+        logger.err("TTSEngine: cannot write native daemon input file")
+        if callback then callback(false, nil) end
+        return false
+    end
+    f:write(text)
+    f:close()
+
+    local req_fifo = self:_nativeFifoPath()
+    local done_marker = audio_file .. ".done"
+
+    -- Remove any stale done marker before sending the request.
+    os.remove(done_marker)
+
+    local request = string.format("SYNTH|%s|%s|%s\n",
+        input_file:gsub("|", "\\|"),
+        audio_file:gsub("|", "\\|"),
+        speed)
+
+    -- Write the request in the background so the UI thread never blocks
+    -- waiting for the daemon to open the FIFO for reading.
+    local write_cmd = string.format(
+        "printf '%%s' '%s' > '%s' 2>/dev/null &",
+        request:gsub("'", "'\\''"),
+        req_fifo:gsub("'", "'\\''")
+    )
+    os.execute(write_cmd)
+
+    logger.dbg("TTSEngine: native daemon request:", request:gsub("%s+$", ""))
+
+    local engine = self
+    local poll_count = 0
+    local max_polls = 120
+    local function pollNativeDone()
+        poll_count = poll_count + 1
+        local mf = io.open(done_marker, "r")
+        if mf then
+            local result = mf:read("*a"):gsub("%s+", "")
+            mf:close()
+            os.remove(done_marker)
+            os.remove(input_file)
+
+            local status, msg = result:match("^([^|]+)|?(.*)$")
+            local af = io.open(audio_file, "r")
+            local size = 0
+            if af then
+                af:seek("end", 0)
+                size = af:seek()
+                af:close()
+            end
+
+            if status == "OK" and size > 0 then
+                engine.current_audio_file = audio_file
+                engine:generateTimingEstimates(engine._native_tts_text or text)
+                if callback then callback(true, engine.timing_data) end
+                return
+            else
+                logger.err("TTSEngine: native daemon error:", result)
+                if callback then callback(false, nil) end
+                return
+            end
+        end
+
+        if poll_count < max_polls then
+            UIManager:scheduleIn(0.5, pollNativeDone)
+        else
+            logger.err("TTSEngine: native daemon response timed out")
+            os.remove(input_file)
+            if callback then callback(false, nil) end
+        end
+    end
+
+    UIManager:scheduleIn(0.3, pollNativeDone)
+    return nil
+end
+
+--[[--
+Start or verify the platform-native helper daemon.
+This is intentionally non-blocking; it returns immediately and the first
+request will time out gracefully if the daemon is not yet ready.
+--]]
+function TTSEngine:_ensureNativeDaemon()
+    local helper = self.backend_cmd
+    if not helper or helper == "" then return false end
+
+    local pid_file = "/tmp/audiobook_native_daemon.pid"
+    local lock_file = "/tmp/audiobook_native_daemon.lock"
+    local log_file = "/tmp/audiobook_native_daemon.log"
+    local req_fifo = self:_nativeFifoPath()
+
+    -- Check existing daemon.
+    local pf = io.open(pid_file, "r")
+    if pf then
+        local pid = tonumber(pf:read("*a"))
+        pf:close()
+        if pid and io.open("/proc/" .. pid .. "/stat", "r") then
+            return true
+        end
+    end
+
+    -- Create the request FIFO and remove stale PID file.
+    os.execute("mkfifo '" .. req_fifo:gsub("'", "'\\''") .. "' 2>/dev/null")
+    os.remove(pid_file)
+
+    local has_flock = self:commandExists("flock")
+    local start_cmd
+    if has_flock then
+        start_cmd = string.format(
+            "flock -n '%s' -c '%s --daemon --fifo %s' >'%s' 2>&1 & echo $!",
+            lock_file:gsub("'", "'\\''"),
+            helper:gsub("'", "'\\''"),
+            req_fifo:gsub("'", "'\\''"),
+            log_file:gsub("'", "'\\''")
+        )
+    else
+        -- Fallback: start helper directly.  The helper itself is expected to
+        -- reject duplicate instances if it needs single-instancing.
+        start_cmd = string.format(
+            "'%s' --daemon --fifo '%s' >'%s' 2>&1 & echo $!",
+            helper:gsub("'", "'\\''"),
+            req_fifo:gsub("'", "'\\''"),
+            log_file:gsub("'", "'\\''")
+        )
+    end
+
+    local h = io.popen(start_cmd)
+    local pid_str = h and h:read("*a") or ""
+    if h then h:close() end
+    local pid = tonumber(pid_str:match("(%d+)"))
+    if not pid then
+        logger.err("TTSEngine: failed to start native daemon")
+        return false
+    end
+
+    local wf = io.open(pid_file, "w")
+    if wf then
+        wf:write(tostring(pid))
+        wf:close()
+    end
+    self.native_daemon_pid = pid
+    logger.warn("TTSEngine: started native daemon pid", pid)
+    return true
+end
+
+--[[--
+Stop the platform-native helper daemon.
+--]]
+function TTSEngine:_stopNativeDaemon()
+    local pid_file = "/tmp/audiobook_native_daemon.pid"
+    local pf = io.open(pid_file, "r")
+    if pf then
+        local pid = tonumber(pf:read("*a"))
+        pf:close()
+        if pid then
+            os.execute("kill -TERM " .. pid .. " 2>/dev/null")
+            os.execute("(sleep 1; kill -9 " .. pid .. " 2>/dev/null) >/dev/null 2>&1 &")
+        end
+    end
+    os.remove(pid_file)
+    self.native_daemon_pid = nil
+end
+
 --[[--
 Synthesize using command-line TTS.
 @param text string Text to synthesize
@@ -666,6 +1094,9 @@ function TTSEngine:synthesizeCommand(text, callback)
     elseif self.backend == self.BACKENDS.ANDROID then
         -- Android TTS via JNI: synthesize to WAV file asynchronously
         return self:synthesizeAndroid(text, audio_file, callback)
+    elseif self.backend == self.BACKENDS.NATIVE then
+        -- Platform-native TTS via user-supplied helper binary/script.
+        return self:_synthesizeNative(text, audio_file, callback)
     end
     if not cmd then
         logger.err("TTSEngine: Cannot create command for backend:", self.backend)
@@ -5625,6 +6056,8 @@ function TTSEngine:forceKillAll()
         os.execute("kill -9 " .. self.audio_pid .. " 2>/dev/null")
         self.audio_pid = nil
     end
+    -- Stop platform-native helper daemon if it is running.
+    self:_stopNativeDaemon()
     -- SIGKILL to guarantee hung gst-launch processes die (e.g. stuck in
     -- BT audio driver).  _stopPersistentPipeline already used SIGKILL for
     -- the pipeline; this catches any legacy-path or newly spawned strays.
@@ -5700,6 +6133,10 @@ function TTSEngine:setBackend(backend)
         logger.warn("TTSEngine: Invalid backend:", backend)
         return
     end
+    -- Tear down any platform-native daemon when leaving the native backend.
+    if self.backend == self.BACKENDS.NATIVE and backend ~= self.BACKENDS.NATIVE then
+        self:_stopNativeDaemon()
+    end
     self.backend = backend
     -- Invalidate cached audio player: backend choice can change which player
     -- is appropriate (e.g. switching to/from kindle-native-tts changes whether
@@ -5722,6 +6159,8 @@ function TTSEngine:setBackend(backend)
         else
             self.backend_cmd = "espeak-ng"
         end
+    elseif backend == self.BACKENDS.NATIVE then
+        self.backend_cmd = self.plugin:getSetting("native_helper_path") or ""
     end
 end
 

@@ -168,6 +168,11 @@ function Audiobook:_initSubmodules()
             if saved_backend then
                 self.tts_engine:setBackend(saved_backend)
             end
+            -- Ensure the native backend has the latest helper path after restore.
+            if saved_backend == self.tts_engine.BACKENDS.NATIVE
+               and self.tts_engine:_nativeHelperConfigured() then
+                self.tts_engine.backend_cmd = self:getSetting("native_helper_path", "")
+            end
             self.tts_engine:setRate(self:getSetting("speech_rate", 1.0))
             self.tts_engine:setPitch(self:getSetting("speech_pitch", 50))
             self.tts_engine:setVolume(self:getSetting("speech_volume", 1.0))

@@ -233,6 +233,17 @@ local function detectStack()
     logger.warn("BTManager: bluetoothctl available:", has_bluetoothctl)
 end
 
+--- Check whether this device is a Kobo with the MediaTek Bluetooth stack.
+-- The MTK stack is the only environment where MBROLA voices other than
+-- mb-en1 trigger a firmware audio-repeat bug.
+-- @treturn bool
+function BTManager:isMtkKobo()
+    if not bt_stack then
+        detectStack()
+    end
+    return bt_stack == "mtk" and Device:isKobo()
+end
+
 --- Run a dbus-send command and return the raw output.
 -- @string cmd  full dbus-send command
 -- @treturn string output (may be empty)
