@@ -1490,55 +1490,65 @@ find /usr /system /vendor /mnt /data -maxdepth 4 -name '*audio*.so*' 2>/dev/null
     -- Reports whether the binary exists, GStreamer loads, and which elements
     -- are available (especially mixersink which is the only audio path).
     if Device.isKindle and Device:isKindle() then
-        -- Try common plugin paths to find the binary
-        local gst_play_path = nil
-        for _, p in ipairs({
-            "/mnt/us/koreader/plugins/audiobook.koplugin",
-            "/opt/koreader/plugins/audiobook.koplugin",
-        }) do
-            local candidate = p .. "/kindle/gst-play"
-            if fileExists(candidate) then gst_play_path = candidate; break end
-        end
-        if gst_play_path then
-            -- Compat binary: run through the bundled ld-linux to bypass old
-            -- system glibc.
-            local gst_cmd = gst_play_path
-            local espeak_lib = gst_play_path:gsub("/kindle/gst%-play$", "/espeak-ng/lib")
-            local ld_linux = espeak_lib .. "/ld-linux-armhf.so.3"
-            if fileExists(ld_linux) then
-                gst_cmd = ld_linux .. " --library-path " .. espeak_lib .. ":/usr/lib:/lib " .. gst_play_path
-            end
-            -- Wrap in ( ... ); echo rc=$? so the EXIT CODE is always captured
-            -- even when the probe crashes producing no stdout (which previously
-            -- collapsed to a useless "binary_exists_but_probe_failed" and hid
-            -- the real failure -- e.g. a glibc-mixing "undefined symbol").
-            info.kindle_gst_play_probe = shellCapture(
-                "( " .. gst_cmd .. " --probe ) 2>&1; echo \"rc=$?\"", 8) or "binary_exists_but_probe_failed"
-            info.kindle_gst_play_version = shellCapture(
-                gst_cmd .. " --version 2>&1", 2) or "n/a"
-
-            -- Native-glibc variant (KinAMP parity): the fallback used on
-            -- audio-less PW4-class devices.  Probed BARE under the system linker
-            -- (its ELF interpreter is the device's /lib/ld-linux-armhf.so.3, so
-            -- no wrapper is needed).  Capturing both probes side by side lets a
-            -- follow-up report show exactly which variant reaches mixersink.
-            local native_path = gst_play_path:gsub("/kindle/gst%-play$", "/kindle/gst-play-native")
-            if fileExists(native_path) then
-                info.kindle_gst_play_native_probe = shellCapture(
-                    "( " .. native_path .. " --probe ) 2>&1; echo \"rc=$?\"", 8) or "binary_exists_but_probe_failed"
-                info.kindle_gst_play_native_version = shellCapture(
-                    native_path .. " --version 2>&1", 2) or "n/a"
-                -- ELF interpreter -- confirms it runs under the SYSTEM linker
-                -- (not a nonexistent nix path like the compat binary).
-                info.kindle_gst_play_native_interp = shellCapture(
-                    "strings -n 6 " .. native_path .. " 2>/dev/null | grep -m1 'ld-linux'", 3) or "n/a"
-            else
-                info.kindle_gst_play_native_probe = "binary_not_found"
-            end
+        -- Locate the plugin directory from the engine or from our own path so
+        -- the report works regardless of whether KOReader is installed under
+        -- /mnt/us, /opt, or a relative path.
+        local plugin_dir = nil
+        if plugin and plugin.tts_engine and plugin.tts_engine.plugin_dir then
+            plugin_dir = plugin.tts_engine.plugin_dir
         else
-            info.kindle_gst_play_probe = "binary_not_found"
-            info.kindle_gst_play_native_probe = "binary_not_found"
+            plugin_dir = _utils_dir:sub(1, -2)
         end
+        plugin_dir = plugin_dir:gsub("/$", "")
+
+        --- Probe a single gst-play variant and return structured diagnostics.
+        -- @tparam string bin_path absolute path to the binary
+        -- @tparam string variant key suffix for info fields (e.g. "", "_native", "_native_pw2")
+        -- @tparam string|nil wrapped_cmd optional command using bundled ld-linux
+        local function probeGstPlayVariant(bin_path, variant, wrapped_cmd)
+            local suffix = variant ~= "" and "_" .. variant or ""
+            if not fileExists(bin_path) then
+                info["kindle_gst_play" .. suffix .. "_probe"] = "binary_not_found"
+                return
+            end
+
+            local cmd = wrapped_cmd or ("'" .. bin_path .. "'")
+            -- Wrap in ( ... ); echo rc=$? so the EXIT CODE is always captured
+            -- even when the probe crashes producing no stdout.
+            info["kindle_gst_play" .. suffix .. "_probe"] = shellCapture(
+                "( " .. cmd .. " --probe ) 2>&1; echo \"rc=$?\"", 8) or "probe_timed_out_or_crashed"
+            info["kindle_gst_play" .. suffix .. "_version"] = shellCapture(
+                cmd .. " --version 2>&1", 2) or "n/a"
+            info["kindle_gst_play" .. suffix .. "_file"] = shellCapture(
+                "file '" .. bin_path .. "' 2>&1", 2) or "n/a"
+            info["kindle_gst_play" .. suffix .. "_interp"] = shellCapture(
+                "readelf -l '" .. bin_path .. "' 2>/dev/null | grep -i 'interpreter'", 3)
+                or shellCapture("strings -n 6 '" .. bin_path .. "' 2>/dev/null | grep -m1 'ld-linux'", 3)
+                or "n/a"
+            info["kindle_gst_play" .. suffix .. "_glibc"] = shellCapture(
+                "readelf -V '" .. bin_path .. "' 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | uniq | tail -3", 3) or "n/a"
+        end
+
+        local gst_play_bin = plugin_dir .. "/kindle/gst-play"
+        local espeak_lib = plugin_dir .. "/espeak-ng/lib"
+        local ld_linux = espeak_lib .. "/ld-linux-armhf.so.3"
+        local compat_cmd = nil
+        if fileExists(ld_linux) then
+            compat_cmd = ld_linux .. " --library-path " .. espeak_lib .. ":/usr/lib:/lib '" .. gst_play_bin .. "'"
+        end
+        -- Compat binary (hard-float, bundled glibc).
+        probeGstPlayVariant(gst_play_bin, "", compat_cmd)
+
+        -- Native hard-float variant (kindlehf, firmware >= 5.16.3).
+        local native_path = plugin_dir .. "/kindle/gst-play-native"
+        probeGstPlayVariant(native_path, "native", nil)
+
+        -- Native soft-float variant (kindlepw2, firmware < 5.16.3).
+        local native_pw2_path = plugin_dir .. "/kindle/gst-play-native-pw2"
+        probeGstPlayVariant(native_pw2_path, "native_pw2", nil)
+
+        -- KinAMP presence check (useful fallback diagnostic).
+        info.kinamp_available = fileExists("/mnt/us/KinAMP/startkinamp_koreader.sh") and "yes" or "no"
 
         -- Last gst-play playback log (stderr captured during actual play)
         info.kindle_gst_play_last_log = shellCapture(

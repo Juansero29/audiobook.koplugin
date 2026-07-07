@@ -4531,27 +4531,22 @@ LIPC focus sequence before audioOutputConnected becomes 1 (issue #32).
 -- device was already classified _no_real_audio_output), so devices that already
 -- select kindle-gst-play normally never run this and cannot regress.
 --
--- @treturn string|nil "kindle-gst-play" if selected, nil otherwise
-function TTSEngine:_probeNativeGstPlay()
-    if not Device:isKindle() then return nil end
-    -- NOTE: deliberately NOT gated on self._gst_play_broken.  That flag means
-    -- the COMPAT (or system) gst-play pipeline hung during playback -- which is
-    -- exactly the glibc-mixing failure this native variant exists to fix -- so
-    -- suppressing native here would block the fallback on the devices that need
-    -- it most.  (Safe: this helper only runs from _kindleRescueProbe, i.e. after
-    -- _no_real_audio_output, so working devices never reach it.)
-    local plugin_dir = Utils.normalizeDirPath(self.plugin_dir or ".")
-    local native_bin = plugin_dir .. "/kindle/gst-play-native"
+-- Probe one native-glibc gst-play binary.  Returns "kindle-gst-play" and
+-- configures the engine if the binary reports mixersink=found, otherwise nil.
+-- @tparam string native_bin absolute path to the binary
+-- @tparam string variant short name for logs/diagnostics (e.g. "native-pw2")
+-- @treturn string|nil
+function TTSEngine:_probeOneNativeGstPlay(native_bin, variant)
     local nf = io.open(native_bin, "r")
     if not nf then
-        logger.dbg("TTSEngine: no bundled kindle/gst-play-native")
+        logger.dbg("TTSEngine: no bundled kindle/gst-play-" .. variant)
         return nil
     end
     nf:close()
 
     -- KinAMP-style launch: run the native binary PLAINLY under the system
-    -- linker.  Its ELF interpreter is the device's /lib/ld-linux-armhf.so.3 (not
-    -- a nonexistent nix path like the compat binary), so bare execution works,
+    -- linker.  Its ELF interpreter is the device's system linker (not a
+    -- nonexistent nix path like the compat binary), so bare execution works,
     -- and it dlopens libgstreamer-0.10 by absolute /usr/lib path -- no
     -- LD_LIBRARY_PATH needed (KinAMP doesn't add /usr/lib either).  Deliberately
     -- NO espeak-linker --library-path wrapper: that wrapper is what triggers the
@@ -4563,17 +4558,19 @@ function TTSEngine:_probeNativeGstPlay()
     if not ph then return nil end
     local probe = ph:read("*a") or ""
     ph:close()
-    self._native_gst_play_probe = probe   -- retained for the bug report
+    -- Retain the most recent probe output for the bug report.
+    self._native_gst_play_probe = probe
+    self._native_gst_play_variant = variant
 
     local has_plugin_error = probe:match("Failed to load plugin")
         or probe:match("undefined symbol")
         or probe:match("GStreamer%-WARNING")
     if has_plugin_error then
-        logger.warn("TTSEngine: gst-play-native probe found plugin load error:", probe:gsub("\n", " "))
+        logger.warn("TTSEngine: gst-play-" .. variant .. " probe found plugin load error:", probe:gsub("\n", " "))
         return nil
     end
     if not probe:match("mixersink=found") then
-        logger.warn("TTSEngine: gst-play-native probe lacks mixersink:", probe:gsub("\n", " "))
+        logger.warn("TTSEngine: gst-play-" .. variant .. " probe lacks mixersink:", probe:gsub("\n", " "))
         return nil
     end
 
@@ -4591,12 +4588,36 @@ function TTSEngine:_probeNativeGstPlay()
     os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
 
     self._kindle_gst_play_bin = native_cmd
-    self._gst_play_variant = "native"
+    self._gst_play_variant = variant
     self.audio_player_type = "kindle-gst-play"
     self._no_real_audio_output = false
-    logger.warn("TTSEngine: Selected kindle-gst-play NATIVE variant (mixersink found), probe:",
+    logger.warn("TTSEngine: Selected kindle-gst-play " .. variant .. " variant (mixersink found), probe:",
         probe:gsub("\n", " "))
     return "kindle-gst-play"
+end
+
+-- @treturn string|nil "kindle-gst-play" if selected, nil otherwise
+function TTSEngine:_probeNativeGstPlay()
+    if not Device:isKindle() then return nil end
+    -- NOTE: deliberately NOT gated on self._gst_play_broken.  That flag means
+    -- the COMPAT (or system) gst-play pipeline hung during playback -- which is
+    -- exactly the glibc-mixing failure this native variant exists to fix -- so
+    -- suppressing native here would block the fallback on the devices that need
+    -- it most.  (Safe: this helper only runs from _kindleRescueProbe, i.e. after
+    -- _no_real_audio_output, so working devices never reach it.)
+    local plugin_dir = Utils.normalizeDirPath(self.plugin_dir or ".")
+
+    -- Try soft-float kindlepw2 binary first: PW2/PW3/PW4 on firmware < 5.16.3.
+    local pw2_bin = plugin_dir .. "/kindle/gst-play-native-pw2"
+    local selected = self:_probeOneNativeGstPlay(pw2_bin, "native-pw2")
+    if selected then return selected end
+
+    -- Fall back to hard-float kindlehf binary: PW4+ on firmware >= 5.16.3.
+    local hf_bin = plugin_dir .. "/kindle/gst-play-native"
+    selected = self:_probeOneNativeGstPlay(hf_bin, "native")
+    if selected then return selected end
+
+    return nil
 end
 
 function TTSEngine:_kindleRescueProbe()

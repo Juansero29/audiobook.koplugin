@@ -94,3 +94,62 @@ jobs:
         with:
           name: gst-play-native-armv7l
           path: kindle/gst-play-native
+
+  # Soft-float variant for PW2/PW3/PW4-class devices on firmware < 5.16.3.
+  # Amazon did not switch to the hard-float ABI until 5.16.3, so the kindlehf
+  # binary above will not load on 5.15.x.  This build uses the koxtoolchain
+  # kindlepw2 target (arm-kindlepw2-linux-gnueabi, soft-float) and runs under
+  # the device's own system linker.
+  build-native-pw2:
+    runs-on: ubuntu-latest
+
+    env:
+      # Prebuilt soft-float Kindle toolchain.  Covers PW2/PW3/PW4 on firmware
+      # up to and including 5.16.2.1.1.
+      KOX_TAG: "2025.05"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache prebuilt koxtoolchain (kindlepw2)
+        id: cache-tc
+        uses: actions/cache@v4
+        with:
+          path: ~/x-tools
+          key: koxtoolchain-prebuilt-kindlepw2-${{ env.KOX_TAG }}
+
+      - name: Fetch prebuilt koxtoolchain (kindlepw2)
+        if: steps.cache-tc.outputs.cache-hit != 'true'
+        run: |
+          # The koxtoolchain release ships a ready-made toolchain (no ~1h build).
+          curl -sL "https://github.com/koreader/koxtoolchain/releases/download/${KOX_TAG}/kindlepw2.tar.gz" \
+            -o /tmp/kindlepw2.tar.gz
+          mkdir -p "$HOME"
+          # Archive root is x-tools/, so it lands at ~/x-tools/arm-kindlepw2-...
+          tar -xzf /tmp/kindlepw2.tar.gz -C "$HOME"
+          ls -la "$HOME/x-tools/arm-kindlepw2-linux-gnueabi/bin/" | head
+
+      - name: Build gst-play-native-pw2
+        run: |
+          export PATH="$HOME/x-tools/arm-kindlepw2-linux-gnueabi/bin:$PATH"
+          # Native build: define KGP_NATIVE_GLIBC (drops the GLIBC_PRIVATE shims)
+          # and DO NOT pass --version-script (the native glibc provides those
+          # symbols itself).
+          arm-kindlepw2-linux-gnueabi-gcc -O2 -Wall -Wextra -Wno-unused-parameter \
+            -DKGP_NATIVE_GLIBC \
+            -o kindle/gst-play-native-pw2 \
+            kindle/gst-play.c \
+            -ldl
+          ls -lh kindle/gst-play-native-pw2
+          RE=arm-kindlepw2-linux-gnueabi-readelf
+          echo "--- interpreter (expect /lib/ld-linux.so.3) ---"
+          $RE -l kindle/gst-play-native-pw2 | grep -i interpreter
+          echo "--- NEEDED + RUNPATH (expect only libc/libdl, no nix RUNPATH) ---"
+          $RE -d kindle/gst-play-native-pw2 | grep -iE "NEEDED|RUNPATH|RPATH" || true
+          echo "--- max required GLIBC symbol version ---"
+          $RE -V kindle/gst-play-native-pw2 | grep -oE "GLIBC_[0-9.]+" | sort -V | uniq | tail -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gst-play-native-pw2-armv7l
+          path: kindle/gst-play-native-pw2

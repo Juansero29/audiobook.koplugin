@@ -98,6 +98,17 @@ if [ -f "$SCRIPT_DIR/kindle/gst-play-native" ]; then
     echo "Bundled kindle/gst-play-native"
 fi
 
+# Soft-float native-glibc variant for PW2/PW3/PW4-class devices on firmware
+# < 5.16.3, where the hard-float kindlehf binary cannot load.  Built with
+# koxtoolchain kindlepw2 (arm-kindlepw2-linux-gnueabi).  Probed before the
+# hard-float native variant (see ttsengine.lua/mediaengine.lua).
+if [ -f "$SCRIPT_DIR/kindle/gst-play-native-pw2" ]; then
+    mkdir -p "$PLUGIN_DEST/kindle"
+    cp "$SCRIPT_DIR/kindle/gst-play-native-pw2" "$PLUGIN_DEST/kindle/"
+    chmod +x "$PLUGIN_DEST/kindle/gst-play-native-pw2"
+    echo "Bundled kindle/gst-play-native-pw2"
+fi
+
 # espeak-ng binary + library (inside plugin dir)
 cp "$ESPEAK_OUT/bin/espeak-ng" "$ESPEAK_DEST/bin/"
 # Find the actual versioned .so file (e.g. libespeak-ng.so.1.52.0.1) without hardcoding version

@@ -353,6 +353,24 @@ Key playermgr properties:
 | `TTS_State` | r Int | TTS-specific state |
 | `gstLogLevel` | rw Int | GStreamer log verbosity |
 
+### Bundled GStreamer WAV player (`kindle-gst-play`)
+
+Kindle firmware ships GStreamer 0.10 with Amazon's custom `mixersink` element, but
+most units strip `wavparse`, so the plugin bundles a tiny helper that reads the
+WAV header in C and feeds raw PCM to `mixersink`.
+
+Three variants are shipped and probed in order:
+
+| Binary | Toolchain | ABI | Firmware range |
+|--------|-----------|-----|----------------|
+| `kindle/gst-play` | `arm-linux-gnueabihf` | hard-float | bundled-ld-linux path; works on kindlehf firmware |
+| `kindle/gst-play-native-pw2` | `arm-kindlepw2-linux-gnueabi` | soft-float | PW2/PW3/PW4 on firmware **<= 5.16.2.1.1** |
+| `kindle/gst-play-native` | `arm-kindlehf-linux-gnueabihf` | hard-float | PW4+/Colorsoft on firmware **>= 5.16.3** |
+
+The soft-float `kindlepw2` variant was added for issue #28: PW4 devices on
+firmware 5.15.x cannot load the hard-float binaries because Amazon only
+switched to the hard-float ABI at firmware 5.16.3.
+
 ### Potential Future Solutions
 
 | Approach | Feasibility | Preserves Piper voice | Dependencies |

@@ -416,16 +416,24 @@ function MediaEngine:_detectKindleGstPlay()
     -- gst-play built with koxtoolchain runs under the SYSTEM linker -- no glibc
     -- mixing -- so it can load the device's old-glibc libgstmixersink.so where
     -- the compat candidates above crash.  Run bare: its ELF interpreter is the
-    -- device's /lib/ld-linux-armhf.so.3 and it dlopens libgstreamer by absolute
-    -- path, so no linker wrapper or LD_LIBRARY_PATH is needed (KinAMP parity).
+    -- device's system linker and it dlopens libgstreamer by absolute path, so
+    -- no linker wrapper or LD_LIBRARY_PATH is needed (KinAMP parity).
     -- Tried LAST: the loop breaks on the first candidate that reports
     -- mixersink=found, so devices where the compat binary works never reach this
     -- and cannot regress.
-    local native_bin = plugin_dir .. "/kindle/gst-play-native"
-    local nf = io.open(native_bin, "r")
-    if nf then
-        nf:close()
-        table.insert(candidates, native_bin)
+    --
+    -- Soft-float kindlepw2 variant first (firmware < 5.16.3), then hard-float
+    -- kindlehf variant (firmware >= 5.16.3).
+    local native_bins = {
+        plugin_dir .. "/kindle/gst-play-native-pw2",
+        plugin_dir .. "/kindle/gst-play-native",
+    }
+    for _, native_bin in ipairs(native_bins) do
+        local nf = io.open(native_bin, "r")
+        if nf then
+            nf:close()
+            table.insert(candidates, native_bin)
+        end
     end
 
     local gst_play_cmd = nil
