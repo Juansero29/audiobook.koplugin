@@ -17,7 +17,7 @@ local _ = require("gettext")
 -- Forward-declared module-level locals.  Populated by init() Phase 1.
 -- Every function in this file can reference them as upvalues; they start
 -- as nil and become usable after init() succeeds.
-local Device, UIManager, InfoMessage, T
+local Device, UIManager, InfoMessage, T, Time
 local BtUI, BtMediaControl, BugReport, BenchmarkRunner, MenuBuilder, Utils, Updater
 local PLUGIN_PATH
 
@@ -41,6 +41,7 @@ function Audiobook:init()
         UIManager = require("ui/uimanager")
         InfoMessage = require("ui/widget/infomessage")
         T = require("ffi/util").template
+        Time = require("ui/time")
 
         -- Kill audio pipelines orphaned by a previous KOReader instance.
         -- Playback (and the A2DP keepalive, which is infinite) runs as
@@ -107,6 +108,11 @@ function Audiobook:init()
     -- while audio is playing (when the user enables the setting).
     self:_installSleepCoverOverride()
 
+    -- If the user chose "Play aligned/enriched audiobook" from the browser,
+    -- the FileManager plugin instance stored a pending request before ReaderUI
+    -- loaded. Handle it now that we have a document.
+    self:_checkPendingAlignedStart()
+
     -- Add "Read aloud from here" to the text selection / highlight popup.
     -- This appears when the user selects a paragraph or multiple words
     -- (as opposed to the single-word dictionary popup, which is handled
@@ -136,6 +142,22 @@ function Audiobook:init()
                             word = word:match("^%s*(%S+)") or word
                         end
                         self:startReadAlongFromWord(word, context)
+                    end)
+                end,
+            }
+        end)
+        self.ui.highlight:addToHighlightDialog("16_play_aligned", function(this)
+            return {
+                text = _("Play aligned audiobook from here"),
+                callback = function()
+                    if not self._init_ok then
+                        self:_showInitError()
+                        return
+                    end
+                    local selected_text = this.selected_text
+                    this:onClose()
+                    UIManager:scheduleIn(0.3, function()
+                        self:startAlignedAudioFromSelection(selected_text)
                     end)
                 end,
             }
@@ -344,7 +366,7 @@ function Audiobook:addToMainMenu(menu_items)
         sub_item_table = {
             -- ── TTS read-along (document required) ──
             {
-                text = _("Start reading from current page"),
+                text = _("Start Text-to-Speech from current page"),
                 enabled_func = function() return (self.ui and self.ui.document) or false end,
                 callback = function(touchmenu_instance)
                     if touchmenu_instance then touchmenu_instance:closeMenu() end
@@ -354,23 +376,14 @@ function Audiobook:addToMainMenu(menu_items)
             },
             -- ── Media playback (audio files & EPUB overlays) ──
             {
-                text = _("Play with audiobook (Highly Experimental)"),
+                text = _("Play aligned/enriched audiobook"),
                 enabled_func = function()
-                    return (self.ui and self.ui.document and self._init_ok and self.media_sync ~= nil) or false
+                    return (self._init_ok and self.media_sync ~= nil
+                            and ((self.ui and self.ui.document) or self:_isFileManager())) or false
                 end,
                 callback = function(touchmenu_instance)
                     if touchmenu_instance then touchmenu_instance:closeMenu() end
                     self:startMediaPlayback()
-                end,
-            },
-            {
-                text = _("Open audiobook..."),
-                enabled_func = function()
-                    return (self._init_ok and self.media_sync ~= nil) or false
-                end,
-                callback = function(touchmenu_instance)
-                    if touchmenu_instance then touchmenu_instance:closeMenu() end
-                    self:openAudioFile()
                 end,
             },
             {
@@ -381,6 +394,16 @@ function Audiobook:addToMainMenu(menu_items)
                 callback = function(touchmenu_instance)
                     if touchmenu_instance then touchmenu_instance:closeMenu() end
                     self:openMusicPlaylist()
+                end,
+            },
+            {
+                text = _("Play unaligned audiobook"),
+                enabled_func = function()
+                    return (self._init_ok and self.media_sync ~= nil) or false
+                end,
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
+                    self:openAudioFile()
                 end,
             },
             -- ── Audiobookshelf ──
@@ -546,6 +569,17 @@ function Audiobook:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = _("Follow page turns in aligned audiobook"),
+                        enabled_func = function() return (self.ui and self.ui.document) or false end,
+                        checked_func = function()
+                            return self:getSetting("media_follow_page_turn", true)
+                        end,
+                        callback = function()
+                            self:toggleSetting("media_follow_page_turn", true)
+                        end,
+                        help_text = _("When enabled (default), an aligned audiobook will automatically turn pages to keep the narration in view, and manually turning the page will seek narration to the new page. When disabled, pages do not auto-follow and manual turns do not seek audio; only the currently visible text is highlighted."),
+                    },
+                    {
                         text = _("Sleep timer"),
                         sub_item_table = {
                             {
@@ -598,8 +632,55 @@ function Audiobook:addToMainMenu(menu_items)
                                     self:_startSleepTimer(60)
                                 end,
                             },
+                            {
+                                text = _("1 hour"),
+                                checked_func = function()
+                                    return self:getSetting("sleep_timer_minutes", 0) == 120
+                                end,
+                                callback = function()
+                                    self:setSetting("sleep_timer_minutes", 120)
+                                    self:_startSleepTimer(120)
+                                end,
+                            },
+                            {
+                                text = _("2 hours"),
+                                checked_func = function()
+                                    return self:getSetting("sleep_timer_minutes", 0) == 180
+                                end,
+                                callback = function()
+                                    self:setSetting("sleep_timer_minutes", 180)
+                                    self:_startSleepTimer(180)
+                                end,
+                            },
+                            {
+                                text = _("3 hours"),
+                                checked_func = function()
+                                    return self:getSetting("sleep_timer_minutes", 0) == 240
+                                end,
+                                callback = function()
+                                    self:setSetting("sleep_timer_minutes", 240)
+                                    self:_startSleepTimer(240)
+                                end,
+                            },
+                            {
+                                text = _("Custom..."),
+                                keep_menu_open = true,
+                                callback = function(touchmenu_instance)
+                                    self:_showCustomSleepTimerDialog(touchmenu_instance)
+                                end,
+                            },
                         },
                         help_text = _("Automatically pause playback after the selected time. Useful for listening before sleep."),
+                    },
+                    {
+                        text = _("Put device to sleep when timer ends"),
+                        checked_func = function()
+                            return self:getSetting("sleep_timer_suspend_device", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("sleep_timer_suspend_device", false)
+                        end,
+                        help_text = _("When enabled, the device will suspend after the sleep timer stops playback."),
                     },
                     {
                         text_func = function()
@@ -768,6 +849,21 @@ function Audiobook:onDictButtonsReady(dict_popup, buttons)
             end)
         end,
     }})
+    table.insert(buttons, {{
+        id = "audiobook_play_aligned",
+        text = _("Play aligned audiobook from here"),
+        font_bold = false,
+        callback = function()
+            local selected_text = nil
+            if dict_popup.highlight and dict_popup.highlight.selected_text then
+                selected_text = dict_popup.highlight.selected_text
+            end
+            UIManager:close(dict_popup)
+            UIManager:scheduleIn(0.3, function()
+                plugin:startAlignedAudioFromSelection(selected_text)
+            end)
+        end,
+    }})
 end
 
 function Audiobook:startReadAlong(text, start_pos)
@@ -895,12 +991,7 @@ end
 -- Media playback functions (audio files & EPUB Media Overlays)
 -- ---------------------------------------------------------------------------
 
-function Audiobook:_hasMediaOverlays()
-    if not self.ui or not self.ui.document then return false end
-    if not self.ui.rolling then return false end
-    -- Check if the current EPUB has Media Overlays in its manifest.
-    -- We do a lightweight check by looking for .smil files in the EPUB zip.
-    local doc_path = self.ui.document.file_path or self.ui.document.file
+function Audiobook:_documentHasMediaOverlays(doc_path)
     if not doc_path then return false end
     local ext = doc_path:match("%.([^.]+)$") or ""
     if ext:lower() ~= "epub" then return false end
@@ -914,6 +1005,13 @@ function Audiobook:_hasMediaOverlays()
         end
     end
     return false
+end
+
+function Audiobook:_hasMediaOverlays()
+    if not self.ui or not self.ui.document then return false end
+    if not self.ui.rolling then return false end
+    local doc_path = self.ui.document.file_path or self.ui.document.file
+    return self:_documentHasMediaOverlays(doc_path)
 end
 
 --- On Kindle there is no speaker/ALSA: audio only plays over Bluetooth A2DP.
@@ -950,14 +1048,25 @@ function Audiobook:startMediaPlayback()
     if not self:_audioOutputReady() then return end
 
     local doc_path = self.ui and self.ui.document and (self.ui.document.file_path or self.ui.document.file)
-    if not doc_path then
-        UIManager:show(InfoMessage:new{
-            text = _("No document is currently open."),
-            timeout = 3,
-        })
+    if doc_path then
+        -- Reader mode: keep existing auto-detection behavior.
+        self:_startMediaPlaybackForDocument(doc_path)
         return
     end
 
+    -- FileManager / browser mode
+    if self:_isFileManager() then
+        self:_startAlignedPlaybackFromFileManager(self.ui)
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = _("No document is currently open."),
+        timeout = 3,
+    })
+end
+
+function Audiobook:_startMediaPlaybackForDocument(doc_path)
     -- Try SMIL Media Overlays first
     if self:_hasMediaOverlays() then
         UIManager:show(InfoMessage:new{
@@ -965,7 +1074,7 @@ function Audiobook:startMediaPlayback()
             timeout = 1,
         })
         UIManager:scheduleIn(0.5, function()
-            self:_startSmilPlayback(doc_path)
+            self:_startSmilPlayback(doc_path, nil, true)
         end)
         return
     end
@@ -987,12 +1096,159 @@ function Audiobook:startMediaPlayback()
 
     -- Nothing found
     UIManager:show(InfoMessage:new{
-        text = _("This book has no embedded narration.\n\nPlace an audiobook file with the same name in the same folder, or use Open audiobook to play a separate file."),
+        text = _("This book has no embedded narration.\n\nPlace an audiobook file with the same name in the same folder, or use Play unaligned audiobook to play a separate file."),
         timeout = 5,
     })
 end
 
-function Audiobook:_startSmilPlayback(doc_path)
+function Audiobook:_isFileManager()
+    return self.ui and self.ui.file_chooser and not self.ui.document
+end
+
+function Audiobook:_getFileManagerSelectedFile(file_manager)
+    local ok, selected = pcall(function()
+        if file_manager.file_chooser and file_manager.file_chooser.getSelectedFile then
+            return file_manager.file_chooser:getSelectedFile()
+        end
+        if file_manager.file_chooser and file_manager.file_chooser.selected then
+            local sel = file_manager.file_chooser.selected
+            if type(sel) == "table" then
+                return sel[1] or sel.path
+            end
+            return sel
+        end
+        return nil
+    end)
+    if ok then return selected end
+    return nil
+end
+
+function Audiobook:_isBookFile(path)
+    local ext = (path:match("%.([^.]+)$") or ""):lower()
+    local book_exts = {
+        epub = true, mobi = true, azw = true, azw3 = true, prc = true,
+        fb2 = true, pdf = true, djvu = true, cbz = true, cbr = true,
+        cbt = true, txt = true, html = true, htm = true, xhtml = true,
+        rtf = true, doc = true, docx = true,
+    }
+    return book_exts[ext] == true
+end
+
+function Audiobook:_startAlignedPlaybackFromFileManager(file_manager)
+    local selected = self:_getFileManagerSelectedFile(file_manager)
+    if selected then
+        self:_startAlignedPlaybackFromBrowserPath(file_manager, selected)
+        return
+    end
+
+    -- No file selected: ask the user to pick one.
+    local PathChooser = require("ui/widget/pathchooser")
+    local home_dir = require("datastorage").getDataDir() or "/mnt"
+    UIManager:show(PathChooser:new{
+        title = _("Select a book"),
+        path = home_dir,
+        select_file = true,
+        onConfirm = function(file_path)
+            self:_startAlignedPlaybackFromBrowserPath(file_manager, file_path)
+        end,
+    })
+end
+
+function Audiobook:_startAlignedPlaybackFromBrowserPath(file_manager, path)
+    if not path then return end
+    local ext = (path:match("%.([^.]+)$") or ""):lower()
+
+    if not self:_isBookFile(path) then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Unsupported file type for aligned audiobook: %1"), ext),
+            timeout = 4,
+        })
+        return
+    end
+
+    -- Check for SMIL overlays before opening the book so we can decide
+    -- cleanly whether to start playback or show the missing-metadata warning
+    -- once ReaderUI loads.
+    local has_overlays = (ext == "epub") and self:_documentHasMediaOverlays(path)
+
+    -- Open the book. The FileManager plugin instance is about to be torn
+    -- down and replaced by a ReaderUI plugin instance, so we cannot poll
+    -- self:_hasMediaOverlays() here. Store a pending request and let the
+    -- ReaderUI instance handle it after its document loads.
+    local ok, err = pcall(function()
+        file_manager:openFile(path)
+    end)
+    if not ok then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Could not open the book: %1"), tostring(err)),
+            timeout = 4,
+        })
+        return
+    end
+
+    Audiobook._pending_aligned_start = {
+        path = path,
+        action = has_overlays and "start" or "warn",
+    }
+end
+
+function Audiobook:_checkPendingAlignedStart()
+    local pending = Audiobook._pending_aligned_start
+    if not pending then return end
+    if not self._init_ok or not self.media_sync then return end
+    if not self.ui or not self.ui.document then return end
+
+    local doc_path = self.ui.document.file_path or self.ui.document.file
+    if not doc_path or doc_path ~= pending.path then return end
+
+    Audiobook._pending_aligned_start = nil
+    UIManager:scheduleIn(0.5, function()
+        if pending.action == "start" then
+            self:_startMediaPlaybackForDocument(doc_path)
+        else
+            UIManager:show(InfoMessage:new{
+                text = _("This book does not contain embedded narration/alignment metadata. Use Play unaligned audiobook or Start music playlist to play a separate audio file."),
+                timeout = 6,
+            })
+        end
+    end)
+end
+
+function Audiobook:addToFileManager(file_manager, menu_items)
+    if not menu_items.audiobook_browser then
+        menu_items.audiobook_browser = {
+            text = _("Play aligned/enriched audiobook"),
+            enabled_func = function()
+                return (self._init_ok and self.media_sync ~= nil) or false
+            end,
+            callback = function()
+                self:_startAlignedPlaybackFromFileManager(file_manager)
+            end,
+        }
+    end
+end
+
+function Audiobook:onShowFileDialog(file_manager, file)
+    local ok = pcall(function()
+        local dialog = file_manager.file_dialog or file_manager.dialog
+        local buttons = dialog and dialog.buttons
+        if not buttons then return end
+        table.insert(buttons, {{
+            id = "audiobook_aligned_browser",
+            text = _("Play aligned/enriched audiobook"),
+            callback = function()
+                UIManager:close(dialog)
+                self:_startAlignedPlaybackFromBrowserPath(file_manager, file)
+            end,
+        }})
+    end)
+    if not ok then
+        logger.warn("Audiobook: failed to add browser aligned-audiobook button")
+    end
+end
+
+function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
+    allow_resume = (allow_resume == true)
     local ok, EpubMediaOverlay = pcall(dofile, PLUGIN_PATH .. "epubmediaoverlay.lua")
     if not ok or not EpubMediaOverlay then
         UIManager:show(InfoMessage:new{
@@ -1062,50 +1318,90 @@ function Audiobook:_startSmilPlayback(doc_path)
         table.insert(playlist, { name = nm, path = p })
     end
 
-    -- Start from the reader's current position: map the current crengine
-    -- DocFragment index through the spine to a content document, then to
-    -- that document's first timing entry (scanning forward past front
-    -- matter that has no narration).
-    local start_file, start_time
-    local cur_xp = self.ui and self.ui.document
-        and self.ui.document:getXPointer()
-    local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
-    local spine = parser._spine_hrefs or {}
-    if frag_idx and spine[frag_idx] then
-        for si = frag_idx, #spine do
-            local base = spine[si]
-            for _, e in ipairs(timing_data) do
-                if e.audio_path and e.text_doc
-                    and (e.text_doc:match("([^/]+)$") == base) then
-                    start_file, start_time = e.audio_path, e.start_time
-                    break
+    -- Common startup logic used both for direct starts and after the resume prompt.
+    local function do_start(chosen_entry)
+        -- Start from the reader's current position, unless a specific entry was
+        -- requested (e.g., "Play aligned audiobook from here").
+        local start_file, start_time
+        if chosen_entry and chosen_entry.audio_path then
+            start_file = chosen_entry.audio_path
+            start_time = chosen_entry.start_time
+        else
+            -- Map the current crengine DocFragment index through the spine to a
+            -- content document, then to that document's first timing entry
+            -- (scanning forward past front matter that has no narration).
+            local cur_xp = self.ui and self.ui.document
+                and self.ui.document:getXPointer()
+            local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+            local spine = parser._spine_hrefs or {}
+            if frag_idx and spine[frag_idx] then
+                for si = frag_idx, #spine do
+                    local base = spine[si]
+                    for _, e in ipairs(timing_data) do
+                        if e.audio_path and e.text_doc
+                            and (e.text_doc:match("([^/]+)$") == base) then
+                            start_file, start_time = e.audio_path, e.start_time
+                            break
+                        end
+                    end
+                    if start_file then break end
                 end
             end
-            if start_file then break end
+            logger.warn("Audiobook: SMIL start-position cur_xp=", tostring(cur_xp),
+                "frag_idx=", frag_idx, "#spine=", #spine,
+                "start_file=", start_file and start_file:match("([^/]+)$") or "nil",
+                "start_time=", start_time)
         end
-    end
-    logger.warn("Audiobook: SMIL start-position cur_xp=", tostring(cur_xp),
-        "frag_idx=", frag_idx, "#spine=", #spine,
-        "start_file=", start_file and start_file:match("([^/]+)$") or "nil",
-        "start_time=", start_time)
 
-    pcall(function()
-        if self:getSetting("bt_media_control", true) and BtMediaControl then
-            BtMediaControl.start(self)
-        end
-    end)
-
-    self._smil_by_file = by_file
-    local first = start_file or files[1]
-    local started = self.media_sync:start(first, by_file[first].timing,
-        by_file[first].chapters, nil, playlist, first)
-    if started and start_time and start_time > 1 then
-        local ms = self.media_sync
-        UIManager:scheduleIn(1.5, function()
-            if ms.state == "playing" then
-                ms:seekToTime(start_time)
+        pcall(function()
+            if self:getSetting("bt_media_control", true) and BtMediaControl then
+                BtMediaControl.start(self)
             end
         end)
+
+        -- Cache parser/timing for page-follow and selection restarts.
+        self._smil_parser = parser
+        self._smil_timing_data = timing_data
+        self._smil_by_file = by_file
+        self._smil_page_index = nil
+        self._smil_doc_path = doc_path
+        local first = start_file or files[1]
+        -- Guard against a saved resume audio_path that no longer matches the
+        -- parsed timing data (e.g., path normalization differences).
+        if first and not by_file[first] then
+            first = files[1]
+        end
+        -- If a specific start entry was requested, resume playback directly at
+        -- that time instead of starting at 0:00 and seeking after a delay.
+        local start_position = nil
+        if start_time and start_time > 1 then
+            start_position = start_time
+        end
+        local started = self.media_sync:start(first, by_file[first].timing,
+            by_file[first].chapters, nil, playlist, first, start_position)
+        if started and start_position then
+            logger.warn("Audiobook: SMIL playback resumed at", start_position, "for", first:match("([^/]+)$"))
+        end
+        -- When resuming or starting from a specific selection, move the book view
+        -- to the sentence being read so the screen matches the audio.
+        if started and start_position and self.media_sync.overlay_mode then
+            logger.warn("Audiobook: navigating view to sentence at", start_position)
+            local ok_nav, nav_err = pcall(function()
+                self.media_sync:navigateToSentenceAtTime(start_position)
+            end)
+            if not ok_nav then
+                logger.warn("Audiobook: navigateToSentenceAtTime error:", nav_err)
+            end
+        end
+    end
+
+    -- When invoked from the main menu, offer to resume from the last saved position.
+    if allow_resume then
+        self:_promptResumeAlignedPlayback(doc_path, timing_data, start_entry, function(chosen_entry)
+            do_start(chosen_entry)
+        end)
+    else
+        do_start(start_entry)
     end
 end
 
@@ -1455,6 +1751,115 @@ function Audiobook:_clearPosition(file_path)
     self:setSetting("audio_positions", positions)
 end
 
+function Audiobook:_clearAlignedPosition(doc_path)
+    if not doc_path then return end
+    local positions = self:getSetting("aligned_positions", {})
+    local key = self:_getAudioPositionKey(doc_path)
+    positions[key] = nil
+    self:setSetting("aligned_positions", positions)
+end
+
+function Audiobook:_getSavedAlignedPosition(doc_path)
+    if not doc_path then return nil, nil, nil, nil end
+    local positions = self:getSetting("aligned_positions", {})
+    local key = self:_getAudioPositionKey(doc_path)
+    local entry = positions[key]
+    if entry and entry.path == doc_path then
+        return entry.position, entry.timestamp, entry.audio_path, entry.chapter_title
+    end
+    return nil, nil, nil, nil
+end
+
+function Audiobook:_saveAlignedPosition(doc_path, audio_path, position, chapter_title)
+    if not doc_path or not position or position <= 10 then return end
+    local positions = self:getSetting("aligned_positions", {})
+    local key = self:_getAudioPositionKey(doc_path)
+    positions[key] = {
+        path = doc_path,
+        audio_path = audio_path,
+        position = position,
+        chapter_title = chapter_title,
+        timestamp = os.time(),
+    }
+    -- Prune old entries (keep last 50)
+    local count = 0
+    for _ in pairs(positions) do count = count + 1 end
+    if count > 50 then
+        local oldest_key, oldest_time = nil, math.huge
+        for k, v in pairs(positions) do
+            if v.timestamp and v.timestamp < oldest_time then
+                oldest_time = v.timestamp
+                oldest_key = k
+            end
+        end
+        if oldest_key then positions[oldest_key] = nil end
+    end
+    self:setSetting("aligned_positions", positions)
+end
+
+function Audiobook:_promptResumeAlignedPlayback(doc_path, timing_data, default_start_entry, on_start_entry)
+    if not doc_path then
+        on_start_entry(default_start_entry)
+        return
+    end
+    local saved_pos, saved_time, saved_audio, saved_chapter = self:_getSavedAlignedPosition(doc_path)
+    -- Threshold: offer to resume only if we have more than 10 s of progress.
+    if not saved_pos or saved_pos <= 10 then
+        on_start_entry(default_start_entry)
+        return
+    end
+
+    local ConfirmBox = require("ui/widget/confirmbox")
+    local default_label = default_start_entry and _("Start from current page")
+        or _("Cancel")
+    local book_title = doc_path:match("([^/]+)%.[^./]+$") or doc_path:match("([^/]+)$") or _("Unknown book")
+    local lines = {
+        T(_("Continue listening from %1?"), self:_formatAudioTime(saved_pos)),
+        "",
+        T(_("Book: %1"), book_title),
+    }
+    if saved_chapter and saved_chapter ~= "" then
+        table.insert(lines, T(_("Chapter: %1"), saved_chapter))
+    end
+    table.insert(lines, "")
+    if saved_time then
+        table.insert(lines, T(_("Last played: %1"), os.date("%Y-%m-%d %H:%M", saved_time)))
+    end
+
+    local function from_start()
+        self:_clearAlignedPosition(doc_path)
+        if timing_data and timing_data[1] then
+            on_start_entry(timing_data[1])
+        else
+            on_start_entry(default_start_entry)
+        end
+    end
+
+    UIManager:show(ConfirmBox:new{
+        text = table.concat(lines, "\n"),
+        ok_text = _("Resume"),
+        cancel_text = default_label,
+        ok_callback = function()
+            local resume_entry = {
+                audio_path = saved_audio,
+                start_time = saved_pos,
+            }
+            on_start_entry(resume_entry)
+        end,
+        cancel_callback = function()
+            if default_start_entry then
+                on_start_entry(default_start_entry)
+            end
+        end,
+        other_buttons = {{
+            {
+                text = _("From start"),
+                callback = from_start,
+            },
+        }},
+    })
+end
+
 -- ---------------------------------------------------------------------------
 -- Sleep timer
 -- ---------------------------------------------------------------------------
@@ -1464,11 +1869,117 @@ function Audiobook:_startSleepTimer(minutes)
     self:_cancelSleepTimer()
     self._sleep_timer_minutes = minutes
     self._sleep_timer_end = os.time() + (minutes * 60)
+    local display
+    if minutes >= 60 then
+        local h = math.floor(minutes / 60)
+        local m = minutes % 60
+        if m == 0 then
+            display = T(_("%1 h"), h)
+        else
+            display = T(_("%1 h %2 min"), h, m)
+        end
+    else
+        display = T(_("%1 min"), minutes)
+    end
     UIManager:show(InfoMessage:new{
-        text = T(_("Sleep timer set: %1 min"), minutes),
+        text = T(_("Sleep timer set: %1"), display),
         timeout = 2,
     })
+    if self.media_sync and self.media_sync.playback_bar then
+        pcall(function()
+            self.media_sync.playback_bar:updateSleepTimer(minutes * 60, true)
+        end)
+    end
     self:_scheduleSleepTimerCheck()
+end
+
+function Audiobook:_showCustomSleepTimerDialog(touchmenu_instance)
+    self:_showSleepTimerDialog(touchmenu_instance)
+end
+
+function Audiobook:_showSleepTimerDialog(touchmenu_instance, on_set_callback)
+    -- Prefer DateTimeWidget because it shows hour + minute pickers at once.
+    local ok_dt, DateTimeWidget = pcall(require, "ui/widget/datetimewidget")
+    if ok_dt and DateTimeWidget then
+        UIManager:show(DateTimeWidget:new{
+            title_text = _("Sleep timer"),
+            info_text = _("Select hours and minutes."),
+            hour = 0,
+            min = 15,
+            hour_min = 0,
+            hour_max = 3,
+            min_min = 0,
+            min_max = 55,
+            min_step = 5,
+            min_hold_step = 5,
+            ok_text = _("Set"),
+            cancel_text = _("Cancel"),
+            callback = function(time)
+                local total = (time.hour or 0) * 60 + (time.min or 0)
+                if total > 0 then
+                    if on_set_callback then
+                        on_set_callback(total)
+                    else
+                        self:setSetting("sleep_timer_minutes", total)
+                        self:_startSleepTimer(total)
+                    end
+                else
+                    if on_set_callback then
+                        on_set_callback(0)
+                    else
+                        self:_cancelSleepTimer()
+                        self:setSetting("sleep_timer_minutes", 0)
+                    end
+                end
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        })
+        return
+    end
+
+    -- Fallback for older KOReader builds: sequential SpinWidgets.
+    local SpinWidget = require("ui/widget/spinwidget")
+    UIManager:show(SpinWidget:new{
+        title_text = _("Sleep timer: hours"),
+        info_text = _("Select the number of hours."),
+        value = 0,
+        value_min = 0,
+        value_max = 3,
+        value_step = 1,
+        value_hold_step = 1,
+        ok_text = _("Next"),
+        callback = function(hours_spin)
+            UIManager:show(SpinWidget:new{
+                title_text = _("Sleep timer: minutes"),
+                info_text = _("Select the number of minutes."),
+                value = 0,
+                value_min = 0,
+                value_max = 55,
+                value_step = 5,
+                value_hold_step = 5,
+                ok_text = _("Set"),
+                callback = function(minutes_spin)
+                    local total = hours_spin.value * 60 + minutes_spin.value
+                    if total > 0 then
+                        if on_set_callback then
+                            on_set_callback(total)
+                        else
+                            self:setSetting("sleep_timer_minutes", total)
+                            self:_startSleepTimer(total)
+                        end
+                    else
+                        if on_set_callback then
+                            on_set_callback(0)
+                        else
+                            self:_cancelSleepTimer()
+                            self:setSetting("sleep_timer_minutes", 0)
+                        end
+                    end
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            })
+        end,
+    })
 end
 
 function Audiobook:_cancelSleepTimer()
@@ -1477,6 +1988,11 @@ function Audiobook:_cancelSleepTimer()
     if self._sleep_timer_check then
         UIManager:unschedule(self._sleep_timer_check)
         self._sleep_timer_check = nil
+    end
+    if self.media_sync and self.media_sync.playback_bar then
+        pcall(function()
+            self.media_sync.playback_bar:updateSleepTimer(0, false)
+        end)
     end
 end
 
@@ -1492,12 +2008,17 @@ function Audiobook:_scheduleSleepTimerCheck()
                 text = _("Sleep timer: playback paused."),
                 timeout = 3,
             })
+            if self:getSetting("sleep_timer_suspend_device", false) then
+                pcall(function()
+                    Device:suspend()
+                end)
+            end
             return
         end
-        -- Update playback bar if it shows timer
+        -- Update playback bar / overlay if it shows timer
         if self.media_sync and self.media_sync.playback_bar then
             pcall(function()
-                self.media_sync.playback_bar:updateSleepTimer(remaining)
+                self.media_sync.playback_bar:updateSleepTimer(remaining, true)
             end)
         end
         self._sleep_timer_check = UIManager:scheduleIn(5, check)
@@ -1508,6 +2029,177 @@ end
 function Audiobook:getSleepTimerRemaining()
     if not self._sleep_timer_end then return 0 end
     return math.max(0, self._sleep_timer_end - os.time())
+end
+
+function Audiobook:_fragmentFromXPointer(xp)
+    if type(xp) ~= "string" then return nil end
+    return xp:match("#([^#]+)$")
+end
+
+function Audiobook:startAlignedAudioFromSelection(selected_text)
+    if not self._init_ok or not self.media_sync then
+        self:_showInitError()
+        return
+    end
+    if not self:_audioOutputReady() then return end
+
+    local doc_path = self.ui and self.ui.document and (self.ui.document.file_path or self.ui.document.file)
+    if not doc_path then
+        UIManager:show(InfoMessage:new{
+            text = _("No document is currently open."),
+            timeout = 3,
+        })
+        return
+    end
+
+    if not self:_hasMediaOverlays() then
+        UIManager:show(InfoMessage:new{
+            text = _("This book has no embedded narration/alignment metadata."),
+            timeout = 4,
+        })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = _("Loading Media Overlays..."),
+        timeout = 1,
+    })
+
+    UIManager:scheduleIn(0.5, function()
+        self:_startSmilPlaybackFromSelection(doc_path, selected_text, false)
+    end)
+end
+
+function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allow_resume)
+    allow_resume = (allow_resume ~= false)
+    local ok, EpubMediaOverlay = pcall(dofile, PLUGIN_PATH .. "epubmediaoverlay.lua")
+    if not ok or not EpubMediaOverlay then
+        UIManager:show(InfoMessage:new{
+            text = _("Failed to load EPUB Media Overlay parser."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local parser = self._smil_parser
+    local timing_data = self._smil_timing_data
+    if parser and timing_data and self._smil_doc_path ~= doc_path then
+        -- Cached data belongs to a different book; discard it.
+        logger.warn("Audiobook: SMIL cache is for", self._smil_doc_path,
+            "but current doc is", doc_path, "; reloading")
+        parser = nil
+        timing_data = nil
+        self._smil_parser = nil
+        self._smil_timing_data = nil
+        self._smil_by_file = nil
+        self._smil_page_index = nil
+        self._smil_doc_path = nil
+    end
+    if not parser or not timing_data then
+        parser = EpubMediaOverlay:new()
+        local err
+        timing_data, err = parser:loadFromEpub(doc_path, PLUGIN_PATH:sub(1, -2))
+        if not timing_data then
+            UIManager:show(InfoMessage:new{
+                text = _("No Media Overlays found: ") .. tostring(err),
+                timeout = 3,
+            })
+            return
+        end
+        self._smil_parser = parser
+        self._smil_timing_data = timing_data
+        self._smil_page_index = nil
+        self._smil_doc_path = doc_path
+    end
+
+    local start_entry = nil
+    if selected_text then
+        local frag = self:_fragmentFromXPointer(selected_text.pos0)
+            or self:_fragmentFromXPointer(selected_text.pos1)
+        if frag then
+            for _, e in ipairs(timing_data) do
+                if e.fragment_id == frag then
+                    start_entry = e
+                    break
+                end
+            end
+        end
+    end
+
+    if not start_entry and selected_text and selected_text.text then
+        -- CRe xpointer selections do not carry a #fragment id. Fall back to
+        -- matching the selected text against the sentence texts in the current
+        -- content document so "Play aligned audiobook from here" actually
+        -- starts near the selection.
+        local sel_text = selected_text.text
+            :gsub("[\n\r]+", " ")
+            :gsub("%s+", " ")
+            :gsub("^%s*", "")
+            :gsub("%s*$", "")
+        if sel_text ~= "" then
+            -- Use the first few words; a full sentence is more reliable than a
+            -- single word that may appear many times.
+            local first_words = sel_text:match("^%S+%s+%S+%s+%S+%s+%S+%s+%S+")
+                or sel_text:match("^%S+%s+%S+%s+%S+")
+                or sel_text:match("^%S+")
+                or sel_text
+            -- Prefer entries in the current document.
+            local cur_xp = self.ui and self.ui.document
+                and self.ui.document:getXPointer()
+            local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+            local spine = parser._spine_hrefs or {}
+            local function in_current_doc(e)
+                if not frag_idx or not spine[frag_idx] then return true end
+                local base = spine[frag_idx]
+                return e.text_doc and e.text_doc:match("([^/]+)$") == base
+            end
+            for pass = 1, 2 do
+                for _, e in ipairs(timing_data) do
+                    local use_entry = (pass == 1) and in_current_doc(e) or true
+                    if use_entry and e.text
+                        and e.text:find(first_words, 1, true) then
+                        start_entry = e
+                        logger.warn("Audiobook: matched selection to SMIL entry by text", e.fragment_id)
+                        break
+                    end
+                end
+                if start_entry then break end
+            end
+        end
+    end
+
+    if not start_entry then
+        -- Fall back to the first timing entry for the current page.
+        local cur_xp = self.ui and self.ui.document
+            and self.ui.document:getXPointer()
+        local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+        local spine = parser._spine_hrefs or {}
+        if frag_idx and spine[frag_idx] then
+            for si = frag_idx, #spine do
+                local base = spine[si]
+                for _, e in ipairs(timing_data) do
+                    if e.audio_path and e.text_doc
+                        and (e.text_doc:match("([^/]+)$") == base) then
+                        start_entry = e
+                        break
+                    end
+                end
+                if start_entry then break end
+            end
+        end
+    end
+
+    if not start_entry then
+        start_entry = timing_data[1]
+    end
+
+    if allow_resume then
+        self:_promptResumeAlignedPlayback(doc_path, timing_data, start_entry, function(chosen_entry)
+            self:_startSmilPlayback(doc_path, chosen_entry)
+        end)
+    else
+        self:_startSmilPlayback(doc_path, start_entry)
+    end
 end
 
 function Audiobook:startReadAlongFromWord(word, context)
@@ -1705,6 +2397,24 @@ function Audiobook:stopReadAlong()
         if ok_pos and ok_path and pos and path and pos > 10 then
             self:_savePosition(path, pos)
             logger.warn("Audiobook: saved position", pos, "for", path)
+
+            -- Also save aligned-audiobook position keyed by the EPUB path,
+            -- so we can offer "continue listening" on the next start.
+            if self.media_sync and self.media_sync.overlay_mode then
+                local doc_path = self.ui and self.ui.document
+                    and (self.ui.document.file_path or self.ui.document.file)
+                if doc_path then
+                    local chapter_title = nil
+                    if self.media_sync.getCurrentChapter then
+                        local ok_ch, ch = pcall(function()
+                            return self.media_sync:getCurrentChapter()
+                        end)
+                        if ok_ch and ch then chapter_title = ch.title end
+                    end
+                    self:_saveAlignedPosition(doc_path, path, pos, chapter_title)
+                    logger.warn("Audiobook: saved aligned position", pos, "for", doc_path)
+                end
+            end
 
             -- Sync to Audiobookshelf if this is an ABS item
             if self.media_sync._abs_item_id and self._abs_sync then
@@ -1918,6 +2628,137 @@ end
 -- Our SyncController manages page flow via advanceToNextPage().
 -- Having onPageUpdate here caused an infinite restart loop:
 -- highlight → screen refresh → PageUpdate → updateText → stop audio → restart → highlight → ...
+
+-- When the user manually turns a page while an aligned audiobook is playing,
+-- optionally seek narration to the new page.
+-- onPosUpdate is intentionally not hooked here; onPageUpdate already covers
+-- page changes, and reacting to every position update caused an infinite
+-- restart loop (highlight -> refresh -> PosUpdate -> seek -> highlight ...).
+function Audiobook:onPosUpdate(pos, refresh_type)
+end
+
+function Audiobook:onPageUpdate(cur_page, prev_page)
+    self:_handlePageTurnFollow()
+end
+
+function Audiobook:_handlePageTurnFollow()
+    if not self._init_ok then return end
+    if not self:getSetting("media_follow_page_turn", true) then return end
+    if not self.media_sync then return end
+    if not self.media_sync.overlay_mode then return end
+    if self.media_sync.state ~= self.media_sync.STATE.PLAYING
+       and self.media_sync.state ~= self.media_sync.STATE.PAUSED then
+        return
+    end
+    -- Ignore page events caused by MediaSync's own auto-follow.
+    if (self._media_sync_page_follow_count or 0) > 0 then return end
+    -- Re-entry / rapid-repeat guard.
+    if self._in_handle_page_turn_follow then return end
+    if Time then
+        local now = Time.now()
+        if self._page_turn_follow_deadline and now < self._page_turn_follow_deadline then
+            return
+        end
+        self._page_turn_follow_deadline = now + Time.s(1.0)
+    end
+
+    self._in_handle_page_turn_follow = true
+    local ok, err = pcall(function()
+        local start_entry = self:_findCurrentPageSmilEntry()
+        if not start_entry or not start_entry.audio_path then return end
+
+        -- If the current audio position is already inside the current page's
+        -- narration range, do not seek.  This prevents auto-follow or a
+        -- resume-navigation from jumping back to the first sentence of the
+        -- page we just moved to.
+        local current_path = self.media_sync.media_engine and self.media_sync.media_engine.current_path
+        local current_pos = self.media_sync.media_engine and self.media_sync.media_engine:getPosition()
+        if current_path == start_entry.audio_path and current_pos then
+            local page_end = start_entry.end_time or start_entry.start_time
+            for _, e in ipairs(self._smil_timing_data or {}) do
+                if e.audio_path == current_path and e.text_doc == start_entry.text_doc then
+                    if e.end_time and e.end_time > page_end then
+                        page_end = e.end_time
+                    end
+                end
+            end
+            if current_pos >= start_entry.start_time and current_pos <= page_end then
+                return
+            end
+        end
+
+        -- Suppress MediaSync's own auto page-follow for a short grace period so
+        -- the seek/restart below doesn't immediately trigger another page turn.
+        if Time then
+            self._suppress_media_sync_auto_page_follow = Time.now() + Time.s(3.0)
+        end
+
+        -- Only seek if we are changing to a different audio file or a later time.
+        if current_path and current_path ~= start_entry.audio_path then
+            self.media_sync:stop()
+            self:_startSmilPlayback(self.ui.document.file_path or self.ui.document.file, start_entry, false)
+        else
+            self.media_sync:seekToTime(start_entry.start_time)
+            if self.media_sync.state == self.media_sync.STATE.PAUSED then
+                self.media_sync:resume()
+            end
+        end
+    end)
+    self._in_handle_page_turn_follow = false
+    if not ok then
+        logger.warn("Audiobook: _handlePageTurnFollow error:", err)
+    end
+end
+
+-- Resolve a SMIL fragment id to a crengine xpointer, but only for the
+-- currently loaded document. Raw EPUB internal paths like
+-- "text/part0009.html#id14-s0" are not accepted by crengine; cross-document
+-- navigation is handled via gotoLink in mediasync.lua.
+function Audiobook:_resolveSmilXPointer(text_doc, fragment_id)
+    local doc = self.ui and self.ui.document
+    if not doc or not fragment_id then return nil end
+    local ok, norm = pcall(function()
+        return doc:getNormalizedXPointer("#" .. fragment_id)
+    end)
+    if ok and norm and norm ~= false then
+        return norm
+    end
+    return nil
+end
+
+function Audiobook:_buildSmilPageIndex()
+    if self._smil_page_index then return end
+    -- Cross-document xpointer resolution is not available in crengine; the page
+    -- index would require thousands of failed getNormalizedXPointer calls and
+    -- would block the UI. Navigation is handled via gotoLink instead.
+    self._smil_page_index = {}
+end
+
+function Audiobook:_findCurrentPageSmilEntry()
+    local parser = self._smil_parser
+    local timing_data = self._smil_timing_data
+    if not parser or not timing_data then return nil end
+
+    local doc = self.ui and self.ui.document
+    local cur_xp = doc and doc:getXPointer()
+    local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+    local spine = parser._spine_hrefs or {}
+    if not frag_idx or not spine[frag_idx] then return nil end
+
+    -- Find the first timing entry whose content document matches the current
+    -- spine document (or a later one, in case the current document has no narration).
+    for si = frag_idx, #spine do
+        local base = spine[si]
+        for _, e in ipairs(timing_data) do
+            if e.audio_path and e.text_doc
+                and (e.text_doc:match("([^/]+)$") == base) then
+                return e
+            end
+        end
+    end
+
+    return nil
+end
 
 -- Auto-pause TTS when any KOReader menu or popup opens.
 -- NOTE: ShowConfigMenu event is consumed by ReaderConfig before reaching us,

@@ -38,6 +38,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
 local logger = require("logger")
 local _ = require("gettext")
+local T = require("ffi/util").template
 
 local AudiobookPlayer = InputContainer:extend{
     plugin = nil,
@@ -53,6 +54,8 @@ local AudiobookPlayer = InputContainer:extend{
     _time_display_mode = "book",
     _current_chapter_start = 0,
     _current_chapter_end = 0,
+    _sleep_timer_remaining = 0,
+    _sleep_timer_active = false,
     -- Callbacks
     on_play_pause = nil,
     on_skip_back = nil,
@@ -70,9 +73,11 @@ local AudiobookPlayer = InputContainer:extend{
     on_loop = nil,
     show_loop = false,
     loop_active = false,
-    -- Digital playback volume (0..100); on_volume(pct) applies it.
     on_volume = nil,
     volume_pct = 100,
+    on_sleep_timer_set = nil,
+    on_sleep_timer_cancel = nil,
+    on_refocus = nil,
     -- Reference to the underlying ReaderUI or FileManager widget for event
     -- forwarding when minimized (since UIManager only dispatches to the top
     -- widget, we must manually forward events to the UI below).
@@ -156,6 +161,16 @@ function AudiobookPlayer:setupUI()
         show_parent = self,
     }
 
+    self.sleep_timer_button = Button:new{
+        text = "⏲",
+        width = button_size,
+        height = button_size,
+        text_font_size = 20,
+        callback = function() self:onSleepTimer() end,
+        bordersize = 0,
+        show_parent = self,
+    }
+
     self.speed_button = Button:new{
         text = self:_speedText(),
         width = button_size,
@@ -209,7 +224,7 @@ function AudiobookPlayer:setupUI()
     }
 
     -- Count visible buttons for title width calculation
-    local visible_buttons = 4 -- chapter_list, speed, minimize, close
+    local visible_buttons = 5 -- chapter_list, sleep_timer, speed, minimize, close
     if self.show_shuffle then visible_buttons = visible_buttons + 1 end
     if self.show_loop then visible_buttons = visible_buttons + 1 end
     self.title_widget = TextWidget:new{
@@ -224,6 +239,8 @@ function AudiobookPlayer:setupUI()
         align = "center",
         self.chapter_list_button,
         HorizontalSpan:new{ width = spacing },
+        self.sleep_timer_button,
+        HorizontalSpan:new{ width = math.floor(spacing / 2) },
     }
     if self.show_shuffle then
         table.insert(top_row_items, self.shuffle_button)
@@ -534,10 +551,30 @@ function AudiobookPlayer:setupUI()
         show_parent = self,
     }
 
+    local refocus_group = {}
+    if self.on_refocus then
+        self._mini_refocus = Button:new{
+            text = "○",
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 18,
+            callback = function() self:onRefocus() end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        refocus_group = {
+            self._mini_refocus,
+            HorizontalSpan:new{ width = math.floor(spacing / 2) },
+        }
+    end
+
     -- Center: title + time stacked and centered.
     -- Width is reduced as optional side button groups are added; the actual
     -- TextWidgets are created after center_max_width is final.
     local center_max_width = self.width - mini_btn_size * 2 - spacing * 4
+    if self.on_refocus then
+        center_max_width = center_max_width - mini_btn_size - spacing
+    end
 
     -- Read-along: live sync-offset nudge buttons.  The sync loop reads the
     -- setting every tick, so each press shifts the highlight immediately;
@@ -650,6 +687,8 @@ function AudiobookPlayer:setupUI()
         nudge_group[3] or HorizontalSpan:new{ width = 0 },
         nudge_group[4] or HorizontalSpan:new{ width = 0 },
         HorizontalSpan:new{ width = spacing },
+        refocus_group[1] or HorizontalSpan:new{ width = 0 },
+        refocus_group[2] or HorizontalSpan:new{ width = 0 },
         self._mini_close,
         HorizontalSpan:new{ width = spacing },
     }
@@ -669,7 +708,10 @@ function AudiobookPlayer:setupUI()
     -- follow are the UI) with only the mini bar for transport control,
     -- instead of covering the text with the full-screen player.
     if self.start_minimized then
-        self:onMinimize()
+        self._minimized = true
+        self.dimen.h = self._mini_height
+        self.dimen.y = self.height - self._mini_height
+        self:_updateMiniWidgets()
     end
 end
 
@@ -808,6 +850,98 @@ function AudiobookPlayer:updateChapterTitle(title)
             return "ui", self.chapter_widget.dimen
         end)
     end
+end
+
+function AudiobookPlayer:_formatSleepTimerText(remaining_seconds, active)
+    if not active or remaining_seconds <= 0 then
+        return "⏲"
+    end
+    return "⏲✓"
+end
+
+function AudiobookPlayer:_formatSleepTimerRemaining(remaining_seconds)
+    local m = math.floor(remaining_seconds / 60)
+    local s = remaining_seconds % 60
+    if m >= 60 then
+        local h = math.floor(m / 60)
+        m = m % 60
+        return T(_("%1 h %2 min %3 s"), h, m, s)
+    end
+    return T(_("%1 min %2 s"), m, s)
+end
+
+function AudiobookPlayer:updateSleepTimer(remaining_seconds, active)
+    self._sleep_timer_remaining = remaining_seconds or 0
+    self._sleep_timer_active = active and remaining_seconds > 0
+    local text = self:_formatSleepTimerText(self._sleep_timer_remaining, self._sleep_timer_active)
+    if self.sleep_timer_button then
+        self.sleep_timer_button:setText(text, self.sleep_timer_button.width)
+    end
+    UIManager:setDirty(self, function()
+        if self._minimized then
+            return "ui", self.dimen
+        end
+        if self.sleep_timer_button and self.sleep_timer_button.dimen then
+            return "ui", self.sleep_timer_button.dimen
+        end
+        return "ui", self.dimen
+    end)
+end
+
+function AudiobookPlayer:onSleepTimer()
+    if self._sleep_timer_active then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Sleep timer active.\nTime remaining: %1\n\nCancel the timer?"), self:_formatSleepTimerRemaining(self._sleep_timer_remaining)),
+            ok_text = _("Cancel"),
+            cancel_text = _("Keep"),
+            ok_callback = function()
+                if self.on_sleep_timer_cancel then
+                    self.on_sleep_timer_cancel()
+                end
+                self:updateSleepTimer(0, false)
+            end,
+        })
+    else
+        -- Let the plugin show a single hours+minutes picker (DateTimeWidget
+        -- when available, sequential SpinWidget fallback).
+        if self.plugin and self.plugin._showSleepTimerDialog then
+            self.plugin:_showSleepTimerDialog(nil, function(total_minutes)
+                if total_minutes and total_minutes > 0 and self.on_sleep_timer_set then
+                    self.on_sleep_timer_set(total_minutes)
+                    self:updateSleepTimer(total_minutes * 60, true)
+                end
+            end)
+        else
+            -- Fallback for unusual plugin states: use a single SpinWidget in minutes.
+            local SpinWidget = require("ui/widget/spinwidget")
+            UIManager:show(SpinWidget:new{
+                title_text = _("Sleep timer"),
+                info_text = _("Select minutes."),
+                value = 15,
+                value_min = 1,
+                value_max = 180,
+                value_step = 5,
+                value_hold_step = 15,
+                ok_text = _("Set"),
+                callback = function(spin)
+                    local total = spin.value
+                    if total > 0 and self.on_sleep_timer_set then
+                        self.on_sleep_timer_set(total)
+                        self:updateSleepTimer(total * 60, true)
+                    end
+                end,
+            })
+        end
+    end
+end
+
+function AudiobookPlayer:onRefocus()
+    logger.warn("ABP: onRefocus called, on_refocus=", self.on_refocus and "set" or "nil")
+    if self.on_refocus then
+        self.on_refocus()
+    end
+    return true
 end
 
 function AudiobookPlayer:setCurrentChapter(chapter)
@@ -1179,11 +1313,9 @@ end
 -- Show / hide
 function AudiobookPlayer:show()
     self.visible = true
-    self._minimized = false
-    -- Use a full flash refresh when appearing; this clears any open reader
-    -- menus or config panels that would otherwise leave a ghost image on
-    -- e-ink screens behind the player overlay.
-    UIManager:show(self, "full")
+    -- If setupUI already minimized us (read-along mode), keep it minimized
+    -- and avoid a disruptive full-screen flash.
+    UIManager:show(self, self._minimized and "ui" or "full")
 end
 
 function AudiobookPlayer:hide()
@@ -1289,6 +1421,18 @@ function AudiobookPlayer:handleEvent(event)
                         and self:_isTapOnWidget(ges.pos, self._mini_vol_plus) then
                         if self._mini_vol_plus.callback then
                             self._mini_vol_plus.callback()
+                        end
+                        return true
+                    end
+                    -- Tap on the refocus button?
+                    if self._mini_refocus
+                        and self:_isTapOnWidget(ges.pos, self._mini_refocus) then
+                        logger.warn("ABP: refocus button tapped")
+                        if self._mini_refocus.callback then
+                            logger.warn("ABP: invoking refocus callback")
+                            self._mini_refocus.callback()
+                        else
+                            logger.warn("ABP: refocus button has no callback")
                         end
                         return true
                     end
@@ -1400,7 +1544,7 @@ function AudiobookPlayer:handleEvent(event)
                 self.play_pause_button, self.skip_back_button, self.skip_forward_button,
                 self.prev_chapter_button, self.next_chapter_button,
                 self.speed_button, self.close_button, self.minimize_button,
-                self.chapter_list_button,
+                self.chapter_list_button, self.sleep_timer_button,
                 self.vol_minus_button, self.vol_plus_button,
             }
             if self.show_shuffle and self.shuffle_button then

@@ -61,6 +61,124 @@ function MediaSync:new(o)
     return o
 end
 
+-- Auto-follow guard: a counter.  It is incremented before every page turn we
+-- initiate ourselves and decremented after the resulting page update has had
+-- time to fire, so any PageUpdate caused by our navigation is recognised as
+-- auto-follow and does not trigger a manual-turn seek.
+function MediaSync:_markPageFollowAuto()
+    if not self.plugin then return end
+    self.plugin._media_sync_page_follow_count = (self.plugin._media_sync_page_follow_count or 0) + 1
+end
+
+function MediaSync:_clearPageFollowAuto()
+    if not self.plugin then return end
+    self.plugin._media_sync_page_follow_count = math.max(0, (self.plugin._media_sync_page_follow_count or 0) - 1)
+end
+
+-- Navigate to a SMIL fragment.  Crengine does not accept raw EPUB internal
+-- paths ("text/part0007.html#id") as xpointers, so we use gotoLink, which
+-- KOReader/crengine uses for internal EPUB links.
+function MediaSync:_gotoSmilFragment(text_doc, fragment_id)
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.document then return false end
+    if not fragment_id then return false end
+
+    local xp = "#" .. fragment_id
+    local raw_xp = (text_doc and text_doc ~= "" and text_doc .. "#" .. fragment_id) or xp
+
+    -- Compute a relative HTML href from the current content document to the
+    -- target content document.  Crengine's gotoLink resolves links the same
+    -- way a browser would: relative to the currently loaded HTML file, not
+    -- relative to the EPUB root.
+    local function current_doc_path()
+        local cur_xp = ui.document:getXPointer()
+        local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+        local parser = self.plugin and self.plugin._smil_parser
+        local spine = parser and parser._spine_hrefs or {}
+        return frag_idx and spine[frag_idx]
+    end
+
+    local function make_relative(from, to)
+        local from_dir = from:match("^(.*)/") or ""
+        local to_dir = to:match("^(.*)/") or ""
+        local to_name = to:match("([^/]+)$") or to
+        if from_dir == to_dir then
+            return to_name
+        end
+        local from_parts, to_parts = {}, {}
+        for part in from_dir:gmatch("[^/]+") do table.insert(from_parts, part) end
+        for part in to_dir:gmatch("[^/]+") do table.insert(to_parts, part) end
+        local i = 1
+        while i <= #from_parts and i <= #to_parts and from_parts[i] == to_parts[i] do
+            i = i + 1
+        end
+        local rel = {}
+        for j = i, #from_parts do table.insert(rel, "..") end
+        for j = i, #to_parts do table.insert(rel, to_parts[j]) end
+        table.insert(rel, to_name)
+        return table.concat(rel, "/")
+    end
+
+    local function scroll_to_fragment()
+        if not ui.rolling then return false end
+        local before = ui.document:getXPointer()
+        local ok = pcall(function()
+            ui.rolling:onGotoXPointer(xp)
+        end)
+        local after = ui.document:getXPointer()
+        if ok then
+            logger.warn("MediaSync: onGotoXPointer", xp,
+                "before", tostring(before), "after", tostring(after))
+            UIManager:setDirty("all", "partial")
+            return true
+        end
+        return false
+    end
+
+    -- If the fragment is already in the current content document, scroll to it
+    -- directly.  This is much more reliable than gotoLink for same-doc targets.
+    local ok, in_doc = pcall(function()
+        return ui.document:isXPointerInDocument(xp)
+    end)
+    if ok and in_doc then
+        logger.warn("MediaSync: fragment", xp, "is in current document")
+        return scroll_to_fragment()
+    end
+
+    -- Cross-document: build a link relative to the current document, use
+    -- gotoLink to load the target content document, then scroll to the fragment.
+    local cur_doc = current_doc_path()
+    local link_targets = { raw_xp }
+    if cur_doc and text_doc and text_doc ~= "" then
+        local rel = make_relative(cur_doc, text_doc)
+        table.insert(link_targets, 1, rel .. "#" .. fragment_id)
+    end
+
+    for _, link in ipairs(link_targets) do
+        local before = ui.document:getXPointer()
+        local link_ok = pcall(function()
+            ui.document:gotoLink(link)
+        end)
+        local after_load = ui.document:getXPointer()
+        logger.warn("MediaSync: gotoLink", link,
+            "ok", tostring(link_ok), "before", tostring(before), "after", tostring(after_load))
+        if link_ok then
+            -- If the fragment is now reachable, scroll to it and refresh.
+            local ok2, in_doc2 = pcall(function()
+                return ui.document:isXPointerInDocument(xp)
+            end)
+            if ok2 and in_doc2 then
+                scroll_to_fragment()
+            end
+            UIManager:setDirty("all", "ui")
+            return true
+        end
+    end
+
+    logger.warn("MediaSync: gotoLink failed for", raw_xp)
+    return false
+end
+
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
@@ -543,20 +661,37 @@ function MediaSync:_updateHighlightAtTime(pos)
         -- The SMIL fragment id resolves as a "#id" xpointer in crengine;
         -- turn the page before highlighting so the text-matching
         -- highlighter can find the sentence on the visible page.
-        if sentence.fragment_id then
+        -- This auto-follow is gated by the same setting as manual
+        -- page-turn seeking so users who disable page-follow stay in
+        -- control of the page.
+        local follow_page_turns = true
+        if self.plugin and self.plugin.getSetting then
+            follow_page_turns = self.plugin:getSetting("media_follow_page_turn", true)
+        end
+        -- After a manual page turn the plugin seeks/restarts playback at the
+        -- new page. Suppress MediaSync's own auto-follow briefly so that seek
+        -- does not immediately trigger another page turn.
+        local suppress_auto_follow = false
+        if self.plugin and self.plugin._suppress_media_sync_auto_page_follow and time then
+            if time.now() < self.plugin._suppress_media_sync_auto_page_follow then
+                suppress_auto_follow = true
+            else
+                self.plugin._suppress_media_sync_auto_page_follow = nil
+            end
+        end
+        if sentence.fragment_id and follow_page_turns and not suppress_auto_follow then
             local ui = self.plugin and self.plugin.ui
             if ui and ui.rolling and ui.document then
                 pcall(function()
-                    local xp = "#" .. sentence.fragment_id
-                    local target = ui.document:getPageFromXPointer(xp)
-                    local cur = ui.document:getCurrentPage()
-                    logger.dbg("MediaSync: page-follow", xp, "->", target, "cur", cur)
-                    -- target == 1 is almost always a failed "#id" lookup
-                    -- (crengine falls back to the start of the book, i.e.
-                    -- the cover) -- never auto-turn there.
-                    if target and target > 1 and target ~= cur then
-                        ui.rolling:onGotoXPointer(xp)
+                    self:_markPageFollowAuto()
+                    local ms = self
+                    local ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id)
+                    if not ok then
+                        logger.dbg("MediaSync: page-follow failed for", sentence.fragment_id)
                     end
+                    UIManager:scheduleIn(2.5, function()
+                        ms:_clearPageFollowAuto()
+                    end)
                 end)
             end
         end
@@ -577,14 +712,26 @@ function MediaSync:_updateHighlightAtTime(pos)
             -- sequential advancement (not seeks), so a failed text match
             -- can never page away from where the user is reading.
             if not hl_ok and self.overlay_mode
-                and sent_idx == (self._last_hl_idx or 0) + 1 then
+                and sent_idx == (self._last_hl_idx or 0) + 1
+                and follow_page_turns and not suppress_auto_follow then
                 local ui = self.plugin and self.plugin.ui
                 if ui then
                     pcall(function()
+                        self:_markPageFollowAuto()
+                        local ms = self
                         ui:handleEvent(Event:new("GotoViewRel", 1))
                         self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                        UIManager:scheduleIn(2.5, function()
+                            ms:_clearPageFollowAuto()
+                        end)
                     end)
                 end
+            end
+            -- If the sentence is genuinely not on the visible page and we
+            -- didn't auto-advance, clear the stale highlight so it isn't
+            -- mirrored at the wrong x,y on the current page.
+            if not hl_ok then
+                pcall(function() self.highlight_manager:clearHighlights() end)
             end
             self._last_hl_idx = sent_idx
         end
@@ -818,6 +965,7 @@ function MediaSync:showPlaybackBar()
     end
 
     local player = AudiobookPlayer:new{
+        plugin = self.plugin,
         title = title,
         output_name = output_name,
         cover_image_path = self.cover_path,
@@ -892,9 +1040,134 @@ function MediaSync:showPlaybackBar()
         on_loop = function()
             self:toggleLoop()
         end,
+        on_sleep_timer_set = function(minutes)
+            if self.plugin and self.plugin._startSleepTimer then
+                self.plugin:_startSleepTimer(minutes)
+            end
+        end,
+        on_sleep_timer_cancel = function()
+            if self.plugin and self.plugin._cancelSleepTimer then
+                self.plugin:_cancelSleepTimer()
+            end
+        end,
+        on_refocus = self.overlay_mode and function()
+            self:refocusToCurrentSentence()
+        end or nil,
     }
     player:show()
+    if self.plugin then
+        pcall(function()
+            player:updateSleepTimer(self.plugin:getSleepTimerRemaining(),
+                self.plugin._sleep_timer_end ~= nil)
+        end)
+    end
     self.playback_bar = player
+end
+
+function MediaSync:navigateToSentenceAtTime(seconds)
+    if not self.overlay_mode then return end
+    if not self.timing_data then return end
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.rolling or not ui.document then return end
+
+    local sent_idx = self:_findSentenceAtTime(seconds)
+    if not sent_idx then
+        logger.warn("MediaSync: navigateToSentenceAtTime found no sentence at", seconds)
+        return
+    end
+    local sentence = self.timing_data[sent_idx]
+    if not sentence or not sentence.fragment_id then
+        logger.warn("MediaSync: navigateToSentenceAtTime no fragment for sentence", sent_idx)
+        return
+    end
+    self._current_sentence_idx = sent_idx
+    logger.warn("MediaSync: navigating to sentence", sent_idx, sentence.text_doc, sentence.fragment_id)
+
+    self:_markPageFollowAuto()
+    local ms = self
+    local nav_ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id)
+    if not nav_ok then
+        logger.warn("MediaSync: navigateToSentenceAtTime failed for", sentence.text_doc, sentence.fragment_id)
+        self:_clearPageFollowAuto()
+        return
+    end
+    UIManager:scheduleIn(2.5, function()
+        ms:_clearPageFollowAuto()
+    end)
+
+    -- Re-highlight the sentence after the page settles.
+    if self.highlight_manager and sentence.text then
+        local sent_obj = {
+            text = sentence.text,
+            start_pos = sentence.start_pos or 0,
+            end_pos = sentence.end_pos or #sentence.text,
+        }
+        UIManager:scheduleIn(0.3, function()
+            pcall(function()
+                self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+            end)
+        end)
+    end
+end
+
+function MediaSync:refocusToCurrentSentence()
+    logger.warn("MediaSync: refocusToCurrentSentence called")
+    if not self.overlay_mode then
+        logger.warn("MediaSync: refocus aborted, not overlay_mode")
+        return
+    end
+    if not self.timing_data then
+        logger.warn("MediaSync: refocus aborted, no timing_data")
+        return
+    end
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.rolling or not ui.document then
+        logger.warn("MediaSync: refocus aborted, no UI/rolling/document")
+        return
+    end
+
+    local sent_idx = self._current_sentence_idx
+    if not sent_idx or not self.timing_data[sent_idx] then
+        local pos = self.media_engine and self.media_engine:getPosition() or 0
+        sent_idx = self:_findSentenceAtTime(pos)
+    end
+    local sentence = self.timing_data[sent_idx]
+    if not sentence or not sentence.fragment_id then
+        logger.warn("MediaSync: no current sentence to refocus (idx=", sent_idx, ")")
+        return
+    end
+    self._current_sentence_idx = sent_idx
+    logger.warn("MediaSync: refocusing to sentence", sent_idx, sentence.text_doc, sentence.fragment_id)
+
+    local text_doc = sentence.text_doc or ""
+    local xp = (text_doc ~= "" and text_doc .. "#" .. sentence.fragment_id)
+        or ("#" .. sentence.fragment_id)
+
+    self:_markPageFollowAuto()
+    local ms = self
+    local nav_ok = self:_gotoSmilFragment(text_doc, sentence.fragment_id)
+    if not nav_ok then
+        logger.warn("MediaSync: refocus cannot navigate to", xp)
+        self:_clearPageFollowAuto()
+        return
+    end
+    UIManager:scheduleIn(1.5, function()
+        ms:_clearPageFollowAuto()
+    end)
+
+    -- Re-highlight the current sentence after the page settles.
+    if self.highlight_manager and sentence.text then
+        local sent_obj = {
+            text = sentence.text,
+            start_pos = sentence.start_pos or 0,
+            end_pos = sentence.end_pos or #sentence.text,
+        }
+        UIManager:scheduleIn(0.3, function()
+            pcall(function()
+                self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+            end)
+        end)
+    end
 end
 
 function MediaSync:hidePlaybackBar()

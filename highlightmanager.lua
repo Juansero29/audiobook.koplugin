@@ -73,6 +73,12 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
     if not sentence then return end
     if not self.ui or not self.ui.document then return end
 
+    -- Always drop the previous highlight before searching for the new one;
+    -- otherwise a sentence that is not visible on the current page would
+    -- leave stale boxes that get mirrored at the wrong x,y.
+    self._pending_boxes = nil
+    self.is_highlighting = false
+
     local doc = self.ui.document
 
     -- EPUB / rolling mode: use screen-coordinate selection.
@@ -123,10 +129,14 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
 
     -- ── Cached line map ──────────────────────────────────────────
     local cur_w, cur_h = Screen:getWidth(), Screen:getHeight()
+    -- Include the current page in the cache key so a page turn invalidates
+    -- the cached text/geometry; otherwise highlights can be drawn at stale
+    -- x,y coordinates after the view changes.
+    local cur_page = self.ui.document:getCurrentPage() or 0
     local cache = self._line_cache
     local built_text, cum, sboxes, n
 
-    if cache and cache.screen_w == cur_w and cache.screen_h == cur_h then
+    if cache and cache.screen_w == cur_w and cache.screen_h == cur_h and cache.page == cur_page then
         built_text = cache.built_text
         cum        = cache.cum
         sboxes     = cache.sboxes
@@ -176,6 +186,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         self._line_cache = {
             screen_w   = cur_w,
             screen_h   = cur_h,
+            page       = cur_page,
             built_text = built_text,
             cum        = cum,
             sboxes     = sboxes,
