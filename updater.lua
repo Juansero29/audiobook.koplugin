@@ -125,37 +125,100 @@ local function fetchLatestRelease()
     return { tag = tag, version = version, zip_url = zip_url, zip_size = zip_size }
 end
 
---- Download a URL to a local file path.
+--- Download a URL to a local file path, with resume support.
+-- Downloads can be large (the release zip includes ffmpeg/Piper binaries),
+-- so we use HTTP Range requests to resume after a network drop or timeout.
 -- @tparam string url
 -- @tparam string dest path
+-- @tparam number|nil expected_size expected file size in bytes
 -- @treturn bool success
 -- @treturn string|nil error message
-local function downloadFile(url, dest)
+local function downloadFile(url, dest, expected_size)
     local http = require("socket.http")
     local ltn12 = require("ltn12")
     local socketutil = require("socketutil")
+    local lfs = require("libs/libkoreader-lfs")
 
-    local fh, err = io.open(dest, "w")
-    if not fh then
-        return false, T(_("Cannot create %1: %2"), dest, err or "unknown")
-    end
+    local max_retries = 5
+    local retry_count = 0
 
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-    local code, headers, status = require("socket").skip(1, http.request{
-        url = url,
-        method = "GET",
-        headers = {
+    while true do
+        local attr = lfs.attributes(dest)
+        local existing_size = (attr and attr.size) or 0
+        if existing_size > 0 and expected_size and existing_size >= expected_size then
+            return true
+        end
+
+        local mode = (existing_size > 0) and "a+b" or "wb"
+        local fh, err = io.open(dest, mode)
+        if not fh then
+            return false, T(_("Cannot create %1: %2"), dest, err or "unknown")
+        end
+
+        -- Scale the total timeout with the remaining bytes so slow Wi-Fi or
+        -- large zips do not abort prematurely. Base 10 minutes plus one minute
+        -- per 20 MB remaining, capped at 30 minutes.
+        local remaining = expected_size and math.max(expected_size - existing_size, 0) or 0
+        local total_timeout = 600
+        if remaining > 0 then
+            total_timeout = math.min(total_timeout + math.ceil(remaining / (20 * 1024 * 1024)) * 60, 1800)
+        end
+        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, total_timeout)
+
+        local headers = {
             ["User-Agent"] = "audiobook.koplugin-updater",
-        },
-        sink = ltn12.sink.file(fh),  -- closes fh on completion
-    })
-    socketutil:reset_timeout()
+        }
+        if existing_size > 0 then
+            headers["Range"] = string.format("bytes=%d-", existing_size)
+        end
 
-    if code ~= 200 then
-        os.remove(dest)
-        return false, T(_("Download failed: %1"), tostring(code or status or "no response"))
+        local bytes_before = existing_size
+        local code, res_headers, status = require("socket").skip(1, http.request{
+            url = url,
+            method = "GET",
+            headers = headers,
+            sink = ltn12.sink.file(fh),  -- closes fh on completion
+        })
+        socketutil:reset_timeout()
+
+        local attr2 = lfs.attributes(dest)
+        local bytes_after = attr2 and attr2.size or bytes_before
+
+        if code == 200 or code == 206 then
+            if code == 200 and existing_size > 0 then
+                -- Server ignored the Range header and sent the full file,
+                -- so the existing partial data is now duplicated at the start.
+                logger.warn("Updater: server ignored Range request, restarting download")
+                os.remove(dest)
+                retry_count = retry_count + 1
+                if retry_count > max_retries then
+                    return false, _("Server does not support resume")
+                end
+            elseif not expected_size then
+                return true
+            elseif bytes_after >= expected_size then
+                return true
+            elseif bytes_after == bytes_before then
+                logger.warn("Updater: no download progress, retrying", bytes_after)
+                retry_count = retry_count + 1
+                if retry_count > max_retries then
+                    os.remove(dest)
+                    return false, T(_("Download stalled at %1 bytes"), tostring(bytes_after))
+                end
+            else
+                retry_count = 0
+            end
+        else
+            logger.warn("Updater: download request failed:", tostring(code or status), "size:", bytes_after)
+            retry_count = retry_count + 1
+            if retry_count > max_retries then
+                os.remove(dest)
+                return false, T(_("Download failed: %1"), tostring(code or status or "no response"))
+            end
+        end
+
+        require("socket").sleep(1)
     end
-    return true
 end
 
 --- Compare two dotted version strings.
@@ -289,7 +352,7 @@ function Updater._performUpdate(plugin, release)
     end
     local zip_path = tmp_dir .. "/audiobook-koplugin-update.zip"
 
-    local ok, err = downloadFile(release.zip_url, zip_path)
+    local ok, err = downloadFile(release.zip_url, zip_path, release.zip_size)
     if not ok then
         UIManager:show(InfoMessage:new{
             text = T(_("Download failed: %1"), err or _("unknown")),
