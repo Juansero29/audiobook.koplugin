@@ -75,59 +75,58 @@ function MediaSync:_clearPageFollowAuto()
     self.plugin._media_sync_page_follow_count = math.max(0, (self.plugin._media_sync_page_follow_count or 0) - 1)
 end
 
--- Navigate to a SMIL fragment.  Crengine does not accept raw EPUB internal
--- paths ("text/part0007.html#id") as xpointers, so we use gotoLink, which
--- KOReader/crengine uses for internal EPUB links.
-function MediaSync:_gotoSmilFragment(text_doc, fragment_id)
+-- Navigate to a SMIL fragment.
+--
+-- Why "Play aligned audiobook from here" usually works on the first try:
+-- the user selects text on the page that is currently visible, so the target
+-- fragment is in the currently loaded EPUB content document.  In that case
+-- `ui.document:isXPointerInDocument("#id")` is true and a simple
+-- `ui.rolling:onGotoXPointer("#id")` scrolls to it.
+--
+-- Resume/refocus are harder because the saved/current sentence may be in a
+-- different content document.  crengine does not expose a direct
+-- "go to file#id" API from Lua, and `gotoLink` only follows actual `<a>`
+-- links in the current document.  We therefore use a small set of strategies:
+--
+-- 1. If we have already resolved the full internal xpointer (cached during
+--    a previous visit), jump directly with it.
+-- 2. If the fragment is in the current content document, scroll directly.
+-- 3. If `allow_scan` is true, try to find the content document through the
+--    EPUB table of contents and jump with a full internal xpointer.
+-- 4. If `allow_scan` is true, use the EPUB spine order to derive the
+--    DocFragment index and jump with a full internal xpointer.
+-- 5. As a last resort, search the document text for the sentence itself and
+--    use the resulting xpointer to jump.  This is slower but reliable even
+--    when the fragment id cannot be resolved globally.
+--
+-- Auto-follow does NOT scan; it only uses strategies 1, 2, and 4 (when the
+-- index is already built).  If the sentence is not yet visible it falls back
+-- to the existing `GotoViewRel(1)` page-advance retry, which avoids the cost
+-- and side effects of text search.
+function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence_text)
+    allow_scan = (allow_scan ~= false)
     local ui = self.plugin and self.plugin.ui
     if not ui or not ui.document then return false end
     if not fragment_id then return false end
 
     local xp = "#" .. fragment_id
     local raw_xp = (text_doc and text_doc ~= "" and text_doc .. "#" .. fragment_id) or xp
+    local cache_key = text_doc and text_doc ~= "" and raw_xp or xp
 
-    -- Compute a relative HTML href from the current content document to the
-    -- target content document.  Crengine's gotoLink resolves links the same
-    -- way a browser would: relative to the currently loaded HTML file, not
-    -- relative to the EPUB root.
-    local function current_doc_path()
-        local cur_xp = ui.document:getXPointer()
-        local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
-        local parser = self.plugin and self.plugin._smil_parser
-        local spine = parser and parser._spine_hrefs or {}
-        return frag_idx and spine[frag_idx]
+    if not sentence_text or sentence_text == "" then
+        sentence_text = self:_lookupSentenceText(text_doc, fragment_id)
     end
 
-    local function make_relative(from, to)
-        local from_dir = from:match("^(.*)/") or ""
-        local to_dir = to:match("^(.*)/") or ""
-        local to_name = to:match("([^/]+)$") or to
-        if from_dir == to_dir then
-            return to_name
-        end
-        local from_parts, to_parts = {}, {}
-        for part in from_dir:gmatch("[^/]+") do table.insert(from_parts, part) end
-        for part in to_dir:gmatch("[^/]+") do table.insert(to_parts, part) end
-        local i = 1
-        while i <= #from_parts and i <= #to_parts and from_parts[i] == to_parts[i] do
-            i = i + 1
-        end
-        local rel = {}
-        for j = i, #from_parts do table.insert(rel, "..") end
-        for j = i, #to_parts do table.insert(rel, to_parts[j]) end
-        table.insert(rel, to_name)
-        return table.concat(rel, "/")
-    end
-
-    local function scroll_to_fragment()
+    local function scroll_to_fragment(target_xp)
+        target_xp = target_xp or xp
         if not ui.rolling then return false end
         local before = ui.document:getXPointer()
         local ok = pcall(function()
-            ui.rolling:onGotoXPointer(xp)
+            ui.rolling:onGotoXPointer(target_xp)
         end)
         local after = ui.document:getXPointer()
         if ok then
-            logger.warn("MediaSync: onGotoXPointer", xp,
+            logger.warn("MediaSync: onGotoXPointer", target_xp,
                 "before", tostring(before), "after", tostring(after))
             UIManager:setDirty("all", "partial")
             return true
@@ -135,48 +134,455 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id)
         return false
     end
 
-    -- If the fragment is already in the current content document, scroll to it
-    -- directly.  This is much more reliable than gotoLink for same-doc targets.
-    local ok, in_doc = pcall(function()
-        return ui.document:isXPointerInDocument(xp)
-    end)
-    if ok and in_doc then
+    local function fragment_in_document()
+        local ok, in_doc = pcall(function()
+            return ui.document:isXPointerInDocument(xp)
+        end)
+        return ok and in_doc
+    end
+
+    local function cache_current_xpointer()
+        local ok, norm = pcall(function()
+            return ui.document:getNormalizedXPointer(xp)
+        end)
+        if ok and norm and norm ~= false then
+            self:_cacheXPointer(text_doc, fragment_id, norm)
+            logger.warn("MediaSync: cached xpointer", norm, "for", cache_key)
+        end
+    end
+
+    -- 1. Cached full xpointer from a previous visit.
+    if self._xpointer_cache and self._xpointer_cache[cache_key] then
+        local cached = self._xpointer_cache[cache_key]
+        logger.warn("MediaSync: using cached xpointer", cached, "for", cache_key)
+        local ok = pcall(function()
+            ui.rolling:_gotoXPointer(cached)
+        end)
+        if ok then
+            UIManager:setDirty("all", "ui")
+            return true
+        end
+        -- Stale cache (book layout changed); drop it and continue.
+        logger.warn("MediaSync: cached xpointer failed, dropping", cache_key)
+        self._xpointer_cache[cache_key] = nil
+    end
+
+    -- 2. Same-document: scroll directly and cache the resolved full xpointer.
+    if fragment_in_document() then
         logger.warn("MediaSync: fragment", xp, "is in current document")
+        cache_current_xpointer()
         return scroll_to_fragment()
     end
 
-    -- Cross-document: build a link relative to the current document, use
-    -- gotoLink to load the target content document, then scroll to the fragment.
-    local cur_doc = current_doc_path()
-    local link_targets = { raw_xp }
-    if cur_doc and text_doc and text_doc ~= "" then
-        local rel = make_relative(cur_doc, text_doc)
-        table.insert(link_targets, 1, rel .. "#" .. fragment_id)
+    -- Remember where we started so we can restore if every cross-document
+    -- strategy fails.
+    local start_page = ui.document:getCurrentPage()
+
+    local function try_page(page)
+        if not page or page <= 0 then return false end
+        local ok = pcall(function()
+            ui.rolling:_gotoPage(page)
+        end)
+        if ok and fragment_in_document() then
+            cache_current_xpointer()
+            scroll_to_fragment()
+            UIManager:setDirty("all", "ui")
+            return true
+        end
+        return false
     end
 
-    for _, link in ipairs(link_targets) do
-        local before = ui.document:getXPointer()
-        local link_ok = pcall(function()
-            ui.document:gotoLink(link)
-        end)
-        local after_load = ui.document:getXPointer()
-        logger.warn("MediaSync: gotoLink", link,
-            "ok", tostring(link_ok), "before", tostring(before), "after", tostring(after_load))
-        if link_ok then
-            -- If the fragment is now reachable, scroll to it and refresh.
-            local ok2, in_doc2 = pcall(function()
-                return ui.document:isXPointerInDocument(xp)
-            end)
-            if ok2 and in_doc2 then
-                scroll_to_fragment()
-            end
+    local function restore_start_page()
+        pcall(function() ui.document:gotoPage(start_page, false) end)
+    end
+
+    if not allow_scan then
+        return false
+    end
+
+    -- 3. Fast cross-document probe: crengine can often resolve a plain id to
+    -- a global page number even when the fragment is not in the currently
+    -- loaded content document.  If it returns a valid page, load it and verify
+    -- the fragment is reachable before scrolling.
+    local ok_fp, page_fp = pcall(function()
+        return ui.document:getPageFromXPointer(xp)
+    end)
+    if ok_fp and page_fp and page_fp > 0 and page_fp ~= start_page then
+        logger.warn("MediaSync: getPageFromXPointer page", page_fp, "for", xp)
+        if try_page(page_fp) then
+            return true
+        end
+    end
+
+    -- 4. TOC fallback: match the content document's chapter title against the
+    -- EPUB table of contents, derive the DocFragment index from the TOC
+    -- xpointer, and jump to the fragment with a full internal xpointer.
+    if allow_scan then
+        if self:_gotoViaToc(text_doc, fragment_id, start_page) then
+            cache_current_xpointer()
+            if fragment_in_document() then scroll_to_fragment() end
             UIManager:setDirty("all", "ui")
             return true
         end
     end
 
-    logger.warn("MediaSync: gotoLink failed for", raw_xp)
+    -- 4b. Spine DocFragment fallback: use the EPUB spine order to know which
+    -- DocFragment contains the target content document, then build a full
+    -- xpointer to the fragment.
+    if allow_scan then
+        if self:_gotoViaSpineDocFragment(text_doc, fragment_id, start_page) then
+            cache_current_xpointer()
+            if fragment_in_document() then scroll_to_fragment() end
+            UIManager:setDirty("all", "ui")
+            return true
+        end
+    end
+
+    -- 5. Text-search fallback: search the whole rendered book for the sentence
+    -- text.  crengine cannot resolve a plain fragment id to a global page on
+    -- this device, but findText returns full internal xpointers that usually
+    -- can be followed.  We accept an occurrence whose DocFragment index matches
+    -- the target content document and navigate with its full xpointer.
+    if allow_scan and sentence_text and sentence_text ~= "" then
+        local search_key = self:_normalizeSearchText(sentence_text)
+        -- Long sentences may differ in trailing punctuation between SMIL and
+        -- rendered text; search for a prefix that is still distinctive.
+        local short_key = search_key
+        if #short_key > 120 then
+            short_key = short_key:sub(1, 120)
+        end
+        local cur_page = ui.document:getCurrentPage() or 1
+
+        local function try_search(pattern, origin, direction)
+            if not pattern or pattern == "" then return nil end
+            local ok, res, words = pcall(function()
+                return ui.document:findText(pattern, origin, direction, true, cur_page, false, 20)
+            end)
+            logger.warn("MediaSync: findText try",
+                "pattern=", pattern,
+                "origin=", origin,
+                "dir=", direction,
+                "ok=", tostring(ok),
+                "type=", type(res),
+                "count=", (res and #res or 0),
+                "words=", tostring(words))
+            if ok and res and #res > 0 then return res end
+            return nil
+        end
+
+        local results = nil
+        -- Try forward from current position, then backward, for full and prefixes.
+        local prefixes = {}
+        if #search_key > 50 then table.insert(prefixes, search_key:sub(1, 50)) end
+        if #search_key > 30 then table.insert(prefixes, search_key:sub(1, 30)) end
+        for _, key in ipairs({short_key, unpack(prefixes)}) do
+            results = try_search(key, 0, 0) or try_search(key, 0, 1)
+            if results then break end
+        end
+        -- Also try the upstream "from start" origin in case it works here.
+        if not results then
+            results = try_search(short_key, -1, 0)
+        end
+
+        if results then
+            local expected_n = self:_getExpectedDocFragmentIndex(text_doc)
+            logger.warn("MediaSync: text-search expected DocFragment", expected_n,
+                "for", text_doc)
+            for i, r in ipairs(results) do
+                local start_xp = r and r.start
+                if start_xp then
+                    local r_n = tonumber(start_xp:match("DocFragment%[(%d+)%]"))
+                    local in_target = (expected_n and r_n == expected_n) or not expected_n
+                    if in_target then
+                        logger.warn("MediaSync: text-search occurrence", i,
+                            "DocFragment", r_n, start_xp)
+                        local before_page = ui.document:getCurrentPage()
+                        local ok_goto = pcall(function()
+                            ui.rolling:onGotoXPointer(start_xp, start_xp)
+                        end)
+                        local after_page = ui.document:getCurrentPage()
+                        logger.warn("MediaSync: text-search onGotoXPointer",
+                            "ok=", tostring(ok_goto),
+                            "page_before=", before_page, "page_after=", after_page)
+                        if ok_goto and after_page and after_page ~= before_page then
+                            cache_current_xpointer()
+                            if fragment_in_document() then scroll_to_fragment() end
+                            UIManager:setDirty("all", "ui")
+                            return true
+                        end
+                    end
+                end
+            end
+            logger.warn("MediaSync: text-search occurrences did not navigate to target", fragment_id)
+        end
+    end
+
+    restore_start_page()
+    logger.warn("MediaSync: fragment", fragment_id, "not reachable in", text_doc)
     return false
+end
+
+-- Look up the sentence text for a fragment so we can use it as a search key.
+function MediaSync:_lookupSentenceText(text_doc, fragment_id)
+    if not self.timing_data then return nil end
+    for _, e in ipairs(self.timing_data) do
+        if e.fragment_id == fragment_id and (not text_doc or e.text_doc == text_doc) and e.text then
+            return e.text
+        end
+    end
+    return nil
+end
+
+-- Normalize sentence text before handing it to crengine's findText.  The
+-- extracted SMIL text and the rendered text can differ in whitespace,
+-- punctuation, and zero-width characters.
+function MediaSync:_normalizeSearchText(text)
+    if not text then return "" end
+    local t = text
+        :gsub("%s+", " ")
+        :gsub("[\226\128\152-\226\128\155]", "'")    -- curly quotes → straight
+        :gsub("[\226\128\156-\226\128\159]", '"')    -- curly double quotes
+        :gsub("\226\128\147", "-")                    -- en-dash
+        :gsub("\226\128\148", "-")                    -- em-dash
+        :gsub("\194\160", " ")                        -- non-breaking space
+        :gsub("[\226\128\139\226\128\169]", "")       -- zero-width chars
+        :gsub("\239\187\191", "")                     -- BOM
+    return t
+end
+
+-- Check whether a fragment id is resolvable in the currently loaded content
+-- document.
+function MediaSync:_fragmentInDocument(fragment_id)
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.document or not fragment_id then return false end
+    local xp = "#" .. fragment_id
+    local ok, in_doc = pcall(function()
+        return ui.document:isXPointerInDocument(xp)
+    end)
+    return ok and in_doc
+end
+
+-- Try to jump to the content document that contains a SMIL fragment by using
+-- the EPUB table of contents.  The SMIL parser already loaded a mapping from
+-- content-document basename to chapter title; we match that title against the
+-- entries returned by `ui.document:getToc()` and jump to the corresponding
+-- page or xpointer.
+function MediaSync:_gotoViaToc(text_doc, fragment_id, start_page)
+    local ui = self.plugin and self.plugin.ui
+    local parser = self.plugin and self.plugin._smil_parser
+    if not ui or not ui.document or not parser or not text_doc then return false end
+    local basename = text_doc:match("([^/]+)$")
+    if not basename then return false end
+    local chapter_title = parser._chapter_titles and parser._chapter_titles[basename]
+    if not chapter_title or chapter_title == "" then
+        logger.warn("MediaSync: no chapter title for", basename)
+        return false
+    end
+    local ok_toc, toc = pcall(function() return ui.document:getToc() end)
+    if not ok_toc or not toc or #toc == 0 then
+        logger.warn("MediaSync: no TOC available")
+        return false
+    end
+    local norm_target = self:_normalizeSearchText(chapter_title):lower()
+    for _, entry in ipairs(toc) do
+        if entry and entry.title then
+            local norm_entry = self:_normalizeSearchText(entry.title):lower()
+            local matched = (norm_entry == norm_target)
+                or norm_entry:find(norm_target, 1, true)
+                or norm_target:find(norm_entry, 1, true)
+            if matched then
+                logger.warn("MediaSync: TOC title match", entry.title,
+                    "page=", entry.page, "xpointer=", entry.xpointer, "for", text_doc)
+                -- The TOC xpointer tells us exactly which DocFragment the
+                -- chapter starts in. Build a full xpointer to the fragment
+                -- inside that DocFragment and jump directly.
+                local toc_n = entry.xpointer and tonumber(entry.xpointer:match("DocFragment%[(%d+)%]"))
+                if toc_n then
+                    local ok_frag, norm = self:_tryGotoDocFragment(text_doc, fragment_id, toc_n, start_page)
+                    if ok_frag then
+                        logger.warn("MediaSync: TOC DocFragment jump succeeded for", fragment_id, norm)
+                        return true
+                    end
+                end
+                -- Legacy page/xpointer fallback.
+                local page = entry.page
+                if page and page > 0 then
+                    local ok = pcall(function() ui.document:gotoPage(page, true) end)
+                    if ok and self:_fragmentInDocument(fragment_id) then
+                        logger.warn("MediaSync: TOC page jump succeeded for", fragment_id)
+                        return true
+                    end
+                end
+                local xp = entry.xpointer
+                if xp then
+                    local ok = pcall(function() ui.document:gotoXPointer(xp) end)
+                    if ok and self:_fragmentInDocument(fragment_id) then
+                        logger.warn("MediaSync: TOC xpointer jump succeeded for", fragment_id)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    logger.warn("MediaSync: TOC fallback failed for", text_doc, fragment_id)
+    return false
+end
+
+-- Try to jump to a specific fragment inside a known DocFragment.  We build
+-- full internal xpointers and use onGotoXPointer so crengine resolves the
+-- target page/position from the absolute path instead of the plain "#id",
+-- which this device maps to page 1 when the fragment is not in the current
+-- content document.
+function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_page)
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.document or not docfrag_n or not fragment_id then return false end
+    local doc = ui.document
+    local tags = {"span", "p", "div", "h1", "h2", "h3", "h4", "li", "td", "em", "strong", "a"}
+    local bodies = {"body", "body.0"}
+    local probes = {}
+    for _, body in ipairs(bodies) do
+        table.insert(probes, string.format("/body/DocFragment[%d]/%s/id('%s')", docfrag_n, body, fragment_id))
+        for _, tag in ipairs(tags) do
+            table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", docfrag_n, body, tag, fragment_id))
+        end
+    end
+    for _, probe in ipairs(probes) do
+        local ok, norm = pcall(function() return doc:getNormalizedXPointer(probe) end)
+        if ok and norm and norm ~= false then
+            logger.warn("MediaSync: DocFragment probe", probe, "resolved to", norm)
+            local before_page = doc:getCurrentPage()
+            local ok_goto = pcall(function()
+                ui.rolling:onGotoXPointer(norm, norm)
+            end)
+            local after_page = doc:getCurrentPage()
+            logger.warn("MediaSync: onGotoXPointer full xp",
+                "ok=", tostring(ok_goto),
+                "page_before=", before_page, "page_after=", after_page)
+            if ok_goto and after_page and after_page ~= before_page then
+                return true, norm
+            end
+        end
+    end
+    return false
+end
+
+-- Use the EPUB spine order to find which DocFragment contains the target
+-- content document, then jump to the fragment inside it.
+function MediaSync:_gotoViaSpineDocFragment(text_doc, fragment_id, start_page)
+    local parser = self.plugin and self.plugin._smil_parser
+    if not parser or not text_doc or not fragment_id then return false end
+    local basename = text_doc:match("([^/]+)$")
+    if not basename then return false end
+    local spine = parser._spine_hrefs or {}
+    local n = nil
+    for i, href in ipairs(spine) do
+        if href == basename then
+            n = i
+            break
+        end
+    end
+    if not n then
+        logger.warn("MediaSync: spine index not found for", basename)
+        return false
+    end
+    logger.warn("MediaSync: spine index for", basename, "is DocFragment", n)
+    local ok, norm = self:_tryGotoDocFragment(text_doc, fragment_id, n, start_page)
+    if ok then
+        logger.warn("MediaSync: spine DocFragment jump succeeded for", fragment_id, norm)
+        return true
+    end
+    return false
+end
+
+-- Map a content document basename to its expected DocFragment index.
+function MediaSync:_getExpectedDocFragmentIndex(text_doc)
+    local parser = self.plugin and self.plugin._smil_parser
+    if not parser or not text_doc then return nil end
+    local basename = text_doc:match("([^/]+)$")
+    if not basename then return nil end
+    local spine = parser._spine_hrefs or {}
+    for i, href in ipairs(spine) do
+        if href == basename then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Find the page of a SMIL fragment by scanning DocFragment indices.  We try
+-- several xpointer probes for each N: an XPath id() lookup first, then a few
+-- common element tags.  getNormalizedXPointer() is used to validate the probe
+-- because getPageFromXPointer() alone can return page 1 for an invalid probe.
+function MediaSync:_findPageByDocFragmentScan(text_doc, fragment_id)
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.document or not fragment_id then return nil end
+    local doc = ui.document
+    local parser = self.plugin and self.plugin._smil_parser
+    local spine = parser and parser._spine_hrefs or {}
+    local max_n = math.max(#spine + 20, 100)
+
+    local tags = {"span", "p", "div", "h1", "h2", "h3", "h4", "li", "td", "em", "strong", "a"}
+
+    for n = 1, max_n do
+        -- Build candidate probes for this DocFragment.
+        local probes = { string.format("/body/DocFragment[%d]/body/id('%s')", n, fragment_id) }
+        for _, tag in ipairs(tags) do
+            table.insert(probes, string.format("/body/DocFragment[%d]/body/%s[@id='%s']", n, tag, fragment_id))
+        end
+
+        for _, probe in ipairs(probes) do
+            local ok, norm = pcall(function()
+                return doc:getNormalizedXPointer(probe)
+            end)
+            if ok and norm and norm ~= false then
+                local ok2, page = pcall(function()
+                    return doc:getPageFromXPointer(norm)
+                end)
+                if ok2 and page and page > 0 then
+                    logger.warn("MediaSync: DocFragment scan found", text_doc or "",
+                        "N=", n, "page=", page, "probe=", probe, "for", fragment_id)
+                    return page, n
+                end
+            end
+        end
+    end
+
+    logger.warn("MediaSync: DocFragment scan failed for", text_doc or "", fragment_id)
+    return nil
+end
+
+function MediaSync:_cacheXPointer(text_doc, fragment_id, full_xpointer)
+    if not self._xpointer_cache then
+        self._xpointer_cache = {}
+    end
+    local raw_xp = (text_doc and text_doc ~= "" and text_doc .. "#" .. fragment_id)
+        or ("#" .. fragment_id)
+    if self._xpointer_cache[raw_xp] == full_xpointer then
+        return
+    end
+    self._xpointer_cache[raw_xp] = full_xpointer
+    -- Persist the cache so resume/refocus work across KOReader sessions.
+    local doc_path = self.plugin and self.plugin._smil_doc_path
+    if doc_path and self.plugin._saveSmilXPointerCache then
+        self.plugin:_saveSmilXPointerCache(doc_path, self._xpointer_cache)
+    end
+end
+
+-- Cache the current document's resolved xpointer for a fragment if it is
+-- currently reachable.  This is called after a successful highlight so that
+-- resume/refocus can later jump back to this fragment using a full internal
+-- xpointer instead of relying on gotoLink.
+function MediaSync:_cacheResolvedXPointer(text_doc, fragment_id)
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.document or not fragment_id then return end
+    local xp = "#" .. fragment_id
+    local ok, norm = pcall(function()
+        return ui.document:getNormalizedXPointer(xp)
+    end)
+    if ok and norm and norm ~= false then
+        self:_cacheXPointer(text_doc, fragment_id, norm)
+        logger.warn("MediaSync: cached resolved xpointer", norm, "for", text_doc, fragment_id)
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -239,6 +645,17 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     self._chain_generation = self._chain_generation + 1
     self._last_progress_pct = -1
     self._last_ui_update_time = nil
+
+    -- Cache of full crengine xpointers for SMIL fragments we have visited.
+    -- This lets resume/refocus jump across EPUB content documents by using
+    -- already-resolved internal xpointers instead of relying on gotoLink.
+    -- Load any previously saved cache for this EPUB from KOReader settings.
+    local doc_path = self.plugin and self.plugin._smil_doc_path
+    if doc_path and self.plugin._loadSmilXPointerCache then
+        self._xpointer_cache = self.plugin:_loadSmilXPointerCache(doc_path)
+    elseif not self._xpointer_cache then
+        self._xpointer_cache = {}
+    end
 
     -- Build sentence index from timing data
     self:_buildSentenceIndex()
@@ -685,7 +1102,7 @@ function MediaSync:_updateHighlightAtTime(pos)
                 pcall(function()
                     self:_markPageFollowAuto()
                     local ms = self
-                    local ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id)
+                    local ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, false, sentence.text)
                     if not ok then
                         logger.dbg("MediaSync: page-follow failed for", sentence.fragment_id)
                     end
@@ -706,6 +1123,9 @@ function MediaSync:_updateHighlightAtTime(pos)
             pcall(function()
                 hl_ok = self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
             end)
+            if hl_ok and sentence.fragment_id then
+                self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+            end
             -- Read-along page advancement: narration flows forward, so when
             -- the next sequential sentence is not on the visible page it is
             -- on the following one -- turn and retry once.  Only for
@@ -721,6 +1141,9 @@ function MediaSync:_updateHighlightAtTime(pos)
                         local ms = self
                         ui:handleEvent(Event:new("GotoViewRel", 1))
                         self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                        if sentence.fragment_id then
+                            self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+                        end
                         UIManager:scheduleIn(2.5, function()
                             ms:_clearPageFollowAuto()
                         end)
@@ -1085,7 +1508,7 @@ function MediaSync:navigateToSentenceAtTime(seconds)
 
     self:_markPageFollowAuto()
     local ms = self
-    local nav_ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id)
+    local nav_ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, true, sentence.text)
     if not nav_ok then
         logger.warn("MediaSync: navigateToSentenceAtTime failed for", sentence.text_doc, sentence.fragment_id)
         self:_clearPageFollowAuto()
@@ -1145,7 +1568,7 @@ function MediaSync:refocusToCurrentSentence()
 
     self:_markPageFollowAuto()
     local ms = self
-    local nav_ok = self:_gotoSmilFragment(text_doc, sentence.fragment_id)
+    local nav_ok = self:_gotoSmilFragment(text_doc, sentence.fragment_id, true, sentence.text)
     if not nav_ok then
         logger.warn("MediaSync: refocus cannot navigate to", xp)
         self:_clearPageFollowAuto()

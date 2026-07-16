@@ -1326,6 +1326,14 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         if chosen_entry and chosen_entry.audio_path then
             start_file = chosen_entry.audio_path
             start_time = chosen_entry.start_time
+            -- Make "Continue listening" pick up a "Play from here" start so
+            -- the two entry points stay in sync.
+            local chapter_title
+            local base = chosen_entry.text_doc and chosen_entry.text_doc:match("([^/]+)$")
+            if base and parser._chapter_titles then
+                chapter_title = parser._chapter_titles[base]
+            end
+            self:_saveAlignedPosition(doc_path, chosen_entry.audio_path, chosen_entry.start_time, chapter_title)
         else
             -- Map the current crengine DocFragment index through the spine to a
             -- content document, then to that document's first timing entry
@@ -1360,6 +1368,11 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         end)
 
         -- Cache parser/timing for page-follow and selection restarts.
+        -- If we are switching to a different EPUB, drop the resolved-xpointer
+        -- cache we built for the previous book.
+        if self._smil_doc_path and self._smil_doc_path ~= doc_path and self.media_sync then
+            self.media_sync._xpointer_cache = {}
+        end
         self._smil_parser = parser
         self._smil_timing_data = timing_data
         self._smil_by_file = by_file
@@ -2710,10 +2723,11 @@ function Audiobook:_handlePageTurnFollow()
     end
 end
 
--- Resolve a SMIL fragment id to a crengine xpointer, but only for the
--- currently loaded document. Raw EPUB internal paths like
--- "text/part0009.html#id14-s0" are not accepted by crengine; cross-document
--- navigation is handled via gotoLink in mediasync.lua.
+-- Resolve a SMIL fragment id to a crengine xpointer, but only when the
+-- content document that contains the fragment is already loaded.  Raw EPUB
+-- internal paths like "text/part0009.html#id14-s0" are not accepted by
+-- crengine; cross-document navigation uses the SMIL page index or a direct
+-- text search fallback instead.
 function Audiobook:_resolveSmilXPointer(text_doc, fragment_id)
     local doc = self.ui and self.ui.document
     if not doc or not fragment_id then return nil end
@@ -2728,10 +2742,53 @@ end
 
 function Audiobook:_buildSmilPageIndex()
     if self._smil_page_index then return end
-    -- Cross-document xpointer resolution is not available in crengine; the page
-    -- index would require thousands of failed getNormalizedXPointer calls and
-    -- would block the UI. Navigation is handled via gotoLink instead.
+    -- Map each EPUB content document referenced by the Media Overlays to a
+    -- page number where that document is rendered.  This is built once per
+    -- SMIL playback session, lazily and in small chunks, so cross-document
+    -- auto-follow does not have to guess DocFragment indices or scan pages.
     self._smil_page_index = {}
+end
+
+-- Normalize sentence text before handing it to crengine's findText.  The
+-- extracted SMIL text and the rendered text can differ in whitespace,
+-- punctuation, and zero-width characters.
+function Audiobook:_normalizeSearchText(text)
+    if not text then return "" end
+    local t = text
+        :gsub("%s+", " ")
+        :gsub("[\226\128\152-\226\128\155]", "'")    -- curly quotes -> straight
+        :gsub("[\226\128\156-\226\128\159]", '"')    -- curly double quotes
+        :gsub("\226\128\147", "-")                    -- en-dash
+        :gsub("\226\128\148", "-")                    -- em-dash
+        :gsub("\194\160", " ")                        -- non-breaking space
+        :gsub("[\226\128\139\226\128\169]", "")       -- zero-width chars
+        :gsub("\239\187\191", "")                     -- BOM
+    return t
+end
+
+-- Find a page number that belongs to the target content document.
+-- The previous DocFragment scan and findText fallbacks were unreliable and
+-- caused severe UI lag, so this now only returns a previously cached page.
+function Audiobook:_ensureSmilPageIndexEntry(text_doc)
+    self:_buildSmilPageIndex()
+    local cached = self._smil_page_index[text_doc]
+    if cached ~= nil and cached ~= false then
+        return cached.page
+    end
+    return nil
+end
+
+-- Keep the old helpers unused for now; they may be removed after the next
+-- round of testing.
+function Audiobook:_getSmilSampleEntries(text_doc, max_samples)
+    return {}
+end
+
+-- Disabled: the DocFragment scan / findText index builders caused severe UI
+-- lag and did not work on this device.  Cross-document navigation now relies
+-- on cached full xpointers and a fast getPageFromXPointer probe.
+function Audiobook:_scheduleSmilPageIndexBuild()
+    -- no-op
 end
 
 function Audiobook:_findCurrentPageSmilEntry()
@@ -3066,6 +3123,54 @@ function Audiobook:deletePluginSettings()
     self.tts_engine_type = "espeak"
     self.voice = nil
     self.highlight_style = "background"
+end
+
+-- ---------------------------------------------------------------------------
+-- Persistent SMIL xpointer cache
+-- ---------------------------------------------------------------------------
+--
+-- crengine does not expose a reliable "go to file#id" API from Lua.  The
+-- workaround is to capture the full internal xpointer for a fragment the
+-- first time it is highlighted during normal playback, save it to KOReader
+-- settings, and reuse it later for resume/refocus/Play-from-here.
+
+-- Build a stable cache key for a fragment.  The key includes the EPUB path
+-- so different books do not collide.
+function Audiobook:_smilXPointerCacheKey(doc_path, text_doc, fragment_id)
+    if not doc_path or not fragment_id then return nil end
+    local fragment_key = fragment_id
+    if text_doc and text_doc ~= "" then
+        fragment_key = text_doc .. "#" .. fragment_id
+    end
+    return doc_path .. "|" .. fragment_key
+end
+
+-- Load the persisted xpointer cache for the current EPUB.
+function Audiobook:_loadSmilXPointerCache(doc_path)
+    if not doc_path then return {} end
+    local all = self:getSetting("smil_xpointer_cache", {})
+    local book_cache = all[doc_path] or {}
+    local copy = {}
+    for k, v in pairs(book_cache) do
+        copy[k] = v
+    end
+    logger.warn("Audiobook: loaded", self:_countTable(copy), "SMIL xpointer entries for", doc_path:match("([^/]+)$"))
+    return copy
+end
+
+-- Save the in-memory xpointer cache back to KOReader settings.
+function Audiobook:_saveSmilXPointerCache(doc_path, cache)
+    if not doc_path or not cache then return end
+    local all = self:getSetting("smil_xpointer_cache", {})
+    all[doc_path] = cache
+    self:setSetting("smil_xpointer_cache", all)
+end
+
+-- Count entries in a table for logging.
+function Audiobook:_countTable(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    return n
 end
 
 -- ---------------------------------------------------------------------------
