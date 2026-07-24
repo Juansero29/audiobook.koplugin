@@ -62,7 +62,7 @@ jobs:
       - name: Verify bundle
         run: |
           PLUGIN_DIR="kobo-tts-bundle/audiobook.koplugin"
-          EXPECTED_LUA_COUNT=30
+          EXPECTED_LUA_COUNT=31
 
           echo "=== Lua files ==="
           ls -la "$PLUGIN_DIR"/*.lua

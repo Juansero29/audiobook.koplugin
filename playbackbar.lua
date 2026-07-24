@@ -479,6 +479,9 @@ function PlaybackBar:handleEvent(event)
     local arg1 = event.args and event.args[1]
     if event.handler == "onGesture" or (type(arg1) == "table" and arg1.ges) then
         local ges = type(arg1) == "table" and arg1 or nil
+        if ges and self.plugin and self.plugin.session_recorder then
+            self.plugin.session_recorder:recordGesture(ges, "playbackbar")
+        end
         if ges then
             -- Let swipe/pan/hold pass through unconditionally
             if ges.ges == "swipe" or ges.ges == "pan" or ges.ges == "hold" or ges.ges == "hold_pan" then

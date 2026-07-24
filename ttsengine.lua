@@ -1756,6 +1756,14 @@ Play the synthesized audio.
 --]]
 function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     local t0 = UIManager:getTime()
+    -- Register the TTS audio file with the session recorder, if active.
+    if self.plugin and self.plugin.session_recorder and self.current_audio_file then
+        local is_real_wav = self.current_audio_file ~= "/tmp/.kindle_native_tts"
+            and self.current_audio_file:match("%.wav$")
+        if is_real_wav then
+            self.plugin.session_recorder:registerAudioFile(self.current_audio_file, "tts")
+        end
+    end
     -- Detect duplicate play() calls that could cause audio repeats.
     if self.is_speaking then
         logger.err("TTSEngine: DUPLICATE play() called while already speaking! gen=",

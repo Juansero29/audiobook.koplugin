@@ -1376,6 +1376,9 @@ function AudiobookPlayer:handleEvent(event)
         local is_gesture = event.handler == "onGesture" or (type(arg1) == "table" and arg1.ges)
         if is_gesture then
             local ges = type(arg1) == "table" and arg1 or nil
+            if ges and self.plugin and self.plugin.session_recorder then
+                self.plugin.session_recorder:recordGesture(ges, "audiobookplayer")
+            end
             if ges and ges.pos then
                 local mini_y = self.height - self._mini_height
                 local on_bar = ges.pos.y >= mini_y
@@ -1454,6 +1457,9 @@ function AudiobookPlayer:handleEvent(event)
     local arg1 = event.args and event.args[1]
     if event.handler == "onGesture" or (type(arg1) == "table" and arg1.ges) then
         local ges = type(arg1) == "table" and arg1 or nil
+        if ges and self.plugin and self.plugin.session_recorder then
+            self.plugin.session_recorder:recordGesture(ges, "audiobookplayer")
+        end
         if not ges then return false end
 
         -- DEBUG: log every gesture we receive

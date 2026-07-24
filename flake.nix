@@ -96,6 +96,7 @@
         "downloader.lua"
         "epubmediaoverlay.lua"
         "updater.lua"
+        "sessionrecorder.lua"
       ];
     in
     {

@@ -1021,23 +1021,35 @@ function MediaEngine:_playFfmpegPipe(gen)
             atempo = atempo:gsub('"$', "," .. vf .. '"')
         end
     end
+
+    -- If a session recording is active, also write decoded audio to a WAV file.
+    local wav_out = ""
+    if self.plugin and self.plugin.session_recorder
+            and self.plugin.session_recorder:isRecording() then
+        local audio_dir = self.plugin.session_recorder._session_dir .. "/audio"
+        os.execute('mkdir -p "' .. audio_dir:gsub('"', '\\"') .. '" 2>/dev/null')
+        local wav_path = audio_dir .. "/playback.wav"
+        wav_out = string.format(' -f wav "%s"', wav_path:gsub('"', '\\"'))
+    end
+
     local cmd
     if offset > 0 then
         cmd = string.format(
-            'nice -n 10 "%s" -ss %d -i "%s"%s -ar 44100 -ac 2 -f s16le - 2>/dev/null | %s',
-            ffmpeg, math.floor(offset), path, atempo, player_cmd
+            'nice -n 10 "%s" -ss %d -i "%s"%s -ar 44100 -ac 2 -f s16le -%s 2>/dev/null | %s',
+            ffmpeg, math.floor(offset), path, atempo, wav_out, player_cmd
         )
     else
         cmd = string.format(
-            'nice -n 10 "%s" -i "%s"%s -ar 44100 -ac 2 -f s16le - 2>/dev/null | %s',
-            ffmpeg, path, atempo, player_cmd
+            'nice -n 10 "%s" -i "%s"%s -ar 44100 -ac 2 -f s16le -%s 2>/dev/null | %s',
+            ffmpeg, path, atempo, wav_out, player_cmd
         )
     end
 
     logger.warn("MediaEngine: ffmpeg-pipe launch gen=", gen,
         "offset=", offset,
         "sink=", has_mtk_sink and "mtkbtmwrpcaudiosink" or "aplay",
-        "cmd=", cmd:sub(1, 200))
+        "wav_out=", wav_out ~= "" and "yes" or "no",
+        "cmd=", cmd:sub(1, 220))
 
     -- Kill any stale ffmpeg/gst-launch processes before starting.
     -- Previous crashes can leave zombie processes that hold the MTK
@@ -1424,6 +1436,7 @@ while kill -0 $GST_PID 2>/dev/null && [ ! -f "$CTRL/stop" ]; do
     FILE=$(sed -n '1p' "$CTRL/play")
     OFFSET=$(sed -n '2p' "$CTRL/play")
     FILT=$(sed -n '3p' "$CTRL/play")
+    WAV_OUT=$(sed -n '4p' "$CTRL/play")
     rm -f "$CTRL/play" "$CTRL/done"
     if [ -n "$CURRENT_FFMPEG_PID" ]; then
       # SIGKILL and a tiny wait so the new ffmpeg starts quickly; a lingering
@@ -1434,9 +1447,9 @@ while kill -0 $GST_PID 2>/dev/null && [ ! -f "$CTRL/stop" ]; do
       CURRENT_FFMPEG_PID=""
     fi
     if [ -n "$FILT" ]; then
-      "$FFMPEG" -ss "$OFFSET" -i "$FILE" -filter:a "$FILT" -f s16le -ar 44100 -ac 2 - >&3 2>>"$CTRL/pipeline_stderr" &
+      "$FFMPEG" -ss "$OFFSET" -i "$FILE" -filter:a "$FILT" -f s16le -ar 44100 -ac 2 - $WAV_OUT >&3 2>>"$CTRL/pipeline_stderr" &
     else
-      "$FFMPEG" -ss "$OFFSET" -i "$FILE" -f s16le -ar 44100 -ac 2 - >&3 2>>"$CTRL/pipeline_stderr" &
+      "$FFMPEG" -ss "$OFFSET" -i "$FILE" -f s16le -ar 44100 -ac 2 - $WAV_OUT >&3 2>>"$CTRL/pipeline_stderr" &
     fi
     CURRENT_FFMPEG_PID=$!
   fi
@@ -1608,6 +1621,39 @@ function MediaEngine:_playPersistentPipeline(gen)
 
     local filter_chain = self:_persistentFilterChain()
 
+    -- If a session recording is active, also write decoded audio to a WAV file.
+    -- Use the persisted session directory so the WAV tee works even after the
+    -- plugin widget is recreated on document open.
+    local wav_out = ""
+    local session_dir = nil
+    if self.plugin and self.plugin.session_recorder then
+        if self.plugin.session_recorder:isRecording() and self.plugin.session_recorder._session_dir then
+            session_dir = self.plugin.session_recorder._session_dir
+        else
+            local last_dir = self.plugin:getSetting("session_recorder_last_dir", nil)
+            if last_dir then
+                local pid_path = last_dir .. "/.video.pid"
+                local pid_f = io.open(pid_path, "r")
+                if pid_f then
+                    local pid = tonumber(pid_f:read("*l") or "")
+                    pid_f:close()
+                    if pid and io.open("/proc/" .. pid, "r") then
+                        session_dir = last_dir
+                    end
+                end
+            end
+        end
+    end
+    if session_dir then
+        local audio_dir = session_dir .. "/audio"
+        os.execute('mkdir -p "' .. audio_dir:gsub('"', '\\"') .. '" 2>/dev/null')
+        local wav_path = audio_dir .. "/playback.wav"
+        wav_out = string.format(' -f wav "%s"', wav_path:gsub('"', '\\"'))
+        logger.warn("MediaEngine: session wav_out enabled:", wav_path)
+    else
+        logger.warn("MediaEngine: no active session dir for wav_out")
+    end
+
     os.remove(self._media_ctrl_dir .. "/done")
     local f = io.open(self._media_ctrl_dir .. "/play", "w")
     if not f then
@@ -1617,6 +1663,7 @@ function MediaEngine:_playPersistentPipeline(gen)
     f:write(self.current_path .. "\n")
     f:write(tostring(self._seek_offset or 0) .. "\n")
     f:write(filter_chain .. "\n")
+    f:write(wav_out .. "\n")
     f:close()
 
     self._play_start_time = UIManager:getTime()

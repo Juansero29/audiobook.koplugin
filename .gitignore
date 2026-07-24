@@ -1,6 +1,9 @@
 # Build output
 kobo-tts-bundle/
 
+# Local deploy helper
+deploy.sh
+
 # Piper download cache
 .cache/
 

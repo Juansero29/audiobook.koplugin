@@ -19,6 +19,7 @@ local _ = require("gettext")
 -- as nil and become usable after init() succeeds.
 local Device, UIManager, InfoMessage, T, Time
 local BtUI, BtMediaControl, BugReport, BenchmarkRunner, MenuBuilder, Utils, Updater
+local SessionRecorder
 local PLUGIN_PATH
 
 local Audiobook = WidgetContainer:extend{
@@ -78,6 +79,7 @@ function Audiobook:init()
         BenchmarkRunner = try_dofile(_utils_dir .. "benchmarkrunner.lua")
         MenuBuilder = try_dofile(_utils_dir .. "menubuilder.lua")
         Utils = try_dofile(_utils_dir .. "utils.lua")
+        SessionRecorder = try_dofile(_utils_dir .. "sessionrecorder.lua")
     end)
     if not load_ok then
         logger.warn("Audiobook: module loading failed:", load_err)
@@ -294,6 +296,21 @@ function Audiobook:_initSubmodules()
         logger.warn("Audiobook: ABS sync module failed to load:", err_abs)
         self._abs_sync = nil
     end
+
+    -- ── Session recorder (always load; works without a document) ──
+    if SessionRecorder then
+        local ok_rec, err_rec = pcall(function()
+            self.session_recorder = SessionRecorder:new{
+                plugin = self,
+                plugin_dir = pp:sub(1, -2),
+            }
+            self.session_recorder:init()
+        end)
+        if not ok_rec then
+            logger.warn("Audiobook: session recorder failed to load:", err_rec)
+            self.session_recorder = nil
+        end
+    end
 end
 
 function Audiobook:onDispatcherRegisterActions()
@@ -486,6 +503,86 @@ function Audiobook:addToMainMenu(menu_items)
             {
                 text = _("General settings"),
                 sub_item_table = {
+                    {
+                        text = _("Session recorder settings"),
+                        sub_item_table = {
+                            {
+                                text_func = function()
+                                    local fps = self:getSetting("session_recorder_video_fps", 1)
+                                    return T(_("Video FPS: %1"), fps)
+                                end,
+                                sub_item_table = {
+                                    { text = "1", checked_func = function() return self:getSetting("session_recorder_video_fps", 1) == 1 end, callback = function() self:setSetting("session_recorder_video_fps", 1) end },
+                                    { text = "2", checked_func = function() return self:getSetting("session_recorder_video_fps", 1) == 2 end, callback = function() self:setSetting("session_recorder_video_fps", 2) end },
+                                    { text = "5", checked_func = function() return self:getSetting("session_recorder_video_fps", 1) == 5 end, callback = function() self:setSetting("session_recorder_video_fps", 5) end },
+                                },
+                                help_text = _("Frames per second for the video capture. Higher values use more CPU and storage."),
+                            },
+                            {
+                                text_func = function()
+                                    local scale = self:getSetting("session_recorder_video_scale", 0.5)
+                                    return T(_("Video scale: %1"), scale)
+                                end,
+                                sub_item_table = {
+                                    { text = "25%", checked_func = function() return self:getSetting("session_recorder_video_scale", 0.5) == 0.25 end, callback = function() self:setSetting("session_recorder_video_scale", 0.25) end },
+                                    { text = "50%", checked_func = function() return self:getSetting("session_recorder_video_scale", 0.5) == 0.5 end, callback = function() self:setSetting("session_recorder_video_scale", 0.5) end },
+                                    { text = "75%", checked_func = function() return self:getSetting("session_recorder_video_scale", 0.5) == 0.75 end, callback = function() self:setSetting("session_recorder_video_scale", 0.75) end },
+                                    { text = "100%", checked_func = function() return self:getSetting("session_recorder_video_scale", 0.5) == 1.0 end, callback = function() self:setSetting("session_recorder_video_scale", 1.0) end },
+                                },
+                                help_text = _("Resolution scaling for the video. Lower values reduce file size and CPU load."),
+                            },
+                            {
+                                text_func = function()
+                                    local q = self:getSetting("session_recorder_video_quality", 8)
+                                    return T(_("Video quality: %1"), q)
+                                end,
+                                sub_item_table = {
+                                    { text = "4", checked_func = function() return self:getSetting("session_recorder_video_quality", 8) == 4 end, callback = function() self:setSetting("session_recorder_video_quality", 4) end },
+                                    { text = "8", checked_func = function() return self:getSetting("session_recorder_video_quality", 8) == 8 end, callback = function() self:setSetting("session_recorder_video_quality", 8) end },
+                                    { text = "12", checked_func = function() return self:getSetting("session_recorder_video_quality", 8) == 12 end, callback = function() self:setSetting("session_recorder_video_quality", 12) end },
+                                    { text = "16", checked_func = function() return self:getSetting("session_recorder_video_quality", 8) == 16 end, callback = function() self:setSetting("session_recorder_video_quality", 16) end },
+                                    { text = "24", checked_func = function() return self:getSetting("session_recorder_video_quality", 8) == 24 end, callback = function() self:setSetting("session_recorder_video_quality", 24) end },
+                                },
+                                help_text = _("MJPEG quality (2 = best, 31 = worst). Lower values produce larger files."),
+                            },
+                            {
+                                text = _("Include audio in video file"),
+                                enabled_func = function()
+                                    return false
+                                end,
+                                checked_func = function()
+                                    return self:getSetting("session_recorder_video_include_audio", false)
+                                end,
+                                callback = function()
+                                    self:toggleSetting("session_recorder_video_include_audio", false)
+                                end,
+                                help_text = _("When enabled, the recorder tries to mux ALSA audio into the video file in real time. This requires a working ALSA capture device and fails on most e-ink devices, so it is disabled."),
+                            },
+                            {
+                                text = _("Save separate audio files"),
+                                checked_func = function()
+                                    return self:getSetting("session_recorder_save_separate_audio", true)
+                                end,
+                                callback = function()
+                                    self:toggleSetting("session_recorder_save_separate_audio", true)
+                                end,
+                                help_text = _("When enabled, TTS and playback audio are saved as WAV files in the audio/ folder. When disabled, only the video file is kept."),
+                            },
+                            {
+                                text_func = function()
+                                    local max_s = self:getSetting("session_recorder_max_interval_s", 5)
+                                    return T(_("Screenshot max interval: %1s"), max_s)
+                                end,
+                                sub_item_table = {
+                                    { text = "5s", checked_func = function() return self:getSetting("session_recorder_max_interval_s", 5) == 5 end, callback = function() self:setSetting("session_recorder_max_interval_s", 5) end },
+                                    { text = "10s", checked_func = function() return self:getSetting("session_recorder_max_interval_s", 5) == 10 end, callback = function() self:setSetting("session_recorder_max_interval_s", 10) end },
+                                    { text = "30s", checked_func = function() return self:getSetting("session_recorder_max_interval_s", 5) == 30 end, callback = function() self:setSetting("session_recorder_max_interval_s", 30) end },
+                                    { text = "60s", checked_func = function() return self:getSetting("session_recorder_max_interval_s", 5) == 60 end, callback = function() self:setSetting("session_recorder_max_interval_s", 60) end },
+                                },
+                                help_text = _("Maximum time between forced screenshot frames when the screen is static."),
+                            },
+                        },
+                    },
                     {
                         text_func = function()
                             if not self._init_ok or not self.tts_engine or not self.tts_engine._wav_play_bin then
@@ -712,6 +809,29 @@ function Audiobook:addToMainMenu(menu_items)
                 },
             },
             -- ── Diagnostics ──
+            {
+                text_func = function()
+                    if self.session_recorder and self.session_recorder:isRecording() then
+                        return _("Stop session recorder")
+                    end
+                    return _("Start session recorder")
+                end,
+                enabled_func = function()
+                    return self.session_recorder ~= nil
+                end,
+                callback = function(touchmenu_instance)
+                    if not self.session_recorder then return end
+                    if self.session_recorder:isRecording() then
+                        self.session_recorder:stop()
+                    else
+                        self.session_recorder:start()
+                    end
+                    if touchmenu_instance then
+                        touchmenu_instance:updateItems()
+                    end
+                end,
+                help_text = _("Records the current audiobook or TTS session. Audio, video/screenshots, and optional touch events are saved to a folder on device storage."),
+            },
             {
                 text = _("Generate bug report"),
                 callback = function()
@@ -2864,6 +2984,9 @@ end
 -- leaves them holding audio hardware resources, which can crash the
 -- entire device on some Kobo models.
 function Audiobook:onSuspend()
+    if self.session_recorder then
+        pcall(function() self.session_recorder:stop() end)
+    end
     if not self._init_ok then return end
     -- Handle media playback suspend
     if self.media_sync and (self.media_sync:isPlaying() or self.media_sync:isPaused()) then
@@ -2934,6 +3057,10 @@ end
 
 function Audiobook:onCloseDocument()
     logger.warn("Audiobook: onCloseDocument event received")
+    -- Do NOT stop the session recorder here: opening a new book from the
+    -- file browser fires CloseDocument, and the user expects the recording
+    -- to persist across book changes. The recorder still stops on suspend,
+    -- sleep-cover close, or explicit Stop.
     self:stopReadAlong()
 end
 
@@ -2941,6 +3068,9 @@ end
 -- without CloseDocument firing first, force-stop everything.
 function Audiobook:onCloseWidget()
     logger.warn("Audiobook: onCloseWidget event received")
+    -- Do NOT stop the session recorder here for the same reason as above:
+    -- widget teardown can happen when switching documents, and we want the
+    -- recording to continue.
     self:stopReadAlong()
     if self._init_ok then
         self:_removeSleepCoverOverride()
@@ -2970,6 +3100,10 @@ function Audiobook:_installSleepCoverOverride()
     local plugin = self
 
     UIManager.event_handlers.SleepCoverClosed = function()
+        -- Stop any active session recording when the cover closes.
+        if plugin.session_recorder then
+            pcall(function() plugin.session_recorder:stop() end)
+        end
         -- Check if anything is playing (TTS or media file)
         local is_playing = false
         if plugin.sync_controller and (plugin.sync_controller:isPlaying() or plugin.sync_controller:isPaused()) then
