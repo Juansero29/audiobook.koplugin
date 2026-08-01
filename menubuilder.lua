@@ -153,6 +153,42 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         })
     end
 
+    -- Piper mitigations for underpowered devices (single-core, low RAM).
+    -- Both are OFF by default; the RTF auto-degrade can also enable them
+    -- for a session when Piper measurably cannot keep up with playback.
+    if plugin.tts_engine
+       and plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PIPER then
+        table.insert(menu, {
+            text = _("Low-resource mode (slow devices)"),
+            checked_func = function()
+                return plugin:getSetting("piper_low_resource", false)
+            end,
+            callback = function()
+                plugin:toggleSetting("piper_low_resource", false)
+            end,
+            help_text = _(
+                "Synthesizes one sentence at a time and prioritizes the "
+                .. "sentence currently being read. Helps on single-core "
+                .. "devices where Piper is slower than playback."
+            ),
+        })
+        table.insert(menu, {
+            text = _("Split sentences aggressively for Piper"),
+            checked_func = function()
+                return plugin:getSetting("piper_aggressive_split", false)
+            end,
+            callback = function()
+                plugin:toggleSetting("piper_aggressive_split", false)
+            end,
+            help_text = _(
+                "Limits synthesis chunks to about 150 characters instead "
+                .. "of 300. Reduces the wait per sentence and avoids "
+                .. "synthesis failures with long sentences on low-memory "
+                .. "devices. Applies from the next page."
+            ),
+        })
+    end
+
     -- Speech rate submenu
     table.insert(menu, {
         text_func = function()
@@ -843,6 +879,21 @@ function MenuBuilder.buildPiperVoiceMenu(plugin)
                     label = label .. " (" .. voice.quality .. ")"
                 end
                 plugin:setSetting("piper_model_label", label)
+                -- One-time-per-session heads-up on underpowered devices:
+                -- Piper cannot sustain realtime playback on single-core /
+                -- low-RAM hardware (measured ~8x slower than realtime on a
+                -- Kobo Clara BW), so set expectations before the first stall.
+                if not plugin._piper_weak_device_warned then
+                    local cores = Utils.getCpuCores()
+                    local mem_kb = Utils.getMemTotalKb()
+                    if cores <= 1 or (mem_kb and mem_kb < 512 * 1024) then
+                        plugin._piper_weak_device_warned = true
+                        UIManager:show(InfoMessage:new{
+                            text = _("Note: this device has limited CPU/RAM. Piper voices may pause between sentences or fall back to espeak during playback. Enabling \"Low-resource mode\" in Voice settings can help."),
+                            timeout = 8,
+                        })
+                    end
+                end
             end,
         })
     end

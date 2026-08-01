@@ -6201,4 +6201,33 @@ function TTSEngine:piperPrefetchAsync(text)     self._piper:enqueue(text) end
 function TTSEngine:_launchNextPiperPrefetch()    self._piper:launchNext() end
 function TTSEngine:consumePiperQueueEntry(text)  return self._piper:consume(text) end
 function TTSEngine:getPiperPrefetchStatus(text)  return self._piper:getStatus(text) end
+
+--[[--
+Low-resource Piper mode (setting A).  One sentence per batch, current
+sentence prioritized.  Enabled persistently via the "piper_low_resource"
+setting, or for the session by the RTF auto-degrade escalation.
+@return boolean
+--]]
+function TTSEngine:_piperLowResource()
+    if self._session_low_resource then return true end
+    if self.plugin and self.plugin:getSetting("piper_low_resource", false) then
+        return true
+    end
+    return false
+end
+
+--[[--
+Aggressive long-sentence splitting for Piper (setting B).  Enabled
+persistently via the "piper_aggressive_split" setting, or for the session
+by the RTF auto-degrade escalation.
+@return boolean
+--]]
+function TTSEngine:_piperAggressiveSplit()
+    if self._session_split_long then return true end
+    if self.plugin and self.plugin:getSetting("piper_aggressive_split", false) then
+        return true
+    end
+    return false
+end
+
 return TTSEngine

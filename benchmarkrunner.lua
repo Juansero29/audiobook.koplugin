@@ -14,6 +14,7 @@ local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
+local time = require("ui/time")
 local _ = require("gettext")
 
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
@@ -190,14 +191,17 @@ local function benchEspeak(engine, text)
         exec_prefix, engine.espeak_bin, voice, speed, audio_file, engine:escapeText(text)
     )
 
-    local t0 = os.clock()
+    -- Wall-clock, not os.clock(): os.clock() measures Lua CPU time, which
+    -- is ~0 while we block waiting for the child process (it produced the
+    -- bogus "synth=5ms rt=0.00x" rows seen on slow devices).
+    local t0 = time.now()
     local handle = io.popen(cmd, "r")
     local output = ""
     if handle then
         output = handle:read("*a") or ""
         handle:close()
     end
-    local synth_ms = math.floor((os.clock() - t0) * 1000)
+    local synth_ms = time.to_ms(time.since(t0))
 
     local wav_bytes = getFileSize(audio_file) or 0
     local wav_ms = WavUtils.getDurationMs(audio_file)
@@ -266,14 +270,14 @@ local function benchPiper(engine, model_path, text)
     local cmd = string.format('nice -n 19 %s%s%s --output_file "%s" < "%s" 2>&1',
         exec_prefix, piper_bin, model_flag, audio_file, text_file)
 
-    local t0 = os.clock()
+    local t0 = time.now()
     local handle = io.popen(cmd, "r")
     local output = ""
     if handle then
         output = handle:read("*a") or ""
         handle:close()
     end
-    local synth_ms = math.floor((os.clock() - t0) * 1000)
+    local synth_ms = time.to_ms(time.since(t0))
 
     os.remove(text_file)
 

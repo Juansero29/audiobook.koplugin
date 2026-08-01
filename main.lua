@@ -220,6 +220,14 @@ function Audiobook:_initSubmodules()
             end
             self.tts_engine:setPiperSpeaker(self:getSetting("piper_speaker", 0))
             self.tts_engine._gap_test_mode = self:getSetting("gap_test_mode", false)
+            -- Aggressive long-sentence splitting for Piper (setting + session
+            -- auto-degrade).  Evaluated lazily at every parse() call.
+            self.text_parser.max_chunk_fn = function()
+                if self.tts_engine and self.tts_engine:_piperAggressiveSplit() then
+                    return TextParser.AGGRESSIVE_CHUNK_CHARS
+                end
+                return nil  -- default cap
+            end
             self.highlight_manager = HighlightManager:new{
                 plugin = self,
                 ui = self.ui,

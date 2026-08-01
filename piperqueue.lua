@@ -54,6 +54,20 @@ local MAX_PIPELINE_DEPTH = _cpu_cores == 1 and 1 or 2
 
 local PiperQueue = {}
 
+--[[--
+Effective batch size.  Low-resource mode (setting A: explicit setting or
+session auto-degrade) forces single-sentence batches so the next needed
+sentence arrives after one synthesis instead of a full multi-sentence batch.
+@return number
+--]]
+function PiperQueue:_batchSize()
+    local engine = self.engine
+    if engine._piperLowResource and engine:_piperLowResource() then
+        return 1
+    end
+    return BATCH_SIZE
+end
+
 function PiperQueue:new(o)
     o = o or {}
     setmetatable(o, self)
@@ -429,7 +443,7 @@ function PiperQueue:startServers()
 
     logger.warn("PiperQueue: CPU cores:", _cpu_cores,
                 "→ SERVER_COUNT:", SERVER_COUNT,
-                "BATCH_SIZE:", BATCH_SIZE)
+                "BATCH_SIZE:", self:_batchSize())
 
     self._servers_starting = true
     self._servers = {}
@@ -698,6 +712,7 @@ function PiperQueue:launchNext()
     if self._slots_busy >= max_concurrent then return end
 
     -- Gather consecutive "queued" entries
+    local batch_size = self:_batchSize()
     local batch_texts   = {}
     local batch_entries = {}
     for _, text in ipairs(self._queue_order) do
@@ -705,7 +720,7 @@ function PiperQueue:launchNext()
         if e and e.status == "queued" then
             table.insert(batch_texts, text)
             table.insert(batch_entries, e)
-            if #batch_texts >= BATCH_SIZE then break end
+            if #batch_texts >= batch_size then break end
         end
     end
     if #batch_texts == 0 then return end
@@ -792,6 +807,10 @@ function PiperQueue:launchNext()
                     logger.warn("PiperQueue: BATCH READY in", synth_ms, "ms:",
                         #batch_texts, "sentences, size:", total_size)
 
+                    -- Track the realtime factor for slow-device auto-degrade
+                    local audio_ms = WavUtils.getDurationMs(combined_audio_file)
+                    self:_recordRtfSample(synth_ms, audio_ms, #batch_texts)
+
                     if #batch_texts == 1 then
                         WavUtils.applyFade(combined_audio_file, 15)
                         engine:generateTimingEstimates(primary_text)
@@ -812,7 +831,7 @@ function PiperQueue:launchNext()
                             total_syllables = total_syllables + count
                         end
 
-                        local total_dur_ms = WavUtils.getDurationMs(combined_audio_file)
+                        local total_dur_ms = audio_ms
                         local est_durations_ms = {}
                         for _, syl in ipairs(durations) do
                             table.insert(est_durations_ms,
@@ -933,6 +952,8 @@ function PiperQueue:launchNext()
                     engine:generateTimingEstimates(text_to_launch)
                     e.timing = engine.timing_data
                     e.status = "ready"
+                    pq:_recordRtfSample(poll_count * 200,
+                        WavUtils.getDurationMs(audio_file), 1)
                     logger.dbg("PiperQueue: Prefetch ready:",
                         text_to_launch:sub(1, 40), "size:", size)
                     pq._slots_busy = math.max(0, (pq._slots_busy or 0) - 1)
@@ -1089,6 +1110,96 @@ function PiperQueue:getSnapshot()
     return string.format("queued=%d pending=%d ready=%d failed=%d total=%d",
         counts.queued, counts.pending, counts.ready, counts.failed,
         #(self._queue_order or {}))
+end
+
+-- ── Realtime-factor tracking (slow-device auto-degrade) ─────────────
+
+--[[--
+Record one synthesis timing sample.
+@param synth_ms number  Wall time the batch took
+@param audio_ms number  Duration of the produced audio
+@param n_sentences number  Sentences in the batch
+--]]
+function PiperQueue:_recordRtfSample(synth_ms, audio_ms, n_sentences)
+    if not synth_ms or synth_ms <= 0 or not audio_ms or audio_ms <= 0 then
+        return
+    end
+    self._rtf_samples = self._rtf_samples or {}
+    table.insert(self._rtf_samples, {
+        rtf = synth_ms / audio_ms,
+        synth_ms = synth_ms,
+        n = n_sentences or 1,
+    })
+    if #self._rtf_samples > 6 then
+        table.remove(self._rtf_samples, 1)
+    end
+    self._rtf_total_samples = (self._rtf_total_samples or 0) + 1
+    logger.dbg("PiperQueue: RTF sample:", string.format("%.2f", synth_ms / audio_ms),
+        "(", synth_ms, "ms synth /", audio_ms, "ms audio )")
+end
+
+--[[--
+Rolling realtime factor (synthesis time / audio duration).  Values above
+1.0 mean Piper cannot keep up with playback.  Returns nil until at least
+3 batches have completed, so callers don't act on cold-start noise.
+@return number|nil
+--]]
+function PiperQueue:getRtf()
+    if (self._rtf_total_samples or 0) < 3 then return nil end
+    local s = self._rtf_samples
+    if not s or #s == 0 then return nil end
+    local sum, n = 0, 0
+    for i = math.max(1, #s - 2), #s do
+        sum = sum + s[i].rtf
+        n = n + 1
+    end
+    if n == 0 then return nil end
+    return sum / n
+end
+
+--[[--
+Total number of RTF samples recorded (monotonic, used as an escalation
+checkpoint marker).
+@return number
+--]]
+function PiperQueue:getRtfSampleCount()
+    return self._rtf_total_samples or 0
+end
+
+--[[--
+Average synthesis wall time per sentence, in seconds (for user-facing
+wait estimates).  Returns nil when no samples exist yet.
+@return number|nil
+--]]
+function PiperQueue:getAvgSentenceSynthS()
+    local s = self._rtf_samples
+    if not s or #s == 0 then return nil end
+    local sum = 0
+    for _, smp in ipairs(s) do
+        sum = sum + smp.synth_ms / math.max(1, smp.n)
+    end
+    return (sum / #s) / 1000
+end
+
+--[[--
+Move a queued entry to the front of the dispatch order so the currently
+needed sentence is synthesized before lookahead entries (low-resource mode).
+No-op when the entry is missing or already dispatched.
+@param text string
+--]]
+function PiperQueue:prioritize(text)
+    local entry = self._queue[text]
+    if not entry or entry.status ~= "queued" then return end
+    for i, t in ipairs(self._queue_order) do
+        if t == text then
+            if i > 1 then
+                table.remove(self._queue_order, i)
+                table.insert(self._queue_order, 1, text)
+                logger.dbg("PiperQueue: Prioritized:", text:sub(1, 40))
+            end
+            return
+        end
+    end
 end
 
 --[[--

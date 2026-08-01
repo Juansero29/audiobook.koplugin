@@ -67,4 +67,35 @@ function Utils.normalizeDirPath(path)
     return path
 end
 
+--- Detect the number of CPU cores (same logic as piperqueue.lua).
+-- @return number  Core count (1 when undetectable)
+function Utils.getCpuCores()
+    local f = io.open("/sys/devices/system/cpu/possible", "r")
+    if f then
+        -- Format: "0-N" → N+1 cores, or "0" → 1 core
+        local s = f:read("*l") or "0"
+        f:close()
+        local hi = s:match("%-(%d+)")
+        if hi then return tonumber(hi) + 1 end
+        return 1
+    end
+    return 1  -- conservative fallback
+end
+
+--- Read total system memory in kB from /proc/meminfo.
+-- @return number|nil  MemTotal in kB, or nil when unreadable
+function Utils.getMemTotalKb()
+    local f = io.open("/proc/meminfo", "r")
+    if not f then return nil end
+    for line in f:lines() do
+        local kb = line:match("MemTotal:%s+(%d+)%s+kB")
+        if kb then
+            f:close()
+            return tonumber(kb)
+        end
+    end
+    f:close()
+    return nil
+end
+
 return Utils

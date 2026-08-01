@@ -11,6 +11,7 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local time = require("ui/time")
 local _ = require("gettext")
+local T = require("ffi/util").template
 
 -- Shared utility modules (DRY: eliminates duplicated getPluginPath, ws)
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
@@ -48,6 +49,16 @@ local PIPER_ABANDON_THRESHOLD = 30
 local MIN_READY_AHEAD = 3         -- wait for 3+ more sentences after target
 local BUFFER_FILL_TIMEOUT_S = 20  -- max seconds to wait after target is ready
 
+-- ── RTF auto-degrade escalation ──────────────────────────────────────
+-- PiperQueue tracks a rolling realtime factor (synthesis time / audio
+-- duration).  Above this threshold Piper cannot keep up with playback.
+-- Stage 1 applies low-resource mode + aggressive sentence splitting for
+-- the session; stage 2 switches to espeak for the rest of the session.
+-- Neither stage touches the user's saved settings.
+local PIPER_RTF_DEGRADE_THRESHOLD = 1.2
+-- Batches to wait after stage 1 before concluding it was not enough.
+local PIPER_RTF_STAGE2_SAMPLES = 3
+
 local SyncController = {
     -- Playback states
     STATE = {
@@ -81,6 +92,10 @@ function SyncController:new(o)
     -- Piper ever delivering, kill the server to free CPU on single-core.
     o._piper_abandoned = false
     o._espeak_fallback_count = 0
+    -- RTF auto-degrade: 0 = not triggered, 1 = low-resource + splitting
+    -- applied for the session, 2 = espeak session fallback active.
+    o._piper_degrade_stage = 0
+    o._piper_degrade_mark = nil
     -- Timing
     o.sentence_sync_start = nil
     o.pause_time = nil
@@ -242,6 +257,13 @@ function SyncController:readNextSentence()
     local piper_status = self.tts_engine:getPiperPrefetchStatus(sentence.text)
     local my_chain_gen = self._chain_generation or 0
     if piper_status == "pending" or piper_status == "queued" then
+        -- Low-resource mode: the currently needed sentence jumps ahead of
+        -- queued lookahead entries so it is synthesized first.
+        if piper_status == "queued"
+                and self.tts_engine._piperLowResource
+                and self.tts_engine:_piperLowResource() then
+            self.tts_engine._piper:prioritize(sentence.text)
+        end
         -- ── espeak cold-start fallback ─────────────────────────────
         -- While Piper hasn't delivered any audio yet, keep playing via
         -- espeak so the user never hits a dead stall on slow hardware.
@@ -294,13 +316,41 @@ function SyncController:readNextSentence()
             end
             poll_count = poll_count + 1
 
+            -- Piper was abandoned mid-wait (RTF escalation stage 2): stop
+            -- waiting for audio that will never arrive.
+            if controller._piper_abandoned then
+                controller:_playViaEspeakOrSkip(sentence, "piper abandoned mid-wait")
+                return
+            end
+
+            -- Every ~4 s, check whether Piper is sustainably keeping up.
+            if poll_count % 16 == 0 then
+                controller:_checkPiperRtfEscalation()
+                if controller._piper_abandoned then
+                    controller:_playViaEspeakOrSkip(sentence, "piper too slow (rtf)")
+                    return
+                end
+            end
+
             -- Slow-synthesis warning: on underpowered devices Piper can take
             -- 30-75s per sentence.  Warn the user so they don't think it's frozen.
             if poll_count == 20 and not _toast_shown.slow then
                 _toast_shown.slow = true
+                -- Estimate from measured synthesis speed when available:
+                -- the old fixed "20-40 seconds" claim was wildly optimistic
+                -- on single-core devices (real: 60-150 s).
+                local pq = controller.tts_engine and controller.tts_engine._piper
+                local avg_s = pq and pq.getAvgSentenceSynthS and pq:getAvgSentenceSynthS()
+                local wait_text
+                if avg_s and avg_s >= 1 then
+                    wait_text = T(_("Neural synthesis in progress...\nThis device needs about %1 seconds per sentence."),
+                        tostring(math.floor(avg_s + 0.5)))
+                else
+                    wait_text = _("Neural synthesis in progress...\nPlease wait.")
+                end
                 local InfoMessage = require("ui/widget/infomessage")
                 UIManager:show(InfoMessage:new{
-                    text = _("Neural synthesis in progress...\nPlease wait (this may take 20-40 seconds on your device)."),
+                    text = wait_text,
                     timeout = 4,
                 })
             elseif poll_count == 60 and not _toast_shown.veryslow then
@@ -357,8 +407,8 @@ function SyncController:readNextSentence()
                         controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
                         controller:beginSentencePlayback(sentence)
                     else
-                        logger.err("SyncController: Piper prefetch hard timeout, skipping")
-                        controller:readNextSentence()
+                        logger.err("SyncController: Piper prefetch hard timeout, espeak fallback")
+                        controller:_playViaEspeakOrSkip(sentence, "piper prefetch hard timeout")
                     end
                 end
                 return
@@ -367,10 +417,19 @@ function SyncController:readNextSentence()
             -- Target not ready yet — check for failure
             local st = controller.tts_engine:getPiperPrefetchStatus(sentence.text)
             if st == "failed" or (not st) then
+                -- Once Piper is known to be too slow (degrade stage >= 1),
+                -- the direct synthesize fallback just stalls for 60 s and
+                -- times out; go straight to espeak instead.
+                if controller._piper_abandoned
+                        or (controller._piper_degrade_stage or 0) >= 1 then
+                    logger.warn("SyncController: Piper prefetch failed/gone, espeak fallback (degraded)")
+                    controller:_playViaEspeakOrSkip(sentence, "piper prefetch failed")
+                    return
+                end
                 logger.warn("SyncController: Piper prefetch failed/gone, falling back to synthesize")
                 controller.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
                     if not synth_success then
-                        controller:readNextSentence()
+                        controller:_playViaEspeakOrSkip(sentence, "piper synthesize failed")
                         return
                     end
                     controller:applySentenceTiming(sentence, timing_data)
@@ -381,8 +440,8 @@ function SyncController:readNextSentence()
             if poll_count < max_polls then
                 UIManager:scheduleIn(0.25, waitForPiperPrefetch)
             else
-                logger.err("SyncController: Piper prefetch wait timed out, skipping sentence")
-                controller:readNextSentence()
+                logger.err("SyncController: Piper prefetch wait timed out, espeak fallback")
+                controller:_playViaEspeakOrSkip(sentence, "piper prefetch wait timeout")
             end
         end
         UIManager:scheduleIn(0.25, waitForPiperPrefetch)
@@ -454,6 +513,17 @@ function SyncController:readNextSentence()
                 return
             end
             poll_count = poll_count + 1
+            if controller._piper_abandoned then
+                controller:_playViaEspeakOrSkip(sentence, "piper abandoned mid-wait")
+                return
+            end
+            if poll_count % 16 == 0 then
+                controller:_checkPiperRtfEscalation()
+                if controller._piper_abandoned then
+                    controller:_playViaEspeakOrSkip(sentence, "piper too slow (rtf)")
+                    return
+                end
+            end
             local ok = controller.tts_engine:usePrefetched(sentence.text)
             if ok then
                 logger.warn("SyncController: Piper queue delivered sentence",
@@ -466,16 +536,16 @@ function SyncController:readNextSentence()
             local st = controller.tts_engine:getPiperPrefetchStatus(sentence.text)
             if st == "failed" or (not st) then
                 logger.err("SyncController: Piper queue failed for sentence",
-                    controller.reading_sentence_idx, ", skipping")
-                controller:readNextSentence()
+                    controller.reading_sentence_idx, ", espeak fallback")
+                controller:_playViaEspeakOrSkip(sentence, "piper queue failed")
                 return
             end
             if poll_count < max_polls then
                 UIManager:scheduleIn(0.25, waitForPiperSynth)
             else
                 logger.err("SyncController: Piper queue timed out for sentence",
-                    controller.reading_sentence_idx)
-                controller:readNextSentence()
+                    controller.reading_sentence_idx, ", espeak fallback")
+                controller:_playViaEspeakOrSkip(sentence, "piper queue timeout")
             end
         end
         UIManager:scheduleIn(0.25, waitForPiperSynth)
@@ -488,8 +558,12 @@ function SyncController:readNextSentence()
     local success = self.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
         if not synth_success then
             logger.warn("SyncController: Synthesis failed for sentence", controller.reading_sentence_idx)
-            -- Skip failed sentence, try next
-            controller:readNextSentence()
+            -- Piper failure: degrade the voice rather than drop book content
+            if controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER then
+                controller:_playViaEspeakOrSkip(sentence, "piper synthesize failed")
+            else
+                controller:readNextSentence()
+            end
             return
         end
 
@@ -1847,6 +1921,112 @@ function SyncController:resume(auto)
 end
 
 --[[--
+Play a sentence via the espeak fallback instead of dropping it.  Used when
+Piper fails or times out for a sentence: silently skipping book content is
+the worst possible failure mode, so degrade the voice instead.  Falls
+through to readNextSentence() only when espeak is unavailable or fails.
+@param sentence table
+@param reason string  Log context
+@return boolean  true when the sentence is being played via espeak
+--]]
+function SyncController:_playViaEspeakOrSkip(sentence, reason)
+    if self.tts_engine and self.tts_engine.espeak_bin then
+        logger.warn("SyncController: espeak fallback for sentence",
+            self.reading_sentence_idx, "(", reason, ")")
+        local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+        if fb_file then
+            self._espeak_fallback_count = (self._espeak_fallback_count or 0) + 1
+            self:_checkPiperAbandon()
+            self:applySentenceTiming(sentence, self.tts_engine.timing_data)
+            self:beginSentencePlayback(sentence)
+            return true
+        end
+        logger.warn("SyncController: espeak fallback failed (", reason,
+            "), skipping sentence")
+    else
+        logger.warn("SyncController: no espeak fallback available (", reason,
+            "), skipping sentence")
+    end
+    self:readNextSentence()
+    return false
+end
+
+--[[--
+RTF auto-degrade escalation.  PiperQueue's rolling realtime factor tells us
+when synthesis is slower than playback and no amount of buffering will fix
+the stall pattern:
+
+  stage 0 → 1: apply low-resource mode and aggressive sentence splitting
+               for the session, with a message explaining what changed.
+               If the user already enabled both settings, there is nothing
+               left to apply and we go straight to stage 2.
+  stage 1 → 2: after PIPER_RTF_STAGE2_SAMPLES more batches are still above
+               threshold, switch to espeak for the rest of the session.
+
+Both stages are session-scoped: the user's saved settings are never
+modified, and Piper is tried again on the next playback session.
+--]]
+function SyncController:_checkPiperRtfEscalation()
+    if self._piper_abandoned then return end
+    if not self.tts_engine or not self.tts_engine._piper then return end
+    if self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER then return end
+    local pq = self.tts_engine._piper
+    local rtf = pq:getRtf()
+    if not rtf or rtf < PIPER_RTF_DEGRADE_THRESHOLD then return end
+
+    local stage = self._piper_degrade_stage or 0
+    local InfoMessage = require("ui/widget/infomessage")
+
+    if stage == 0 then
+        local already_low   = self.tts_engine:_piperLowResource()
+        local already_split = self.tts_engine:_piperAggressiveSplit()
+        if already_low and already_split then
+            -- Nothing left to apply: the user already runs both mitigations
+            -- and Piper still cannot keep up.  Skip stage 1: set the stage
+            -- marker so the window check below passes immediately and we
+            -- fall through to stage 2 in this same call.
+            stage = 1
+            self._piper_degrade_stage = 1
+            self._piper_degrade_mark = pq:getRtfSampleCount() - PIPER_RTF_STAGE2_SAMPLES
+        else
+            if not already_low then self.tts_engine._session_low_resource = true end
+            if not already_split then self.tts_engine._session_split_long = true end
+            self._piper_degrade_stage = 1
+            self._piper_degrade_mark = pq:getRtfSampleCount()
+            local applied = {}
+            if not already_low then table.insert(applied, _("low-resource mode")) end
+            if not already_split then table.insert(applied, _("sentence splitting")) end
+            logger.warn("SyncController: Piper RTF degrade stage 1, rtf=",
+                string.format("%.2f", rtf), "applied:", table.concat(applied, ", "))
+            UIManager:show(InfoMessage:new{
+                text = T(_("Piper is synthesizing slower than playback (%1x realtime).\nApplying %2 to compensate (this session only)."),
+                    string.format("%.1f", rtf), table.concat(applied, " + ")),
+                timeout = 8,
+            })
+            return
+        end
+    end
+
+    if stage == 1 then
+        -- Give the stage-1 mitigations a fair window before concluding
+        -- they are insufficient.
+        if (pq:getRtfSampleCount() - (self._piper_degrade_mark or 0))
+                < PIPER_RTF_STAGE2_SAMPLES then
+            return
+        end
+        self._piper_degrade_stage = 2
+        logger.warn("SyncController: Piper RTF degrade stage 2, rtf=",
+            string.format("%.2f", rtf), "— espeak session fallback")
+        self._piper_abandoned = true
+        pcall(function() pq:shutdown() end)
+        UIManager:show(InfoMessage:new{
+            text = _("This device is too slow for Piper voices.\nSwitching to espeak for this session.\nPiper will be tried again the next time you start playback."),
+            timeout = 8,
+        })
+    end
+end
+
+--[[--
 Check whether Piper should be abandoned after too many consecutive espeak
 fallbacks (i.e. Piper never delivered any audio).  Shows a one-time warning
 explaining the situation, kills the Piper server to free CPU, and enables
@@ -1920,6 +2100,14 @@ function SyncController:stop()
     self._piper_warmed_up = false
     self._piper_abandoned = false
     self._espeak_fallback_count = 0
+    self._piper_degrade_stage = 0
+    self._piper_degrade_mark = nil
+    -- Session-scoped auto-degrade flags end with the session; the user's
+    -- saved settings are never touched.
+    if self.tts_engine then
+        self.tts_engine._session_low_resource = nil
+        self.tts_engine._session_split_long = nil
+    end
     self.total_sentences = 0
     self.current_sentence = nil
     self.sentence_sync_start = nil

@@ -17,12 +17,19 @@ local TextParser = {
     -- Word separators
     WORD_SEPARATORS = "[%s%p]",
 }
-
 -- Long-sentence splitting thresholds (see benchmark/RESULTS_LONG.md).
 -- Piper on ARM OOMs above ~900 chars; 300 keeps us in the efficient window.
 -- Chunks below 80 chars waste 90%+ of synthesis time on per-request overhead.
 local MAX_CHUNK_CHARS = 300
 local MIN_CHUNK_CHARS = 80
+
+-- Aggressive splitting (setting B, "piper_aggressive_split"): smaller chunks
+-- reach the synthesizer sooner and avoid onnxruntime failures on long inputs
+-- in low-memory devices.  Used when max_chunk_fn() returns a lower cap.
+local AGGRESSIVE_CHUNK_CHARS = 150
+
+-- Exposed for the plugin's max_chunk_fn wiring (main.lua).
+TextParser.AGGRESSIVE_CHUNK_CHARS = AGGRESSIVE_CHUNK_CHARS
 
 function TextParser:new(o)
     o = o or {}
@@ -47,10 +54,17 @@ function TextParser:parse(text)
     
     -- Normalize whitespace
     text = self:normalizeText(text)
-    
+
+    -- Optional chunk-size override (aggressive Piper splitting).  The
+    -- callback is installed by the plugin and evaluates current settings.
+    local max_chunk = MAX_CHUNK_CHARS
+    if self.max_chunk_fn then
+        max_chunk = self.max_chunk_fn() or MAX_CHUNK_CHARS
+    end
+
     local result = {
         text = text,
-        sentences = self:parseSentences(text),
+        sentences = self:parseSentences(text, max_chunk),
         words = self:parseWords(text),
     }
     
@@ -125,9 +139,11 @@ end
 --[[--
 Parse text into sentences.
 @param text string Input text
+@param max_chunk number|nil  Long-sentence split cap (default MAX_CHUNK_CHARS)
 @return table Array of sentence objects
 --]]
-function TextParser:parseSentences(text)
+function TextParser:parseSentences(text, max_chunk)
+    max_chunk = max_chunk or MAX_CHUNK_CHARS
     local sentences = {}
     local sentence_index = 1
 
@@ -196,13 +212,13 @@ function TextParser:parseSentences(text)
     end
 
     -- Step 3: split long sentences for TTS safety.
-    -- Piper on ARM OOMs above ~900 chars; split anything over MAX_CHUNK_CHARS
+    -- Piper on ARM OOMs above ~900 chars; split anything over max_chunk
     -- at clause boundaries, then cap at word boundaries if still too long.
     local expanded = {}
     local new_index = 1
     for _, sentence in ipairs(sentences) do
-        if #sentence.text > MAX_CHUNK_CHARS then
-            local chunks = self:splitLongSentence(sentence.text)
+        if #sentence.text > max_chunk then
+            local chunks = self:splitLongSentence(sentence.text, max_chunk)
             for j, chunk in ipairs(chunks) do
                 local etype = (j == #chunks) and sentence.end_type or "sentence"
                 table.insert(expanded, {
