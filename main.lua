@@ -118,7 +118,8 @@ function Audiobook:init()
     -- Add "Read aloud from here" to the text selection / highlight popup.
     -- This appears when the user selects a paragraph or multiple words
     -- (as opposed to the single-word dictionary popup, which is handled
-    -- by onDictButtonsReady).
+    -- by _registerDictButtons on KOReader >= 2026.07 and by the legacy
+    -- onDictButtonsReady event handler on older releases).
     if self.ui.highlight and self.ui.highlight.addToHighlightDialog then
         self.ui.highlight:addToHighlightDialog("15_read_aloud", function(this)
             return {
@@ -165,6 +166,83 @@ function Audiobook:init()
             }
         end)
     end
+
+    -- Single-word dictionary popup buttons.  KOReader 2026.07
+    -- (koreader/koreader#15184) removed the DictButtonsReady broadcast in
+    -- favor of a registration API; on older releases onDictButtonsReady()
+    -- below still receives the event and appends the same buttons.
+    self:_registerDictButtons()
+end
+
+--[[--
+Register "Read aloud from here" / "Play aligned audiobook from here" in the
+single-word dictionary popup via ReaderDictionary:addToDictButtons (KOReader
+>= 2026.07).  No-op on older KOReader, where the DictButtonsReady event is
+still broadcast and handled by onDictButtonsReady().
+
+Both buttons use conditional = true: transient rows appended at the end,
+mirroring the old table.insert(buttons, ...) placement.
+--]]
+function Audiobook:_registerDictButtons()
+    if not (self.ui.dictionary and self.ui.dictionary.addToDictButtons) then
+        return
+    end
+    local plugin = self
+
+    self.ui.dictionary:addToDictButtons({
+        id = "audiobook_read",
+        text = _("Read aloud from here"),
+        font_bold = false,
+        conditional = true,
+        show_func = function(dict_popup)
+            return plugin._init_ok and not dict_popup.is_wiki_fullpage
+        end,
+        callback = function(dict_popup)
+            local word = dict_popup.word or dict_popup.lookupword
+            -- Capture surrounding text context from the highlight selection
+            -- so we can find the correct occurrence of the word on the page,
+            -- not just the first one.
+            local selected_text_context = nil
+            if dict_popup.highlight and dict_popup.highlight.selected_text then
+                local sel = dict_popup.highlight.selected_text
+                -- For CRe docs, pos0 is an xpointer string with an offset;
+                -- for paged docs it's a table.  Either way, save the surrounding
+                -- selected text or the raw pos0 for position matching.
+                selected_text_context = {
+                    pos0 = sel.pos0,
+                    pos1 = sel.pos1,
+                }
+            end
+            UIManager:close(dict_popup)
+            -- Give the dictionary popup and any parent highlight enough time
+            -- to fully close and leave the UIManager window stack before we
+            -- add the PlaybackBar.  Too short a delay means _isOverlayActive()
+            -- still sees stale non-toast widgets and suppresses the bar.
+            UIManager:scheduleIn(0.3, function()
+                plugin:startReadAlongFromWord(word, selected_text_context)
+            end)
+        end,
+    })
+
+    self.ui.dictionary:addToDictButtons({
+        id = "audiobook_play_aligned",
+        text = _("Play aligned audiobook from here"),
+        font_bold = false,
+        conditional = true,
+        show_func = function(dict_popup)
+            return plugin._init_ok and not dict_popup.is_wiki_fullpage
+        end,
+        callback = function(dict_popup)
+            local selected_text = nil
+            if dict_popup.highlight and dict_popup.highlight.selected_text then
+                selected_text = dict_popup.highlight.selected_text
+            end
+            UIManager:close(dict_popup)
+            UIManager:scheduleIn(0.3, function()
+                plugin:startAlignedAudioFromSelection(selected_text)
+            end)
+        end,
+    })
 end
 
 function Audiobook:_initSubmodules()
@@ -937,7 +1015,10 @@ function Audiobook:addToMainMenu(menu_items)
     }
 end
 
---- Hook into dictionary popup to add "Read aloud from here" button
+--- Legacy hook: dictionary popup "DictButtonsReady" event (KOReader <= 2026.03).
+--- KOReader 2026.07 removed the broadcast; _registerDictButtons() covers the
+--- new addToDictButtons API instead.  Keep this handler so older releases
+--- still get the buttons.
 function Audiobook:onDictButtonsReady(dict_popup, buttons)
     if not self._init_ok then return end
     if dict_popup.is_wiki_fullpage then
