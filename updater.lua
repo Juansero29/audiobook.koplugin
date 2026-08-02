@@ -128,6 +128,9 @@ end
 --- Download a URL to a local file path, with resume support.
 -- Downloads can be large (the release zip includes ffmpeg/Piper binaries),
 -- so we use HTTP Range requests to resume after a network drop or timeout.
+-- A partial file is kept on failure so the next attempt resumes where this
+-- one stopped; a sidecar marker guards against resuming into a DIFFERENT
+-- release's bytes (same fixed dest path, new zip on the server).
 -- @tparam string url
 -- @tparam string dest path
 -- @tparam number|nil expected_size expected file size in bytes
@@ -142,10 +145,32 @@ local function downloadFile(url, dest, expected_size)
     local max_retries = 5
     local retry_count = 0
 
+    -- Stale-partial guard: only resume a previous partial when it was
+    -- downloaded against the same expected size.
+    local marker = dest .. ".expected"
+    if expected_size then
+        local mf = io.open(marker, "r")
+        local marker_val = mf and mf:read("*a")
+        if mf then mf:close() end
+        if marker_val ~= tostring(expected_size) then
+            if lfs.attributes(dest) then
+                logger.warn("Updater: discarding stale partial download",
+                    "(marker:", tostring(marker_val), "expected:", expected_size, ")")
+                os.remove(dest)
+            end
+            local wf = io.open(marker, "w")
+            if wf then
+                wf:write(tostring(expected_size))
+                wf:close()
+            end
+        end
+    end
+
     while true do
         local attr = lfs.attributes(dest)
         local existing_size = (attr and attr.size) or 0
         if existing_size > 0 and expected_size and existing_size >= expected_size then
+            os.remove(marker)
             return true
         end
 
@@ -195,15 +220,18 @@ local function downloadFile(url, dest, expected_size)
                     return false, _("Server does not support resume")
                 end
             elseif not expected_size then
+                os.remove(marker)
                 return true
             elseif bytes_after >= expected_size then
+                os.remove(marker)
                 return true
             elseif bytes_after == bytes_before then
                 logger.warn("Updater: no download progress, retrying", bytes_after)
                 retry_count = retry_count + 1
                 if retry_count > max_retries then
-                    os.remove(dest)
-                    return false, T(_("Download stalled at %1 bytes"), tostring(bytes_after))
+                    -- Keep the partial file: the next attempt resumes here.
+                    return false, T(_("Download stalled at %1 bytes.\nTrying again will resume from that point."),
+                        tostring(bytes_after))
                 end
             else
                 retry_count = 0
@@ -212,8 +240,9 @@ local function downloadFile(url, dest, expected_size)
             logger.warn("Updater: download request failed:", tostring(code or status), "size:", bytes_after)
             retry_count = retry_count + 1
             if retry_count > max_retries then
-                os.remove(dest)
-                return false, T(_("Download failed: %1"), tostring(code or status or "no response"))
+                -- Keep the partial file: the next attempt resumes here.
+                return false, T(_("Download failed (%1) at %2 bytes.\nTrying again will resume from that point."),
+                    tostring(code or status or "no response"), tostring(bytes_after))
             end
         end
 
@@ -367,10 +396,14 @@ function Updater._performUpdate(plugin, release)
         local actual_size = attr and attr.size or 0
         if actual_size ~= release.zip_size then
             logger.warn("Updater: downloaded zip size mismatch: expected", release.zip_size, "got", actual_size)
+            -- Delete: a completed-but-wrong file cannot be trusted and would
+            -- otherwise satisfy the resume check forever (actual >= expected).
             os.remove(zip_path)
+            os.remove(zip_path .. ".expected")
             UIManager:show(InfoMessage:new{
-                text = T(_("Download incomplete: expected %1 bytes, got %2"),
+                text = T(_("Download incomplete: expected %1 bytes, got %2.\n\nPlease try again, or install manually: download the release zip from GitHub and copy audiobook.koplugin to your plugins folder."),
                          tostring(release.zip_size), tostring(actual_size)),
+                timeout = 10,
             })
             return
         end
@@ -481,6 +514,7 @@ function Updater._performUpdate(plugin, release)
     -- we created it (it is normally absent and the plugin should not leave
     -- it behind after an update).
     os.remove(zip_path)
+    os.remove(zip_path .. ".expected")
     if created_ext_tmp then
         os.execute('rmdir "' .. tmp_dir .. '" 2>/dev/null')
     end
