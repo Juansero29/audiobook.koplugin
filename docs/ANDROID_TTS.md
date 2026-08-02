@@ -239,9 +239,13 @@ cd android/
   character-proportional heuristic as other backends, scaled to the real WAV
   duration.
 
-- **Voice selection:** Currently defaults to `Locale.US`. The `setLanguage()`
-  method is exposed but there is no UI for browsing installed TTS voices or
-  engines. This can be added through `TextToSpeech.getVoices()`.
+- **Voice/language selection:** The plugin resolves the TTS language per
+  chunk: an explicit override from Voice settings → "Android TTS language"
+  wins; otherwise CJK text is detected by script (Han/kana/hangul byte
+  ranges) and everything else falls back to the book's language metadata,
+  then en-US. `setLanguage()` is only called when the language changes.
+  There is still no UI for browsing installed TTS voices or engines; this
+  can be added through `TextToSpeech.getVoices()`.
 
 - **Init latency:** The Android TTS engine takes 100-500ms to initialize on
   first use. `detectBackend()` waits up to 3 seconds. Subsequent sentences

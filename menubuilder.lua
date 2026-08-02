@@ -189,6 +189,29 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         })
     end
 
+    -- Android TTS language override (backend defaults to auto-detection:
+    -- CJK script per chunk, else book metadata; issue #45).
+    if plugin.tts_engine
+       and plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ANDROID then
+        table.insert(menu, {
+            text_func = function()
+                local lang = plugin:getSetting("android_tts_language", "auto")
+                if lang == "auto" then
+                    return T(_("Android TTS language: %1"), _("Auto-detect"))
+                end
+                return T(_("Android TTS language: %1"), lang)
+            end,
+            sub_item_table_func = function()
+                return MenuBuilder.buildAndroidTtsLanguageMenu(plugin)
+            end,
+            help_text = _(
+                "Auto-detect picks the voice from the text script (Chinese, "
+                .. "Japanese, Korean) or the book's language metadata. "
+                .. "Choose a specific language to override detection."
+            ),
+        })
+    end
+
     -- Speech rate submenu
     table.insert(menu, {
         text_func = function()
@@ -898,6 +921,46 @@ function MenuBuilder.buildPiperVoiceMenu(plugin)
         })
     end
 
+    return menu
+end
+
+--[[--
+Build Android TTS language menu (auto-detect + common overrides).
+--]]
+function MenuBuilder.buildAndroidTtsLanguageMenu(plugin)
+    local choices = {
+        { id = "auto",  label = _("Auto-detect (script + book language)") },
+        { id = "en-US", label = "English (US)" },
+        { id = "en-GB", label = "English (UK)" },
+        { id = "zh-CN", label = "Chinese (Simplified)" },
+        { id = "zh-TW", label = "Chinese (Traditional)" },
+        { id = "ja-JP", label = "Japanese" },
+        { id = "ko-KR", label = "Korean" },
+        { id = "fr-FR", label = "French" },
+        { id = "de-DE", label = "German" },
+        { id = "es-ES", label = "Spanish" },
+        { id = "it-IT", label = "Italian" },
+        { id = "pt-BR", label = "Portuguese (Brazil)" },
+        { id = "ru-RU", label = "Russian" },
+    }
+    local menu = {}
+    for _, choice in ipairs(choices) do
+        table.insert(menu, {
+            text = choice.label,
+            checked_func = function()
+                return plugin:getSetting("android_tts_language", "auto") == choice.id
+            end,
+            callback = function()
+                plugin:setSetting("android_tts_language", choice.id)
+                -- Force re-application (and re-warning) on the next chunk
+                if plugin.tts_engine then
+                    plugin.tts_engine._android_tts_lang = nil
+                    plugin.tts_engine._android_lang_warned = nil
+                end
+            end,
+            radio = true,
+        })
+    end
     return menu
 end
 

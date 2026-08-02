@@ -43,6 +43,7 @@ local _inkview_audio  -- loaded lazily on first PB InkView use
 local logger = require("logger")
 local time = require("ui/time")
 local _ = require("gettext")
+local T = require("ffi/util").template
 -- Shared utility modules (DRY: extracted from ttsengine, synccontroller, main)
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local Utils = dofile(_utils_dir .. "utils.lua")
@@ -1292,6 +1293,72 @@ Runs asynchronously via UIManager:scheduleIn so the UI stays responsive.
 @param callback function Callback(success, timing_data)
 @return nil  (async -- caller should not treat as immediate failure)
 --]]
+-- CJK script detection as raw UTF-8 byte patterns (no unicode library):
+--   Han U+4E00-U+9FFF:      lead byte E4-E9 + two continuation bytes
+--   Kana U+3040-U+30FF:     E3 + 81-83 + continuation byte
+--   Hangul U+AC00-U+D7A3:   lead byte EA-ED + two continuation bytes
+-- These blocks are disjoint, so match order between them does not matter.
+local RE_HAN    = "[\228-\233][\128-\191][\128-\191]"
+local RE_KANA   = "\227[\129-\131][\128-\191]"
+local RE_HANGUL = "[\234-\237][\128-\191][\128-\191]"
+
+--[[--
+Book language from document metadata (EPUB dc:language etc.), normalized to
+a BCP-47 tag usable with Android's Locale.forLanguageTag.  Bare CJK tags get
+a region because Google's TTS needs one to pick a voice.  Cached per engine
+instance (the engine is recreated per document).
+@return string|nil
+--]]
+function TTSEngine:_androidBookLanguage()
+    if self._android_book_lang ~= nil then
+        return self._android_book_lang or nil
+    end
+    local lang
+    pcall(function()
+        local doc = self.plugin and self.plugin.ui and self.plugin.ui.document
+        local props = doc and doc.getProps and doc:getProps()
+        lang = props and props.language
+    end)
+    if type(lang) ~= "string" then lang = nil end
+    if lang then
+        lang = lang:lower():gsub("_", "-"):match("^%s*(.-)%s*$")
+        if lang == "" then lang = nil end
+    end
+    local aliases = { zh = "zh-CN", ja = "ja-JP", ko = "ko-KR", en = "en-US" }
+    if lang and aliases[lang] then lang = aliases[lang] end
+    self._android_book_lang = lang or false
+    logger.dbg("TTSEngine: Android book language =", lang or "(unknown)")
+    return lang
+end
+
+--[[--
+Resolve the Android TTS language for one text chunk.
+Priority: explicit user setting > CJK script detection > book metadata >
+"en-US".  Han characters are shared between Chinese and Japanese, so the
+book language breaks the tie; kana and hangul are unambiguous on their own.
+@param text string
+@return string  BCP-47 tag
+--]]
+function TTSEngine:_androidChunkLanguage(text)
+    local override = self.plugin
+        and self.plugin:getSetting("android_tts_language", "auto")
+    if override and override ~= "auto" then
+        return override
+    end
+    local book = self:_androidBookLanguage()
+    if text:find(RE_KANA) then return "ja-JP" end
+    if text:find(RE_HANGUL) then return "ko-KR" end
+    if text:find(RE_HAN) then
+        if book == "ja-JP" then return "ja-JP" end
+        if book and (book:find("^zh%-tw") or book:find("^zh%-hant")
+                or book:find("^zh%-hk") or book:find("^zh%-mo")) then
+            return "zh-TW"
+        end
+        return "zh-CN"
+    end
+    return book or "en-US"
+end
+
 function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     local atts = self._android_tts
     if not atts then
@@ -1305,6 +1372,28 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     -- around 1.0.  Map 0-99 to 0.5-2.0 range.
     local android_pitch = 0.5 + ((self.pitch or 50) / 99) * 1.5
     atts:setPitch(android_pitch)
+    -- Language: the Java helper initializes with Locale.US and nothing ever
+    -- changed it, so non-English books were read with the en-US voice or
+    -- stayed silent (issue #45).  Resolve per chunk (manual override > CJK
+    -- script detection > book metadata) and only cross JNI when the
+    -- language actually changes.
+    local chunk_lang = self:_androidChunkLanguage(text)
+    if chunk_lang and chunk_lang ~= self._android_tts_lang then
+        local res = atts:setLanguage(chunk_lang)
+        self._android_tts_lang = chunk_lang
+        logger.dbg("TTSEngine: Android TTS language =", chunk_lang, "result:", res)
+        if res and res < 0 and not self._android_lang_warned then
+            -- LANG_MISSING_DATA / LANG_NOT_SUPPORTED: voice data not
+            -- installed for this language in the system TTS engine.
+            self._android_lang_warned = true
+            logger.err("TTSEngine: Android TTS setLanguage(", chunk_lang,
+                ") failed, code:", res)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Android TTS: no voice available for %1.\nInstall the matching voice data in Android's Text-to-speech settings, or pick a different language in Voice settings."), chunk_lang),
+                timeout = 8,
+            })
+        end
+    end
     logger.dbg("TTSEngine: Android TTS pipeline for:", text:sub(1, 60))
     -- Dispatch synth-then-play pipeline.  The Java side synthesizes the
     -- WAV and starts MediaPlayer automatically, without needing a Lua
