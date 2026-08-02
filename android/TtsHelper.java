@@ -4,6 +4,8 @@ import android.content.Context;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 
@@ -16,11 +18,26 @@ import java.util.Locale;
  * Provides a polling-friendly API so Lua (via JNI) does not need to
  * implement Java callback interfaces.  All callbacks update volatile
  * status fields that Lua reads via getInitStatus() / getSynthStatus().
+ *
+ * Threading: all MediaPlayer work (create, prepare, start, stop, release)
+ * runs on a dedicated HandlerThread.  Two kinds of callers must never
+ * touch MediaPlayer directly:
+ *   - the TTS utterance callback thread (onDone/onError): doing blocking
+ *     media work there can deadlock against the TTS engine's own audio
+ *     output, which is exactly what users reported as "one syllable, then
+ *     KOReader hard-locks" (issue #44);
+ *   - the Android main thread (Lua JNI calls): a wedged mediaserver call
+ *     would otherwise freeze the whole UI.
+ * JNI-facing stop/pause/resume methods therefore only post to the playback
+ * thread; volatile status fields are still updated synchronously so Lua's
+ * polling semantics do not change.
  */
 public class TtsHelper implements TextToSpeech.OnInitListener {
 
     private TextToSpeech tts;
     private AudioManager audioManager;
+    private final HandlerThread playbackThread;
+    private final Handler playbackHandler;
 
     /** -1 = pending, 0 = SUCCESS, non-zero = error */
     private volatile int initStatus = -1;
@@ -34,8 +51,14 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     private volatile int pipelineDurationMs = 0;
     private volatile boolean pipelineActive = false;
     private volatile String pendingPlayFile = null;
+    /** File of the currently active pipeline; stale posted starts compare
+     *  against it so a stop or a newer pipeline cancels them. */
+    private volatile String pipelineFile = null;
 
     public TtsHelper(Context context) {
+        playbackThread = new HandlerThread("audiobook-playback");
+        playbackThread.start();
+        playbackHandler = new Handler(playbackThread.getLooper());
         tts = new TextToSpeech(context, this);
         audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
     }
@@ -52,18 +75,32 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 @Override
                 public void onDone(String utteranceId) {
                     synthStatus = 1;
-                    // Pipeline mode: auto-start playback when synthesis finishes
+                    // Pipeline mode: auto-start playback when synthesis finishes.
+                    // Do NOT call startPlayback() here: this callback thread
+                    // belongs to the TTS engine, and blocking media calls on it
+                    // can deadlock the engine (issue #44).  Post to the
+                    // playback thread and return immediately.
                     if (pipelineActive && pendingPlayFile != null) {
-                        String path = pendingPlayFile;
+                        final String path = pendingPlayFile;
                         pendingPlayFile = null;
-                        int dur = startPlayback(path);
-                        if (dur >= 0) {
-                            pipelineDurationMs = dur;
-                            pipelineStatus = 1;  // playing
-                        } else {
-                            pipelineStatus = 3;  // error
-                            pipelineActive = false;
-                        }
+                        playbackHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                // A stopPipeline() or a newer pipeline may
+                                // have been dispatched after this was posted.
+                                if (!pipelineActive || !path.equals(pipelineFile)) {
+                                    return;
+                                }
+                                int dur = startPlayback(path);
+                                if (dur >= 0) {
+                                    pipelineDurationMs = dur;
+                                    pipelineStatus = 1;  // playing
+                                } else {
+                                    pipelineStatus = 3;  // error
+                                    pipelineActive = false;
+                                }
+                            }
+                        });
                     }
                 }
 
@@ -148,6 +185,13 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
             tts.shutdown();
             tts = null;
         }
+        // Drain pending playback work, then stop the thread.
+        playbackHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                playbackThread.quitSafely();
+            }
+        });
     }
 
     // --- Audio focus ---
@@ -186,6 +230,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         pipelineStatus = 0;  // synthesizing
         pipelineDurationMs = 0;
         pendingPlayFile = filePath;
+        pipelineFile = filePath;
         synthStatus = 0;
 
         File file = new File(filePath);
@@ -223,6 +268,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     /** Cancel the pipeline (synthesis and/or playback) and release audio focus. */
     public void stopPipeline() {
         pendingPlayFile = null;
+        pipelineFile = null;
         boolean wasSynthesizing = pipelineActive && pipelineStatus == 0;
         pipelineActive = false;
         pipelineStatus = -1;
@@ -244,6 +290,10 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
      * If a pipeline is active, it is cancelled first (direct playFile
      * implies the caller is bypassing the pipeline).
      * Returns the duration in ms, or -1 on error.
+     *
+     * NOTE: legacy direct API, not used by the synth-then-play pipeline.
+     * It runs startPlayback() on the caller's thread; prefer the pipeline
+     * for anything user-facing.
      */
     public int playFile(String path) {
         if (pipelineActive) {
@@ -257,10 +307,11 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /**
      * Internal: start MediaPlayer on a file.  Used by both playFile()
-     * (direct) and the pipeline's auto-play callback.
+     * (direct) and the pipeline's auto-play callback.  Runs on the
+     * playback HandlerThread except in the legacy playFile() path.
      */
     private int startPlayback(String path) {
-        stopPlayback();
+        stopPlaybackInternal();
         playbackDone = false;
         requestAudioFocus();
         synchronized (mpLock) {
@@ -319,8 +370,22 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         return playbackDone;
     }
 
-    /** Stop and release the MediaPlayer. */
+    /**
+     * Stop and release the MediaPlayer (JNI entry point).
+     * Only posts to the playback thread; the main thread must never block
+     * in MediaPlayer calls (issue #44).
+     */
     public void stopPlayback() {
+        playbackHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                stopPlaybackInternal();
+            }
+        });
+    }
+
+    /** Stop and release the MediaPlayer.  Runs on the playback thread. */
+    private void stopPlaybackInternal() {
         synchronized (mpLock) {
             if (mediaPlayer != null) {
                 // Clear listeners BEFORE release to prevent callbacks from
@@ -343,25 +408,35 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         abandonAudioFocus();
     }
 
-    /** Pause audio playback. */
+    /** Pause audio playback (JNI entry point: posted, never blocks). */
     public void pausePlayback() {
-        synchronized (mpLock) {
-            try {
-                if (mediaPlayer != null && mediaPlayer.isPlaying()) {
-                    mediaPlayer.pause();
+        playbackHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (mpLock) {
+                    try {
+                        if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                            mediaPlayer.pause();
+                        }
+                    } catch (IllegalStateException ignored) {}
                 }
-            } catch (IllegalStateException ignored) {}
-        }
+            }
+        });
     }
 
-    /** Resume audio playback after pause. */
+    /** Resume audio playback after pause (JNI entry point: posted). */
     public void resumePlayback() {
-        synchronized (mpLock) {
-            try {
-                if (mediaPlayer != null && !mediaPlayer.isPlaying()) {
-                    mediaPlayer.start();
+        playbackHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (mpLock) {
+                    try {
+                        if (mediaPlayer != null && !mediaPlayer.isPlaying()) {
+                            mediaPlayer.start();
+                        }
+                    } catch (IllegalStateException ignored) {}
                 }
-            } catch (IllegalStateException ignored) {}
-        }
+            }
+        });
     }
 }
