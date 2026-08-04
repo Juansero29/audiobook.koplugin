@@ -1253,9 +1253,6 @@ function SyncController:_prefetchNextPage()
 end
 
 --[[--
-Show the playback control bar.
---]]
---[[--
 Reserve the playback bar's height in the document's bottom margin so the bar
 never covers book text: the page reflows to end just above the bar.
 
@@ -1311,6 +1308,9 @@ function SyncController:_releaseBarSpace()
     end
 end
 
+--[[--
+Show the playback control bar.
+--]]
 function SyncController:showPlaybackBar()
     if self.playback_bar then
         self:hidePlaybackBar()
@@ -1321,6 +1321,8 @@ function SyncController:showPlaybackBar()
 
     self.playback_bar = PlaybackBar:new{
         sync_controller = self,
+        show_progress = not (self.plugin
+            and self.plugin:getSetting("hide_tts_progress_bar", false)),
         on_play_pause = function()
             if self:isPlaying() then
                 self:pause()
