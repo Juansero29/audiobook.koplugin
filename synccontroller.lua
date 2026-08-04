@@ -139,7 +139,11 @@ function SyncController:start(text)
     -- settles (the same scheduleIn pattern advanceToNextPage uses).  On page
     -- advances the bar already exists / the margin is already reserved, so
     -- there is no reflow, no defer, and prefetched text stays valid.
-    if not self.playback_bar then
+    -- Remember whether WE created the bar: if the page turns out to have no
+    -- readable text, _beginReading removes it again (it did not exist before
+    -- this start, so it should not linger).
+    local created_bar = not self.playback_bar
+    if created_bar then
         local was_reserved = self._bar_space_reserved
         self:showPlaybackBar()
         if self._bar_space_reserved and not was_reserved
@@ -156,13 +160,13 @@ function SyncController:start(text)
                         #text, "->", #fresh, "chars)")
                     text = fresh
                 end
-                controller:_beginReading(text)
+                controller:_beginReading(text, created_bar)
             end)
             return
         end
     end
 
-    self:_beginReading(text)
+    self:_beginReading(text, created_bar)
 end
 
 --[[--
@@ -170,14 +174,21 @@ Parse the (settled) page text and begin sentence playback.  Split out of
 start() so the initial margin reflow can settle before we capture and read
 the page (see the deferral in start()).
 @param text string The text to read
+@param created_bar boolean  true when start() created the bar for this call
 --]]
-function SyncController:_beginReading(text)
+function SyncController:_beginReading(text, created_bar)
     -- Parse the full text into sentences and words
     self.parsed_data = self.text_parser:parse(text)
 
     if not self.parsed_data or #self.parsed_data.sentences == 0 then
         logger.warn("SyncController: No sentences found in text")
         self.state = self.STATE.STOPPED
+        -- Nothing to read on this page: remove the bar we just created so it
+        -- does not linger (and release the reserved margin) on image-only
+        -- pages.
+        if created_bar then
+            self:hidePlaybackBar()
+        end
         local InfoMessage = require("ui/widget/infomessage")
         UIManager:show(InfoMessage:new{
             text = "No readable text found on this page.",
