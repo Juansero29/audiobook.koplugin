@@ -3710,7 +3710,14 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             self.current_audio_file
         )
     else
-        play_cmd = string.format('%s "%s"', player, self.current_audio_file)
+        -- If a previous wav-play crash proved this device needs software
+        -- conversion (fixed-config ALSA chain), apply it from the start.
+        local conv_flags = ""
+        if self._wav_play_needs_conversion and self._wav_play_cmd
+                and player == self._wav_play_cmd then
+            conv_flags = " --rate 48000 --channels 2"
+        end
+        play_cmd = string.format('%s%s "%s"', player, conv_flags, self.current_audio_file)
         self._concat_durations = nil
     end
 
@@ -5697,7 +5704,7 @@ for rotation, taps, and other input events.
 
 @param bt_retry_allowed boolean Whether BT early-death retry is allowed
 --]]
-function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail)
+function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_retried)
     local my_gen = self.play_generation or 0
     local launch_time = UIManager:getTime()
     -- Real BT connection failures exit in <200ms (no A2DP sink).
@@ -5810,6 +5817,89 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail)
                     engine:onPlaybackComplete()
                 end
             else
+                -- Crash detection: a player that dies on an ALSA assertion
+                -- or abort still exits "naturally" from the process table's
+                -- point of view, so without this check a crashing player
+                -- looks like normal completion and the book keeps "reading"
+                -- silently (PocketBook tts_sm empty-interval assertion).
+                local player_stderr = nil
+                if engine._gst_status_file then
+                    local sf = io.open(engine._gst_status_file, "r")
+                    if sf then
+                        player_stderr = sf:read("*a") or ""
+                        sf:close()
+                    end
+                end
+                local crashed = player_stderr and (
+                    player_stderr:find("Assertion")
+                    or player_stderr:find("assert failed")
+                    or player_stderr:find("Segmentation")
+                    or player_stderr:find("Aborted"))
+
+                -- wav-play crash: retry once with software conversion to
+                -- 48000 Hz stereo.  PocketBook's tts_sm chain (softvol ->
+                -- nested plug -> dmix fixed at 48000/S16_LE/2ch) can abort
+                -- alsa-lib when the nested plug wrappers refine an
+                -- unsupported rate; matching the chain's native config in
+                -- software sidesteps the buggy negotiation entirely.
+                if crashed and not conv_retried
+                        and engine.audio_player_type == "aplay"
+                        and engine._wav_play_cmd
+                        and engine.current_audio_file then
+                    logger.err("TTSEngine: wav-play crashed (",
+                        player_stderr:match("Assertion[^\n]*") or "assertion/abort",
+                        ") — retrying with software conversion to 48000 Hz stereo")
+                    os.remove(engine._gst_status_file)
+                    local retry_pid_cmd = string.format(
+                        '%s --rate 48000 --channels 2 "%s" >/dev/null 2>>%s & echo $!',
+                        engine._wav_play_cmd, engine.current_audio_file,
+                        engine._gst_status_file)
+                    engine._last_pid_cmd = retry_pid_cmd
+                    local handle = io.popen(retry_pid_cmd)
+                    local pid_str = handle and handle:read("*a") or ""
+                    if handle then handle:close() end
+                    engine.audio_pid = tonumber(pid_str:match("(%d+)"))
+                    engine._audio_launched_at = UIManager:getTime()
+                    engine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, true)
+                    return
+                end
+
+                if crashed then
+                    engine._player_crash_count = (engine._player_crash_count or 0) + 1
+                    logger.err("TTSEngine: audio player crashed (count:",
+                        engine._player_crash_count, "), stderr:",
+                        player_stderr:sub(1, 300))
+                    if engine._player_crash_count >= 3 then
+                        engine._player_crash_count = 0
+                        engine.is_speaking = false
+                        engine.audio_pid = nil
+                        engine.play_generation = (engine.play_generation or 0) + 1
+                        engine:cleanup()
+                        UIManager:show(InfoMessage:new{
+                            text = _("The audio player keeps crashing, playback was stopped.")
+                                .. "\n\n" .. _("Last error:") .. " "
+                                .. player_stderr:sub(1, 200)
+                                .. "\n\n" .. _("Please generate a bug report (Audiobook > Generate bug report) and share it on GitHub."),
+                            timeout = 12,
+                        })
+                        if engine.on_fail_callback then
+                            engine.on_fail_callback()
+                        end
+                        return
+                    end
+                    -- Skip this sentence; the chain continues and the next
+                    -- sentence may succeed (or the counter escalates).
+                    engine:onPlaybackComplete()
+                    return
+                end
+
+                -- Conversion retry succeeded: use it directly from now on so
+                -- later sentences do not pay the crash-and-retry cost.
+                if conv_retried then
+                    engine._wav_play_needs_conversion = true
+                    logger.warn("TTSEngine: software conversion works on this device, using it for subsequent playback")
+                end
+
                 -- Normal completion (process streamed successfully then exited)
                 -- Detect rapid failure: if aplay exits in < 200ms and we have
                 -- no real audio output (no soundcard), this is likely an instant
@@ -5862,6 +5952,7 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail)
                 else
                     -- Successful playback (or at least not instant failure)
                     engine._rapid_fail_count = 0
+                    engine._player_crash_count = 0
                 end
                 logger.warn("TTSEngine: Process watcher → normal completion, elapsed=", elapsed_ms, "ms")
 

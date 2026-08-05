@@ -16,6 +16,12 @@
  *
  * Supports -q (quiet), -D <device> (ALSA PCM device name),
  * --no-mixer (skip hw:0 mixer setup/restore).
+ * --rate <Hz> / --channels <N>: convert 16-bit PCM in software before
+ * playback (linear resample, mono<->stereo).  Used as a fallback on
+ * devices whose ALSA chain is fixed to one configuration and crashes
+ * during plug negotiation (PocketBook tts_sm -> softvol -> plug -> dmix
+ * chains can die on "Assertion `!snd_interval_empty(i)' failed" when the
+ * nested plug wrappers try to refine an unsupported rate).
  * Uses only ALSA 0.9.x-era functions for maximum compatibility.
  *
  * Build: $CC -O2 -o wav-play wav-play.c -lasound
@@ -186,6 +192,8 @@ int main(int argc, char **argv)
     const char *filename = NULL;
     int quiet = 0;
     int no_mixer = 0;
+    unsigned force_rate = 0;     /* --rate: software-resample target */
+    unsigned force_channels = 0; /* --channels: software-convert target */
 
     /* Parse arguments (aplay-compatible subset) */
     for (int i = 1; i < argc; i++) {
@@ -195,6 +203,10 @@ int main(int argc, char **argv)
             quiet = 1;
         else if (strcmp(argv[i], "--no-mixer") == 0)
             no_mixer = 1;
+        else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc)
+            force_rate = (unsigned)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--channels") == 0 && i + 1 < argc)
+            force_channels = (unsigned)atoi(argv[++i]);
         else if (argv[i][0] != '-')
             filename = argv[i];
     }
@@ -256,6 +268,92 @@ int main(int argc, char **argv)
                             hdr.bits_per_sample);
         fclose(f);
         return 1;
+    }
+
+    /* Effective stream parameters: normally the WAV's own, but --rate /
+     * --channels force software conversion (see header comment).  Converting
+     * to the chain's native config lets us request exactly the supported
+     * parameters, which avoids the nested-plug refinement crash on
+     * PocketBook's tts_sm chain (alsa-lib assertion on empty interval). */
+    unsigned eff_rate = hdr.sample_rate;
+    unsigned eff_channels = hdr.channels;
+    unsigned eff_bits = hdr.bits_per_sample;
+    snd_pcm_format_t eff_format = format;
+    int16_t *conv_buf = NULL;   /* converted PCM, when converting */
+    uint32_t conv_frames = 0;
+
+    int need_convert = (force_rate > 0 && force_rate != hdr.sample_rate)
+                    || (force_channels > 0 && force_channels != hdr.channels);
+    if (need_convert) {
+        if (hdr.bits_per_sample != 16) {
+            if (!quiet)
+                fprintf(stderr, "wav-play: --rate/--channels conversion supports only 16-bit PCM\n");
+            fclose(f);
+            return 3;
+        }
+        eff_rate = force_rate > 0 ? force_rate : hdr.sample_rate;
+        eff_channels = force_channels > 0 ? force_channels : hdr.channels;
+        eff_format = SND_PCM_FORMAT_S16_LE;
+        eff_bits = 16;
+
+        uint32_t in_frames = chunk_size / (hdr.channels * 2);
+        int16_t *in = malloc(chunk_size > 0 ? chunk_size : 2);
+        if (!in) { fclose(f); return 1; }
+        if (fread(in, 2, (size_t)in_frames * hdr.channels, f)
+                != (size_t)in_frames * hdr.channels) {
+            if (!quiet) fprintf(stderr, "wav-play: short read for conversion\n");
+            free(in);
+            fclose(f);
+            return 1;
+        }
+
+        /* Channel conversion first (mono<->stereo, generic N->M fallback) */
+        const int16_t *ch_src = in;
+        int16_t *ch_buf = NULL;
+        if (eff_channels != hdr.channels) {
+            ch_buf = malloc((size_t)in_frames * eff_channels * 2);
+            if (!ch_buf) { free(in); fclose(f); return 1; }
+            for (uint32_t i = 0; i < in_frames; i++) {
+                if (hdr.channels == 1 && eff_channels == 2) {
+                    ch_buf[2*i] = ch_buf[2*i+1] = in[i];
+                } else if (hdr.channels == 2 && eff_channels == 1) {
+                    ch_buf[i] = (int16_t)(((int)in[2*i] + (int)in[2*i+1]) / 2);
+                } else {
+                    for (unsigned c = 0; c < eff_channels; c++)
+                        ch_buf[i*eff_channels+c] =
+                            c < hdr.channels ? in[i*hdr.channels+c] : 0;
+                }
+            }
+            ch_src = ch_buf;
+        }
+
+        /* Linear resample (per channel, fixed-point position) */
+        if (eff_rate != hdr.sample_rate) {
+            conv_frames = (uint32_t)(((uint64_t)in_frames * eff_rate) / hdr.sample_rate);
+            conv_buf = malloc((size_t)conv_frames * eff_channels * 2);
+            if (!conv_buf) { free(ch_buf); free(in); fclose(f); return 1; }
+            for (uint32_t i = 0; i < conv_frames; i++) {
+                uint64_t pos = (uint64_t)i * hdr.sample_rate;
+                uint32_t i0 = (uint32_t)(pos / eff_rate);
+                uint32_t frac = (uint32_t)(pos % eff_rate);
+                uint32_t i1 = (i0 + 1 < in_frames) ? i0 + 1 : in_frames - 1;
+                for (unsigned c = 0; c < eff_channels; c++) {
+                    int a = ch_src[i0*eff_channels + c];
+                    int b = ch_src[i1*eff_channels + c];
+                    conv_buf[i*eff_channels + c] =
+                        (int16_t)(a + (int)(((int64_t)(b - a) * frac) / (int)eff_rate));
+                }
+            }
+            free(ch_buf);
+            free(in);
+        } else {
+            /* Rate unchanged: channel conversion only (or straight copy) */
+            conv_frames = in_frames;
+            conv_buf = ch_buf ? ch_buf : in;
+        }
+        if (!quiet)
+            fprintf(stderr, "wav-play: software conversion: %u Hz/%uch -> %u Hz/%uch\n",
+                    hdr.sample_rate, hdr.channels, eff_rate, eff_channels);
     }
 
     /* Save hw:0 switch state, unmute switches, raise volume from zero.
@@ -356,15 +454,15 @@ int main(int argc, char **argv)
     snd_pcm_hw_params_alloca(&params);
     snd_pcm_hw_params_any(pcm, params);
     snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, params, format);
-    snd_pcm_hw_params_set_channels(pcm, params, hdr.channels);
+    snd_pcm_hw_params_set_format(pcm, params, eff_format);
+    snd_pcm_hw_params_set_channels(pcm, params, eff_channels);
 
-    unsigned int rate = hdr.sample_rate;
+    unsigned int rate = eff_rate;
     snd_pcm_hw_params_set_rate_near(pcm, params, &rate, NULL);
 
-    if (rate != hdr.sample_rate) {
+    if (rate != eff_rate) {
         fprintf(stderr, "wav-play: rate mismatch on '%s': requested %u Hz, got %u Hz\n",
-                opened_device, hdr.sample_rate, rate);
+                opened_device, eff_rate, rate);
 
         if (strict_device) {
             /* In strict mode, the raw device does not support the WAV's
@@ -386,11 +484,11 @@ int main(int argc, char **argv)
                 if (err >= 0) {
                     snd_pcm_hw_params_any(pcm, params);
                     snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-                    snd_pcm_hw_params_set_format(pcm, params, format);
-                    snd_pcm_hw_params_set_channels(pcm, params, hdr.channels);
-                    unsigned int plug_rate = hdr.sample_rate;
+                    snd_pcm_hw_params_set_format(pcm, params, eff_format);
+                    snd_pcm_hw_params_set_channels(pcm, params, eff_channels);
+                    unsigned int plug_rate = eff_rate;
                     snd_pcm_hw_params_set_rate_near(pcm, params, &plug_rate, NULL);
-                    if (plug_rate == hdr.sample_rate) {
+                    if (plug_rate == eff_rate) {
                         opened_device = plug_buf;
                         rate = plug_rate;
                         fprintf(stderr, "wav-play: plug: retry succeeded at %u Hz\n", rate);
@@ -414,8 +512,8 @@ int main(int argc, char **argv)
                      * resampler. */
                     fprintf(stderr,
                         "wav-play: refusing to play %u Hz audio on '%s' (no rate conversion available, would play at %.1fx speed). Try a different ALSA device.\n",
-                        hdr.sample_rate, device,
-                        (double)rate / hdr.sample_rate);
+                        eff_rate, device,
+                        (double)rate / eff_rate);
                     restore_mixer_switches(quiet);
                     fclose(f);
                     return 2;
@@ -423,8 +521,8 @@ int main(int argc, char **argv)
             } else {
                 fprintf(stderr,
                     "wav-play: refusing to play %u Hz audio on '%s' (plug device returned %u Hz, would play at %.1fx speed). Try a different ALSA device.\n",
-                    hdr.sample_rate, opened_device, rate,
-                    (double)rate / hdr.sample_rate);
+                    eff_rate, opened_device, rate,
+                    (double)rate / eff_rate);
                 snd_pcm_close(pcm);
                 restore_mixer_switches(quiet);
                 fclose(f);
@@ -451,11 +549,11 @@ int main(int argc, char **argv)
                 /* Reconfigure on the new device */
                 snd_pcm_hw_params_any(pcm, params);
                 snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-                snd_pcm_hw_params_set_format(pcm, params, format);
-                snd_pcm_hw_params_set_channels(pcm, params, hdr.channels);
-                unsigned int retry_rate = hdr.sample_rate;
+                snd_pcm_hw_params_set_format(pcm, params, eff_format);
+                snd_pcm_hw_params_set_channels(pcm, params, eff_channels);
+                unsigned int retry_rate = eff_rate;
                 snd_pcm_hw_params_set_rate_near(pcm, params, &retry_rate, NULL);
-                if (retry_rate != hdr.sample_rate) {
+                if (retry_rate != eff_rate) {
                     fprintf(stderr, "wav-play: rate mismatch persists on '%s' (%u Hz)\n",
                             try_devices[j], retry_rate);
                     snd_pcm_close(pcm);
@@ -470,7 +568,7 @@ int main(int argc, char **argv)
             }
             if (!pcm) {
                 fprintf(stderr, "wav-play: no device supports %u Hz, proceeding anyway\n",
-                        hdr.sample_rate);
+                        eff_rate);
                 /* Re-open the original device as last resort */
                 err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, 0);
                 if (err < 0) {
@@ -480,9 +578,9 @@ int main(int argc, char **argv)
                 }
                 snd_pcm_hw_params_any(pcm, params);
                 snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-                snd_pcm_hw_params_set_format(pcm, params, format);
-                snd_pcm_hw_params_set_channels(pcm, params, hdr.channels);
-                rate = hdr.sample_rate;
+                snd_pcm_hw_params_set_format(pcm, params, eff_format);
+                snd_pcm_hw_params_set_channels(pcm, params, eff_channels);
+                rate = eff_rate;
                 snd_pcm_hw_params_set_rate_near(pcm, params, &rate, NULL);
                 opened_device = device;
             }
@@ -510,11 +608,11 @@ int main(int argc, char **argv)
     if (strict_device) {
         unsigned int actual_rate = 0;
         if (snd_pcm_hw_params_get_rate(params, &actual_rate, NULL) == 0
-            && actual_rate != hdr.sample_rate) {
+            && actual_rate != eff_rate) {
             fprintf(stderr,
                 "wav-play: post-commit rate mismatch on '%s': WAV=%u Hz, device=%u Hz (would play at %.2fx speed). Refusing.\n",
-                opened_device, hdr.sample_rate, actual_rate,
-                (double)actual_rate / hdr.sample_rate);
+                opened_device, eff_rate, actual_rate,
+                (double)actual_rate / eff_rate);
             snd_pcm_close(pcm);
             restore_mixer_switches(quiet);
             fclose(f);
@@ -528,39 +626,64 @@ int main(int argc, char **argv)
     fprintf(stderr, "PLAYING\n");
     fflush(stderr);
 
-    /* Play PCM data */
-    size_t frame_size  = hdr.channels * (hdr.bits_per_sample / 8);
+    /* Play PCM data (streamed from file, or from the converted buffer) */
+    size_t frame_size  = eff_channels * (eff_bits / 8);
     size_t buf_frames  = 1024;
     unsigned char *buf = malloc(buf_frames * frame_size);
     if (!buf) {
         snd_pcm_close(pcm);
         restore_mixer_switches(quiet);
         fclose(f);
+        free(conv_buf);
         return 1;
     }
 
-    uint32_t remaining = chunk_size;
-    while (remaining > 0) {
-        size_t to_read = buf_frames * frame_size;
-        if (to_read > remaining)
-            to_read = remaining;
-
-        size_t n = fread(buf, 1, to_read, f);
-        if (n == 0)
-            break;
-        remaining -= n;
-
-        snd_pcm_sframes_t frames = n / frame_size;
-        snd_pcm_sframes_t written = snd_pcm_writei(pcm, buf, frames);
-        if (written == -EPIPE) {
-            /* Underrun - recover and retry */
-            snd_pcm_prepare(pcm);
-            written = snd_pcm_writei(pcm, buf, frames);
+    if (conv_buf) {
+        /* Software-converted path: play the whole in-memory buffer. */
+        uint32_t frames_left = conv_frames;
+        const unsigned char *p = (const unsigned char *)conv_buf;
+        while (frames_left > 0) {
+            snd_pcm_sframes_t chunk = frames_left > buf_frames
+                ? (snd_pcm_sframes_t)buf_frames : (snd_pcm_sframes_t)frames_left;
+            snd_pcm_sframes_t written = snd_pcm_writei(pcm, p, chunk);
+            if (written == -EPIPE) {
+                /* Underrun - recover and retry */
+                snd_pcm_prepare(pcm);
+                written = snd_pcm_writei(pcm, p, chunk);
+            }
+            if (written < 0) {
+                if (!quiet) fprintf(stderr, "wav-play: write error: %s\n",
+                                    snd_strerror(written));
+                break;
+            }
+            p += (size_t)written * frame_size;
+            frames_left -= written;
         }
-        if (written < 0) {
-            if (!quiet) fprintf(stderr, "wav-play: write error: %s\n",
-                                snd_strerror(written));
-            break;
+        free(conv_buf);
+    } else {
+        uint32_t remaining = chunk_size;
+        while (remaining > 0) {
+            size_t to_read = buf_frames * frame_size;
+            if (to_read > remaining)
+                to_read = remaining;
+
+            size_t n = fread(buf, 1, to_read, f);
+            if (n == 0)
+                break;
+            remaining -= n;
+
+            snd_pcm_sframes_t frames = n / frame_size;
+            snd_pcm_sframes_t written = snd_pcm_writei(pcm, buf, frames);
+            if (written == -EPIPE) {
+                /* Underrun - recover and retry */
+                snd_pcm_prepare(pcm);
+                written = snd_pcm_writei(pcm, buf, frames);
+            }
+            if (written < 0) {
+                if (!quiet) fprintf(stderr, "wav-play: write error: %s\n",
+                                    snd_strerror(written));
+                break;
+            }
         }
     }
 
