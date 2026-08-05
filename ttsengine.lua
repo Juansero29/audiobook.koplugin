@@ -1387,6 +1387,9 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     -- stayed silent (issue #45).  Resolve per chunk (manual override > CJK
     -- script detection > book metadata) and only cross JNI when the
     -- language actually changes.
+    -- Time the JNI calls: on some devices the TTS engine's binder calls can
+    -- block (issue #44); the timings pinpoint the culprit in logcat.
+    local jni_t0 = UIManager:getTime()
     local chunk_lang = self:_androidChunkLanguage(text)
     if chunk_lang and chunk_lang ~= self._android_tts_lang then
         local res = atts:setLanguage(chunk_lang)
@@ -1410,6 +1413,12 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     -- round-trip between synthesis and playback.  This keeps audio going
     -- even when the Lua event loop is throttled (app backgrounded).
     local dispatch = atts:synthesizeAndPlay(text, audio_file)
+    local jni_ms = time.to_ms(UIManager:getTime() - jni_t0)
+    if jni_ms > 300 then
+        logger.warn("TTSEngine: Android TTS JNI calls blocked for", jni_ms, "ms")
+    else
+        logger.dbg("TTSEngine: Android TTS JNI calls took", jni_ms, "ms")
+    end
     if dispatch ~= 0 then
         logger.err("TTSEngine: Android TTS pipeline dispatch failed, code:", dispatch)
         if callback then callback(false, nil) end

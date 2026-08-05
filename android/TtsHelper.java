@@ -11,6 +11,8 @@ import android.speech.tts.UtteranceProgressListener;
 
 import java.io.File;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Minimal TTS helper for the KOReader audiobook plugin.
@@ -19,25 +21,33 @@ import java.util.Locale;
  * implement Java callback interfaces.  All callbacks update volatile
  * status fields that Lua reads via getInitStatus() / getSynthStatus().
  *
- * Threading: all MediaPlayer work (create, prepare, start, stop, release)
- * runs on a dedicated HandlerThread.  Two kinds of callers must never
- * touch MediaPlayer directly:
- *   - the TTS utterance callback thread (onDone/onError): doing blocking
- *     media work there can deadlock against the TTS engine's own audio
- *     output, which is exactly what users reported as "one syllable, then
- *     KOReader hard-locks" (issue #44);
- *   - the Android main thread (Lua JNI calls): a wedged mediaserver call
- *     would otherwise freeze the whole UI.
- * JNI-facing stop/pause/resume methods therefore only post to the playback
- * thread; volatile status fields are still updated synchronously so Lua's
- * polling semantics do not change.
+ * Threading: ALL TextToSpeech and MediaPlayer calls run on a single
+ * dedicated HandlerThread.  Neither the Android main thread (Lua JNI
+ * calls) nor the TTS utterance callback thread ever touches the engine
+ * or the media server directly:
+ *
+ *   - Binder calls into the TTS service (synthesizeToFile, stop,
+ *     setLanguage, ...) block the caller when the engine process is
+ *     wedged; on the main thread that hard-freezes KOReader (issue #44).
+ *   - MediaPlayer create/prepare/start/stop block on the media server;
+ *     running them inside the TTS callback can deadlock against the
+ *     engine's own audio output (the original #44 freeze).
+ *
+ * JNI-facing methods therefore only post work to the worker thread and
+ * update volatile status fields synchronously, so Lua's polling semantics
+ * do not change.  The single worker also serializes engine operations,
+ * which keeps stop-before-next-synthesis ordering for free.
+ *
+ * The one bounded exception is setLanguage(): its result code drives a
+ * user-facing warning, so it waits on a latch with a 3 s cap.  A wedged
+ * engine turns that into a 3 s stall plus a warning, never a freeze.
  */
 public class TtsHelper implements TextToSpeech.OnInitListener {
 
     private TextToSpeech tts;
     private AudioManager audioManager;
-    private final HandlerThread playbackThread;
-    private final Handler playbackHandler;
+    private final HandlerThread workerThread;
+    private final Handler worker;
 
     /** -1 = pending, 0 = SUCCESS, non-zero = error */
     private volatile int initStatus = -1;
@@ -54,11 +64,16 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     /** File of the currently active pipeline; stale posted starts compare
      *  against it so a stop or a newer pipeline cancels them. */
     private volatile String pipelineFile = null;
+    /** Monotonic generation; posted work captured under an older
+     *  generation is dropped (a stop or a newer pipeline superseded it). */
+    private volatile int pipelineGeneration = 0;
+    /** Result of the most recent setLanguage() (TextToSpeech result code). */
+    private volatile int lastLangResult = 0;
 
     public TtsHelper(Context context) {
-        playbackThread = new HandlerThread("audiobook-playback");
-        playbackThread.start();
-        playbackHandler = new Handler(playbackThread.getLooper());
+        workerThread = new HandlerThread("audiobook-tts");
+        workerThread.start();
+        worker = new Handler(workerThread.getLooper());
         tts = new TextToSpeech(context, this);
         audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
     }
@@ -76,14 +91,12 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 public void onDone(String utteranceId) {
                     synthStatus = 1;
                     // Pipeline mode: auto-start playback when synthesis finishes.
-                    // Do NOT call startPlayback() here: this callback thread
-                    // belongs to the TTS engine, and blocking media calls on it
-                    // can deadlock the engine (issue #44).  Post to the
-                    // playback thread and return immediately.
+                    // This callback runs on a TTS engine thread; never do
+                    // media work here, just hand the file to the worker.
                     if (pipelineActive && pendingPlayFile != null) {
                         final String path = pendingPlayFile;
                         pendingPlayFile = null;
-                        playbackHandler.post(new Runnable() {
+                        worker.post(new Runnable() {
                             @Override
                             public void run() {
                                 // A stopPipeline() or a newer pipeline may
@@ -124,30 +137,38 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /**
      * Start async synthesis to a WAV file.
-     * Returns 0 on successful dispatch, -1 if TTS not ready, >0 on error.
+     * The engine call happens on the worker thread; returns 0 when the
+     * request was dispatched, -1 if TTS not ready.  Completion is reported
+     * through getSynthStatus().
      */
-    public int synthesizeToFile(String text, String filePath) {
+    public int synthesizeToFile(final String text, final String filePath) {
         if (tts == null || initStatus != TextToSpeech.SUCCESS) {
             return -1;
         }
         synthStatus = 0;
-        Bundle params = new Bundle();
-        File file = new File(filePath);
-        // Ensure parent directory exists
-        File parent = file.getParentFile();
-        if (parent != null && !parent.exists()) {
-            parent.mkdirs();
-        }
-        try {
-            // Use a unique utterance ID per call so the TTS engine treats
-            // each request as distinct.  Some engines ignore onDone for
-            // reused IDs.
-            String uttId = "audiobook_" + System.currentTimeMillis();
-            return tts.synthesizeToFile(text, params, file, uttId);
-        } catch (Exception e) {
-            synthStatus = 2;
-            return -1;
-        }
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                File file = new File(filePath);
+                File parent = file.getParentFile();
+                if (parent != null && !parent.exists()) {
+                    parent.mkdirs();
+                }
+                try {
+                    // Unique utterance ID per call so the engine treats each
+                    // request as distinct (some engines ignore onDone for
+                    // reused IDs).
+                    String uttId = "audiobook_" + System.currentTimeMillis();
+                    int result = tts.synthesizeToFile(text, new Bundle(), file, uttId);
+                    if (result != TextToSpeech.SUCCESS) {
+                        synthStatus = 2;
+                    }
+                } catch (Exception e) {
+                    synthStatus = 2;
+                }
+            }
+        });
+        return 0;
     }
 
     /** Returns -1 idle, 0 in-progress, 1 done, 2 error. */
@@ -156,40 +177,73 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     }
 
     /** Set speech rate (1.0 = normal). */
-    public void setRate(float rate) {
-        if (tts != null) {
-            tts.setSpeechRate(rate);
-        }
+    public void setRate(final float rate) {
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                if (tts != null) {
+                    try { tts.setSpeechRate(rate); } catch (Exception ignored) {}
+                }
+            }
+        });
     }
 
     /** Set pitch (1.0 = normal). */
-    public void setPitch(float pitch) {
-        if (tts != null) {
-            tts.setPitch(pitch);
-        }
-    }
-
-    /** Set language by BCP-47 tag (e.g. "en-US"). */
-    public int setLanguage(String bcp47) {
-        if (tts == null) return -1;
-        Locale locale = Locale.forLanguageTag(bcp47);
-        int result = tts.setLanguage(locale);
-        return result;
-    }
-
-    /** Release the TTS engine. */
-    public void shutdown() {
-        stopPipeline();
-        if (tts != null) {
-            tts.stop();
-            tts.shutdown();
-            tts = null;
-        }
-        // Drain pending playback work, then stop the thread.
-        playbackHandler.post(new Runnable() {
+    public void setPitch(final float pitch) {
+        worker.post(new Runnable() {
             @Override
             public void run() {
-                playbackThread.quitSafely();
+                if (tts != null) {
+                    try { tts.setPitch(pitch); } catch (Exception ignored) {}
+                }
+            }
+        });
+    }
+
+    /**
+     * Set language by BCP-47 tag (e.g. "en-US").
+     * Runs on the worker thread; the caller waits on a latch with a 3 s
+     * cap because the result code drives a user-facing warning.  Returns
+     * the TextToSpeech result code, or -1 on error/timeout.
+     */
+    public int setLanguage(String bcp47) {
+        if (tts == null) return -1;
+        final Locale locale = Locale.forLanguageTag(bcp47);
+        final CountDownLatch latch = new CountDownLatch(1);
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                int result = -1;
+                try {
+                    if (tts != null) {
+                        result = tts.setLanguage(locale);
+                    }
+                } catch (Exception ignored) {}
+                lastLangResult = result;
+                latch.countDown();
+            }
+        });
+        try {
+            if (latch.await(3, TimeUnit.SECONDS)) {
+                return lastLangResult;
+            }
+        } catch (InterruptedException ignored) {}
+        return -1;
+    }
+
+    /** Release the TTS engine (posted; the caller never blocks). */
+    public void shutdown() {
+        stopPipeline();
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                if (tts != null) {
+                    try { tts.stop(); } catch (Exception ignored) {}
+                    try { tts.shutdown(); } catch (Exception ignored) {}
+                    tts = null;
+                }
+                // Drain pending work, then stop the thread.
+                workerThread.quitSafely();
             }
         });
     }
@@ -215,17 +269,17 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /**
      * Start a combined synthesize-then-play pipeline.
-     * Synthesis runs asynchronously; when complete, playback starts
-     * automatically on the Java side (no Lua polling needed for the
-     * synth-to-play transition).
-     * Returns 0 on successful dispatch, -1 if TTS not ready, >0 on error.
+     * All engine work happens on the worker thread; this method only
+     * updates volatile state and posts.  Returns 0 when dispatched, -1 if
+     * TTS not ready.  Progress is reported through getPipelineStatus().
      */
-    public int synthesizeAndPlay(String text, String filePath) {
+    public int synthesizeAndPlay(final String text, final String filePath) {
         if (tts == null || initStatus != TextToSpeech.SUCCESS) return -1;
 
-        // Stop any current pipeline/playback
+        // Cancel the current pipeline (state only; engine stop is posted).
         stopPipeline();
 
+        final int gen = ++pipelineGeneration;
         pipelineActive = true;
         pipelineStatus = 0;  // synthesizing
         pipelineDurationMs = 0;
@@ -233,26 +287,38 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         pipelineFile = filePath;
         synthStatus = 0;
 
-        File file = new File(filePath);
-        File parent = file.getParentFile();
-        if (parent != null && !parent.exists()) parent.mkdirs();
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                if (gen != pipelineGeneration) return;  // superseded by stop/newer
+                // Engine-side stop of whatever the previous pipeline was
+                // doing, then dispatch this synthesis.
+                try { if (tts != null) tts.stop(); } catch (Exception ignored) {}
 
-        try {
-            String uttId = "pipeline_" + System.currentTimeMillis();
-            int result = tts.synthesizeToFile(text, new Bundle(), file, uttId);
-            if (result != TextToSpeech.SUCCESS) {
-                pipelineStatus = 3;
-                pipelineActive = false;
-                pendingPlayFile = null;
-                return result;
+                File file = new File(filePath);
+                File parent = file.getParentFile();
+                if (parent != null && !parent.exists()) parent.mkdirs();
+
+                try {
+                    String uttId = "pipeline_" + System.currentTimeMillis();
+                    int result = tts.synthesizeToFile(text, new Bundle(), file, uttId);
+                    if (result != TextToSpeech.SUCCESS && gen == pipelineGeneration) {
+                        pipelineStatus = 3;
+                        pipelineActive = false;
+                        pendingPlayFile = null;
+                        pipelineFile = null;
+                    }
+                } catch (Exception e) {
+                    if (gen == pipelineGeneration) {
+                        pipelineStatus = 3;
+                        pipelineActive = false;
+                        pendingPlayFile = null;
+                        pipelineFile = null;
+                    }
+                }
             }
-            return 0;
-        } catch (Exception e) {
-            pipelineStatus = 3;
-            pipelineActive = false;
-            pendingPlayFile = null;
-            return -1;
-        }
+        });
+        return 0;
     }
 
     /** Pipeline status: -1=idle, 0=synthesizing, 1=playing, 2=done OK, 3=error. */
@@ -267,6 +333,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /** Cancel the pipeline (synthesis and/or playback) and release audio focus. */
     public void stopPipeline() {
+        pipelineGeneration++;
         pendingPlayFile = null;
         pipelineFile = null;
         boolean wasSynthesizing = pipelineActive && pipelineStatus == 0;
@@ -274,7 +341,12 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         pipelineStatus = -1;
         pipelineDurationMs = 0;
         if (wasSynthesizing && tts != null) {
-            tts.stop();
+            worker.post(new Runnable() {
+                @Override
+                public void run() {
+                    try { if (tts != null) tts.stop(); } catch (Exception ignored) {}
+                }
+            });
         }
         stopPlayback();
     }
@@ -306,9 +378,8 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     }
 
     /**
-     * Internal: start MediaPlayer on a file.  Used by both playFile()
-     * (direct) and the pipeline's auto-play callback.  Runs on the
-     * playback HandlerThread except in the legacy playFile() path.
+     * Internal: start MediaPlayer on a file.  Runs on the worker thread
+     * except in the legacy playFile() path.
      */
     private int startPlayback(String path) {
         stopPlaybackInternal();
@@ -372,11 +443,11 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /**
      * Stop and release the MediaPlayer (JNI entry point).
-     * Only posts to the playback thread; the main thread must never block
+     * Only posts to the worker thread; the main thread must never block
      * in MediaPlayer calls (issue #44).
      */
     public void stopPlayback() {
-        playbackHandler.post(new Runnable() {
+        worker.post(new Runnable() {
             @Override
             public void run() {
                 stopPlaybackInternal();
@@ -384,7 +455,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         });
     }
 
-    /** Stop and release the MediaPlayer.  Runs on the playback thread. */
+    /** Stop and release the MediaPlayer.  Runs on the worker thread. */
     private void stopPlaybackInternal() {
         synchronized (mpLock) {
             if (mediaPlayer != null) {
@@ -410,7 +481,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /** Pause audio playback (JNI entry point: posted, never blocks). */
     public void pausePlayback() {
-        playbackHandler.post(new Runnable() {
+        worker.post(new Runnable() {
             @Override
             public void run() {
                 synchronized (mpLock) {
@@ -426,7 +497,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /** Resume audio playback after pause (JNI entry point: posted). */
     public void resumePlayback() {
-        playbackHandler.post(new Runnable() {
+        worker.post(new Runnable() {
             @Override
             public void run() {
                 synchronized (mpLock) {
