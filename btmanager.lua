@@ -796,25 +796,23 @@ local function findBluealsaBin()
     -- Same directory structure as espeak-ng: plugin_dir/bluealsa/bin/bluealsa
     local info = debug.getinfo(1, "S")
     local plugin_dir = info.source:match("^@(.*/)[^/]*$") or "./"
-    local candidates = {
-        plugin_dir .. "bluealsa/bin/bluealsa",
-        plugin_dir .. "bluealsa/bin/bluealsa.bin",
-    }
-    for _, p in ipairs(candidates) do
-        local f = io.open(p, "r")
-        if f then
-            f:close()
-            -- Rename .bin → original if needed (Windows extraction workaround)
-            if p:match("%.bin$") then
-                local orig = p:gsub("%.bin$", "")
-                os.rename(p, orig)
-                os.execute("chmod +x " .. orig .. " 2>/dev/null")
-                p = orig
-            end
-            bluealsa_bin = p
-            logger.warn("BTManager: found bundled bluealsa at", p)
-            return bluealsa_bin
-        end
+    local bin_path = plugin_dir .. "bluealsa/bin/bluealsa.bin"
+    local orig_path = plugin_dir .. "bluealsa/bin/bluealsa"
+    -- If both exist (after a plugin update), the freshly shipped .bin is
+    -- always the newer build: replace the stale renamed binary.
+    local bf = io.open(bin_path, "r")
+    if bf then
+        bf:close()
+        os.remove(orig_path)
+        os.rename(bin_path, orig_path)
+        os.execute("chmod +x " .. orig_path .. " 2>/dev/null")
+    end
+    local f = io.open(orig_path, "r")
+    if f then
+        f:close()
+        bluealsa_bin = orig_path
+        logger.warn("BTManager: found bundled bluealsa at", orig_path)
+        return bluealsa_bin
     end
     return nil
 end

@@ -228,8 +228,18 @@ function TTSEngine:detectBackend()
     -- survive Windows extraction / antivirus.  On first run we rename
     -- them back.  Returns true if the file now exists at `path`.
     local function ensureBinary(path)
-        if fileAccessible(path) then return true end
         local bin_path = path .. ".bin"
+        if fileAccessible(path) and fileAccessible(bin_path) then
+            -- Both exist: a fresh .bin arrived via an update while the
+            -- renamed binary from the previous version is still in place.
+            -- The .bin only ever appears from a fresh zip extraction, so
+            -- it is always the newer build.  Without this replacement,
+            -- updating users keep running the old binary forever (issue
+            -- #49: the wav-play conversion flags never reached the device).
+            logger.warn("TTSEngine: replacing stale binary with updated", bin_path)
+            os.remove(path)
+        end
+        if fileAccessible(path) then return true end
         if fileAccessible(bin_path) then
             local ok = os.rename(bin_path, path)
             if ok then
