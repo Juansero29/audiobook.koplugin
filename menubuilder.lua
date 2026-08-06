@@ -372,6 +372,16 @@ function MenuBuilder.buildAlsaDeviceMenu(plugin)
         { id = "inkview",  label = _("System player (InkView) - experimental"),
           help = _("Uses the PocketBook InkView PlayFile API. Some firmwares (PB740, PB631) export PlayFile but do not actually play audio; if no sound comes out, switch back to tts_sm or Auto.") },
     }
+    -- hwout_mix: daemon-routed dmix without the softvol/nested-plug layers.
+    -- Only offered when present in asound.conf; it is the fallback for
+    -- devices whose alsa-lib aborts opening tts_sm (issue #49).
+    if plugin.tts_engine and plugin.tts_engine._pb_has_hwout_mix then
+        table.insert(devices, 2, {
+            id = "hwout_mix",
+            label = _("PocketBook pipeline (direct dmix) - hwout_mix"),
+            help = _("Routes to the same PocketBook audio daemon output as tts_sm but skips the softvol layers that crash on some firmwares. Try this if tts_sm produces no sound or playback stops with an error. Loses the system TTS volume control."),
+        })
+    end
     local menu = {}
     for _, d in ipairs(devices) do
         table.insert(menu, {

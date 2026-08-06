@@ -691,6 +691,19 @@ function Audiobook:addToMainMenu(menu_items)
                         help_text = _("PocketBook devices route audio through different paths depending on firmware. The default works on most devices. Change this only if you hear no sound, distorted sound, or playback at 2-3x speed (known issue on PB631). Each option in the submenu has its own help text describing what to try."),
                     },
                     {
+                        text = _("Allow speaker playback without Bluetooth"),
+                        checked_func = function()
+                            return self:getSetting("pb_speaker_without_bt", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("pb_speaker_without_bt", false)
+                        end,
+                        enabled_func = function()
+                            return (self._init_ok and self.tts_engine and self.tts_engine._wav_play_bin ~= nil) or false
+                        end,
+                        help_text = _("By default, PocketBooks with a Bluetooth adapter only play through Bluetooth audio, because direct hardware access can damage the amplifier. This toggle lifts the Bluetooth requirement ONLY for daemon-routed devices (tts_sm, hwout_mix), which go through the PocketBook audio daemon like the system's own TTS and never touch the hardware directly. Direct-hardware choices (plughw:0) remain blocked without Bluetooth. Use at your own risk."),
+                    },
+                    {
                         text = _("Keep playing when lid is closed"),
                         checked_func = function()
                             return self:getSetting("keep_playing_on_lid_close", false)

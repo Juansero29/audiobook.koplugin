@@ -2143,17 +2143,29 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             logger.warn("TTSEngine: PB pre-flight: bt_manager is nil")
         end
         if not bt_connected then
-            logger.warn("TTSEngine: PocketBook with BT adapter but no BT audio - refusing to play",
-                "(player_type=", self.audio_player_type,
-                "wav_play_cmd=", self._wav_play_cmd and "set" or "nil",
-                "bt_detect_source=", bt_detect_source,
-                "no_real_audio=", self._no_real_audio_output, ")")
-            self.is_speaking = false
-            UIManager:show(InfoMessage:new{
-                text = _("No audio output available.\n\nOn this PocketBook, direct ALSA playback can damage the audio subsystem. Please connect Bluetooth headphones first, then try again."),
-                timeout = 10,
-            })
-            return false
+            -- Deliberate opt-in ("Allow speaker playback without Bluetooth"):
+            -- daemon-routed devices (tts_sm, hwout_mix) belong to neither
+            -- damage class this gate protects against (no mixer access, no
+            -- direct hw:0), so the user may lift the BT requirement for
+            -- those routes only.  Direct-hardware routes stay refused.
+            if self.plugin and self.plugin:getSetting("pb_speaker_without_bt", false)
+                    and self:_pbDaemonRouted() then
+                logger.warn("TTSEngine: no BT, speaker playback allowed",
+                    "for daemon-routed device (opt-in):",
+                    self._wav_play_force_prefix and "sticky fallback" or self._wav_play_device)
+            else
+                logger.warn("TTSEngine: PocketBook with BT adapter but no BT audio - refusing to play",
+                    "(player_type=", self.audio_player_type,
+                    "wav_play_cmd=", self._wav_play_cmd and "set" or "nil",
+                    "bt_detect_source=", bt_detect_source,
+                    "no_real_audio=", self._no_real_audio_output, ")")
+                self.is_speaking = false
+                UIManager:show(InfoMessage:new{
+                    text = _("No audio output available.\n\nOn this PocketBook, direct ALSA playback can damage the audio subsystem. Please connect Bluetooth headphones first, then try again."),
+                    timeout = 10,
+                })
+                return false
+            end
         end
         -- BT is connected but selected player type isn't BT-routed.
         -- This means audio_player_type cache is stale (e.g. user paired
@@ -3729,14 +3741,14 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             self.current_audio_file
         )
     else
-        -- If a previous wav-play crash proved this device needs software
-        -- conversion (fixed-config ALSA chain), apply it from the start.
-        local conv_flags = ""
-        if self._wav_play_needs_conversion and self._wav_play_cmd
+        -- If a crash-retry proved a specific device/conversion combo works
+        -- on this device (issue #49), use it from the start this session.
+        local effective_player = player
+        if self._wav_play_force_prefix and self._wav_play_cmd
                 and player == self._wav_play_cmd then
-            conv_flags = " --rate 48000 --channels 2"
+            effective_player = self._wav_play_force_prefix
         end
-        play_cmd = string.format('%s%s "%s"', player, conv_flags, self.current_audio_file)
+        play_cmd = string.format('%s "%s"', effective_player, self.current_audio_file)
         self._concat_durations = nil
     end
 
@@ -4551,10 +4563,14 @@ function TTSEngine:findAudioPlayer()
         -- Only default to tts_sm when the device actually defines it in
         -- asound.conf; devices like PB632 lack tts_sm entirely and would
         -- fall through to plughw:0/hw:0 which bypasses BT routing.
+        -- hwout_mix (the dmix feeding the Loopback the audio daemon reads)
+        -- is probed too: it is the crash-fallback route when the nested
+        -- plug chain above tts_sm aborts in alsa-lib (issue #49).
         local pb_default = ""
         if not self._pb_has_tts_sm_probed then
             self._pb_has_tts_sm_probed = true
             self._pb_has_tts_sm = false
+            self._pb_has_hwout_mix = false
             for _, conf in ipairs({"/etc/asound.conf", "/usr/share/alsa/asound.conf"}) do
                 local fh = io.open(conf, "r")
                 if fh then
@@ -4563,8 +4579,12 @@ function TTSEngine:findAudioPlayer()
                     if content and content:find("pcm%.tts_sm") then
                         self._pb_has_tts_sm = true
                         logger.warn("TTSEngine: tts_sm PCM found in", conf)
-                        break
                     end
+                    if content and content:find("pcm%.hwout_mix") then
+                        self._pb_has_hwout_mix = true
+                        logger.warn("TTSEngine: hwout_mix PCM found in", conf)
+                    end
+                    if self._pb_has_tts_sm and self._pb_has_hwout_mix then break end
                 end
             end
             if not self._pb_has_tts_sm then
@@ -4592,22 +4612,29 @@ function TTSEngine:findAudioPlayer()
         if (not alsa_device or alsa_device == "") and self._pb_has_tts_sm then
             alsa_device = "tts_sm"
         end
-        if alsa_device and alsa_device ~= "" then
-            -- On PocketBook, skip wav-play's mixer setup/restore to
-            -- avoid corrupting amplifier state.  The PocketBook audio
-            -- daemon manages hw:0 natively; touching the mixer kills the
-            -- speaker system-wide until reboot on devices like PB700c.
-            -- This applies to all device choices, not only tts_sm,
-            -- because setup_mixer always targets hw:0 regardless of
-            -- which PCM device is opened for playback.
-            wav_play_cmd = wav_play_cmd .. " --no-mixer"
+        -- On PocketBook, skip wav-play's mixer setup/restore to avoid
+        -- corrupting amplifier state.  The PocketBook audio daemon manages
+        -- hw:0 natively; touching the mixer kills the speaker system-wide
+        -- until reboot on devices like PB700c.  This applies to all device
+        -- choices, not only tts_sm, because setup_mixer always targets hw:0
+        -- regardless of which PCM device is opened for playback.
+        wav_play_cmd = wav_play_cmd .. " --no-mixer"
+        -- Retain the device-less base command and the chosen device so the
+        -- crash-retry ladder can rebuild variants (conversion flags, other
+        -- devices) without string surgery on the full command.
+        self._wav_play_base_cmd = wav_play_cmd
+        self._wav_play_device = (alsa_device and alsa_device ~= "") and alsa_device or nil
+        if self._wav_play_device then
             wav_play_cmd = wav_play_cmd .. " -D " .. alsa_device
+            if alsa_device == "hwout_mix" then
+                -- The dmix is fixed at 48000/S16_LE/2ch; feed it
+                -- pre-converted audio so no plug refinement runs at all
+                -- (issue #49: this firmware's alsa-lib aborts in it).
+                wav_play_cmd = wav_play_cmd .. " --rate 48000 --channels 2"
+            end
             self._wav_play_cmd = wav_play_cmd
             logger.warn("TTSEngine: PocketBook ALSA device override:", alsa_device)
         else
-            -- No explicit device selected and no tts_sm: still pass
-            -- --no-mixer to protect PocketBook amplifier state.
-            wav_play_cmd = wav_play_cmd .. " --no-mixer"
             self._wav_play_cmd = wav_play_cmd
         end
         logger.warn("TTSEngine: Using bundled wav-play for ALSA playback")
@@ -5710,6 +5737,58 @@ function TTSEngine:_isAudioProcessRunning()
 end
 
 --[[--
+True when the effective PocketBook playback route goes through the audio
+daemon (tts_sm or hwout_mix, including the session-sticky crash fallback).
+These routes feed the dmix/Loopback the daemon reads, never touch hw:0 or
+the mixer (the two damage classes the pre-flight protects against), and are
+the routes PocketBook's own TTS uses with or without Bluetooth.
+--]]
+function TTSEngine:_pbDaemonRouted()
+    local prefix = self._wav_play_force_prefix
+    if prefix then
+        return prefix:find("hwout_mix") ~= nil or prefix:find("tts_sm") ~= nil
+    end
+    local dev = self._wav_play_device
+    return dev == "tts_sm" or dev == "hwout_mix"
+end
+
+--[[--
+Next wav-play crash fallback (issue #49).  Returns {desc=, suffix=} for the
+next attempt, or nil when the ladder is exhausted.  The suffix is appended
+to _wav_play_base_cmd (which ends in --no-mixer, with no -D) and carries a
+device selection plus software-conversion flags.
+
+Stage 1 converts in software to 48000 Hz stereo on the SAME device, which
+matches the fixed dmix config that PocketBook's tts_sm chain ends in.
+Stages 2-3 target the daemon-routed dmix (hwout_mix) directly, skipping
+the nested plug+softvol refinement that aborts inside alsa-lib on some
+PocketBook firmware even at native parameters.
+--]]
+function TTSEngine:_nextWavPlayRetry()
+    if not self._wav_play_base_cmd then return nil end
+    local conv = "--rate 48000 --channels 2"
+    local stage = (self._wav_play_retry_stage or 0) + 1
+    local suffix, desc
+    if stage == 1 then
+        local dev = self._wav_play_device
+        suffix = (dev and (" -D " .. dev) or "") .. " " .. conv
+        desc = "software conversion to 48000 Hz stereo"
+    elseif stage == 2 and self._pb_has_hwout_mix then
+        suffix = " -D hwout_mix " .. conv
+        desc = "daemon-routed dmix (hwout_mix) + conversion"
+    elseif stage == 3 and self._pb_has_hwout_mix then
+        suffix = " -D plug:hwout_mix " .. conv
+        desc = "plug:hwout_mix + conversion"
+    end
+    if not suffix then
+        self._wav_play_retry_stage = 0
+        return nil
+    end
+    self._wav_play_retry_stage = stage
+    return { desc = desc, suffix = suffix }
+end
+
+--[[--
 Poll for audio process exit. When the player process finishes,
 trigger playback completion.
 
@@ -5855,32 +5934,33 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_ret
                     or player_stderr:find("Segmentation")
                     or player_stderr:find("Aborted"))
 
-                -- wav-play crash: retry once with software conversion to
-                -- 48000 Hz stereo.  PocketBook's tts_sm chain (softvol ->
-                -- nested plug -> dmix fixed at 48000/S16_LE/2ch) can abort
-                -- alsa-lib when the nested plug wrappers refine an
-                -- unsupported rate; matching the chain's native config in
-                -- software sidesteps the buggy negotiation entirely.
-                if crashed and not conv_retried
-                        and engine.audio_player_type == "aplay"
-                        and engine._wav_play_cmd
+                -- wav-play crash: walk the session fallback ladder
+                -- (conversion first, then daemon-routed dmix devices that
+                -- bypass the crashing plug refinement entirely; issue #49).
+                if crashed and engine.audio_player_type == "aplay"
+                        and engine._wav_play_base_cmd
                         and engine.current_audio_file then
-                    logger.err("TTSEngine: wav-play crashed (",
-                        player_stderr:match("Assertion[^\n]*") or "assertion/abort",
-                        ") — retrying with software conversion to 48000 Hz stereo")
-                    os.remove(engine._gst_status_file)
-                    local retry_pid_cmd = string.format(
-                        '%s --rate 48000 --channels 2 "%s" >/dev/null 2>>%s & echo $!',
-                        engine._wav_play_cmd, engine.current_audio_file,
-                        engine._gst_status_file)
-                    engine._last_pid_cmd = retry_pid_cmd
-                    local handle = io.popen(retry_pid_cmd)
-                    local pid_str = handle and handle:read("*a") or ""
-                    if handle then handle:close() end
-                    engine.audio_pid = tonumber(pid_str:match("(%d+)"))
-                    engine._audio_launched_at = UIManager:getTime()
-                    engine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, true)
-                    return
+                    local retry = engine:_nextWavPlayRetry()
+                    if retry then
+                        logger.err("TTSEngine: wav-play crashed (",
+                            player_stderr:match("Assertion[^\n]*") or "assertion/abort",
+                            ") — retrying:", retry.desc)
+                        os.remove(engine._gst_status_file)
+                        engine._wav_play_retry_prefix =
+                            engine._wav_play_base_cmd .. retry.suffix
+                        local retry_pid_cmd = string.format(
+                            '%s "%s" >/dev/null 2>>%s & echo $!',
+                            engine._wav_play_retry_prefix, engine.current_audio_file,
+                            engine._gst_status_file)
+                        engine._last_pid_cmd = retry_pid_cmd
+                        local handle = io.popen(retry_pid_cmd)
+                        local pid_str = handle and handle:read("*a") or ""
+                        if handle then handle:close() end
+                        engine.audio_pid = tonumber(pid_str:match("(%d+)"))
+                        engine._audio_launched_at = UIManager:getTime()
+                        engine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, true)
+                        return
+                    end
                 end
 
                 if crashed then
@@ -5910,13 +5990,6 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_ret
                     -- sentence may succeed (or the counter escalates).
                     engine:onPlaybackComplete()
                     return
-                end
-
-                -- Conversion retry succeeded: use it directly from now on so
-                -- later sentences do not pay the crash-and-retry cost.
-                if conv_retried then
-                    engine._wav_play_needs_conversion = true
-                    logger.warn("TTSEngine: software conversion works on this device, using it for subsequent playback")
                 end
 
                 -- Normal completion (process streamed successfully then exited)
@@ -5974,6 +6047,15 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_ret
                     engine._player_crash_count = 0
                 end
                 logger.warn("TTSEngine: Process watcher → normal completion, elapsed=", elapsed_ms, "ms")
+
+                -- A crash-retry that played to completion becomes the
+                -- working command for the rest of the session (issue #49).
+                if engine._wav_play_retry_prefix then
+                    engine._wav_play_force_prefix = engine._wav_play_retry_prefix
+                    engine._wav_play_retry_prefix = nil
+                    engine._wav_play_retry_stage = 0
+                    logger.warn("TTSEngine: crash fallback works, keeping it for this session")
+                end
 
                 -- Capture wav-play / gst-play stderr for diagnostics
                 if engine._gst_status_file then
