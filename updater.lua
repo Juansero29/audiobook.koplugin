@@ -125,6 +125,19 @@ local function fetchLatestRelease()
     return { tag = tag, version = version, zip_url = zip_url, zip_size = zip_size }
 end
 
+--- Free space in kB on the filesystem holding path (via busybox df).
+-- @tparam string path
+-- @treturn number|nil free kB, or nil when undeterminable
+local function freeSpaceKb(path)
+    local h = io.popen('df -k "' .. path .. '" 2>/dev/null | tail -1')
+    if not h then return nil end
+    local line = h:read("*a") or ""
+    h:close()
+    -- df -k columns: Filesystem  1K-blocks  Used  Available  Use%  Mounted
+    local avail = line:match("%s(%d+)%s+%d+%%")
+    return tonumber(avail)
+end
+
 --- Download a URL to a local file path, with resume support.
 -- Downloads can be large (the release zip includes ffmpeg/Piper binaries),
 -- so we use HTTP Range requests to resume after a network drop or timeout.
@@ -237,6 +250,15 @@ local function downloadFile(url, dest, expected_size)
                 retry_count = 0
             end
         else
+            local err_str = tostring(code or status or "")
+            -- ENOSPC is terminal: no amount of retrying frees storage.
+            -- Seen in the wild as repeated ~59 MB stalls on a full Kindle
+            -- (issue #46), misreported as a network stall.
+            if err_str:lower():find("no space") then
+                logger.err("Updater: download failed, disk full at", bytes_after, "bytes")
+                return false, T(_("Storage is full: the download stopped at %1 MB because the device has no free space left.\n\nFree up space (e.g. delete books or files via USB, or clean KOReader's cache), then try again. The download will resume where it stopped."),
+                    tostring(math.floor(bytes_after / 1048576)))
+            end
             logger.warn("Updater: download request failed:", tostring(code or status), "size:", bytes_after)
             retry_count = retry_count + 1
             if retry_count > max_retries then
@@ -380,6 +402,28 @@ function Updater._performUpdate(plugin, release)
         os.remove(test_file)
     end
     local zip_path = tmp_dir .. "/audiobook-koplugin-update.zip"
+
+    -- Pre-flight space check (issue #46): the update needs the zip, a
+    -- backup copy of the plugin, and the extracted files side by side.
+    -- On nearly-full devices the download used to die mid-way and was
+    -- misreported as a network stall.
+    if release.zip_size then
+        -- Rough margin over the zip: backup of the existing plugin dir
+        -- plus extraction workspace (the plugin with binaries is ~165 MB).
+        local need_kb = math.ceil(release.zip_size / 1024) + 350 * 1024
+        local free_kb = freeSpaceKb(tmp_dir)
+        if free_kb and free_kb < need_kb then
+            logger.err("Updater: not enough space in", tmp_dir,
+                "free:", free_kb, "kB, need:", need_kb, "kB")
+            UIManager:show(InfoMessage:new{
+                text = T(_("Not enough free storage for the update.\n\nNeeded: about %1 MB (update package plus installation workspace)\nAvailable: %2 MB\n\nFree up space (e.g. delete books or files via USB, or clean KOReader's cache), then try again."),
+                    tostring(math.ceil(need_kb / 1024)),
+                    tostring(math.floor(free_kb / 1024))),
+                timeout = 12,
+            })
+            return
+        end
+    end
 
     local ok, err = downloadFile(release.zip_url, zip_path, release.zip_size)
     if not ok then
