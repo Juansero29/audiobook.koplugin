@@ -42,6 +42,26 @@ function EpubMediaOverlay:_runCommand(cmd)
     return out
 end
 
+--- Info-ZIP unzip treats [], ?, * as wildcards in archive member names.
+-- Storyteller titles often include bracketed series tags, e.g.
+-- "Author-[Series-1]Title(1955).html". Without escaping, unzip -p returns
+-- nothing even though unzip -l lists the SMIL files (which is why overlay
+-- detection passes but timing extraction yields zero entries).
+function EpubMediaOverlay:_escapeUnzipMember(path)
+    if not path then return path end
+    -- Literal '[' -> '[[]', literal ']' -> '[]]' (Info-ZIP unzip convention).
+    path = path:gsub("%[", "[[]")
+    path = path:gsub("%]", "[]]")
+    return path
+end
+
+--- Pretty-printed XML puts newlines inside elements; collapse tag boundaries
+-- so legacy `(.-)` patterns still work if RE_ANY_LAZY ever fails on-device.
+function EpubMediaOverlay:_compactXml(xml)
+    if not xml or xml == "" then return xml end
+    return xml:gsub(">%s+<", "><")
+end
+
 function EpubMediaOverlay:_ensureCacheDir(plugin_dir, epub_path)
     -- Use a hash of the epub path to create a stable cache directory
     local hash = self:_simpleHash(epub_path)
@@ -109,10 +129,11 @@ end
 
 function EpubMediaOverlay:_extractFromZip(epub_path, internal_path)
     -- Extract a single file from the EPUB using unzip
+    local zip_member = self:_escapeUnzipMember(internal_path)
     local cmd = string.format(
         'unzip -p "%s" "%s"',
         epub_path:gsub('"', '\\"'),
-        internal_path:gsub('"', '\\"')
+        zip_member:gsub('"', '\\"')
     )
     return self:_runCommand(cmd)
 end
@@ -140,6 +161,7 @@ function EpubMediaOverlay:_findOpfPath(epub_path)
 end
 
 function EpubMediaOverlay:_parseOpfManifest(opf_xml)
+    opf_xml = self:_compactXml(opf_xml)
     -- Extract manifest items from OPF.
     -- We need: items with media-overlay attributes, and the smil files they reference.
     local manifest = {}
@@ -195,6 +217,7 @@ end
 -- ---------------------------------------------------------------------------
 
 function EpubMediaOverlay:_parseSmil(smil_xml, smil_base_path)
+    smil_xml = self:_compactXml(smil_xml)
     -- Parse a SMIL file and return timing_data entries.
     -- SMIL structure:
     --   <smil>
@@ -340,10 +363,11 @@ function EpubMediaOverlay:_extractAudioFile(epub_path, internal_path, cache_dir)
     end
 
     -- Extract the file
+    local zip_member = self:_escapeUnzipMember(internal_path)
     local cmd = string.format(
         'unzip -o "%s" "%s" -d "%s" >/dev/null 2>&1',
         epub_path:gsub('"', '\\"'),
-        internal_path:gsub('"', '\\"'),
+        zip_member:gsub('"', '\\"'),
         cache_dir:gsub('"', '\\"')
     )
     os.execute(cmd)

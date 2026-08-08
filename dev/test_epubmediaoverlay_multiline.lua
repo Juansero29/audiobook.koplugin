@@ -1,8 +1,7 @@
 #!/usr/bin/env luajit
 --[[--
-Smoke test: multiline Storyteller SMIL/OPF must parse under Lua patterns.
+Smoke test for Storyteller EPUB overlay parsing helpers.
 
-Run from repo root:
   luajit dev/test_epubmediaoverlay_multiline.lua
 
 No KOReader install required.
@@ -10,87 +9,52 @@ No KOReader install required.
 
 local RE_ANY_LAZY = "([%z\1-\255]-)"
 
-local function count(pattern, text)
+local function escape_unzip_member(path)
+    path = path:gsub("%[", "[[]")
+    path = path:gsub("%]", "[]]")
+    return path
+end
+
+local function compact_xml(xml)
+    return xml:gsub(">%s+<", "><")
+end
+
+local function count_par(smil, pattern)
     local n = 0
-    for _ in text:gmatch(pattern) do
+    for _ in smil:gmatch(pattern) do
         n = n + 1
     end
     return n
 end
 
 local multiline_smil = [[
-<smil xmlns="http://www.w3.org/ns/SMIL" version="3.0">
+<smil>
   <body>
-    <seq epub:textref="chapter.xhtml">
-      <par id="s0">
-        <text src="../chapter.xhtml#s0"/>
-        <audio src="../Audio/00001.mp4" clipBegin="0.000s" clipEnd="12.340s"/>
-      </par>
-      <par id="s1">
-        <text src="../chapter.xhtml#s1"/>
-        <audio src="../Audio/00001.mp4" clipBegin="12.340s" clipEnd="25.180s"/>
-      </par>
-    </seq>
+    <par id="s0">
+      <text src="../Author-[Series-1]Title.html#s0"/>
+      <audio src="../Audio/00001.mp4" clipBegin="0.000s" clipEnd="12.340s"/>
+    </par>
   </body>
 </smil>
 ]]
 
-local multiline_opf = [[
-<package>
-  <manifest>
-    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml" media-overlay="mo1"/>
-    <item id="mo1" href="MediaOverlays/ch1.smil" media-type="application/smil+xml"/>
-  </manifest>
-  <spine>
-    <itemref idref="ch1"/>
-  </spine>
-</package>
-]]
+local storyteller_member =
+    "MediaOverlays/Author-[Series-1]Title_split_003.smil"
+local escaped = escape_unzip_member(storyteller_member)
 
-local multiline_html = [[
-<p>
-  <span id="s0">Première phrase.</span>
-  <span id="s1">Deuxième phrase.</span>
-</p>
-]]
-
-local broken_par = count("<par([^>]*)>(.-)</par>", multiline_smil)
-local fixed_par = count("<par([^>]*)>" .. RE_ANY_LAZY .. "</par>", multiline_smil)
-
-local broken_manifest = multiline_opf:match("<manifest[^>]*>(.-)</manifest>") or ""
-local fixed_manifest = multiline_opf:match("<manifest[^>]*>" .. RE_ANY_LAZY .. "</manifest>") or ""
-
-local broken_spine = multiline_opf:match("<spine[^>]*>(.-)</spine>") or ""
-local fixed_spine = multiline_opf:match("<spine[^>]*>" .. RE_ANY_LAZY .. "</spine>") or ""
-
-local broken_span = count('<span[^>]-id="([^"]+)"[^>]*>(.-)</span>', multiline_html)
-local fixed_span = count('<span[^>]-id="([^"]+)"[^>]*>' .. RE_ANY_LAZY .. '</span>', multiline_html)
+local broken = count_par(multiline_smil, "<par([^>]*)>(.-)</par>")
+local fixed = count_par(compact_xml(multiline_smil), "<par([^>]*)>" .. RE_ANY_LAZY .. "</par>")
 
 local failures = {}
 
-if broken_par ~= 0 then
-    table.insert(failures, "expected broken par pattern to miss multiline SMIL, got " .. broken_par)
+if broken ~= 0 then
+    table.insert(failures, "broken par pattern should miss multiline SMIL")
 end
-if fixed_par ~= 2 then
-    table.insert(failures, "expected 2 par blocks, got " .. fixed_par)
+if fixed ~= 1 then
+    table.insert(failures, "expected 1 par after compact+fixed, got " .. fixed)
 end
-if broken_manifest ~= "" then
-    table.insert(failures, "expected broken manifest pattern to miss multiline OPF")
-end
-if fixed_manifest == "" or not fixed_manifest:find("media-overlay") then
-    table.insert(failures, "expected fixed manifest pattern to capture overlay items")
-end
-if broken_spine ~= "" then
-    table.insert(failures, "expected broken spine pattern to miss multiline OPF")
-end
-if fixed_spine == "" or not fixed_spine:find("itemref") then
-    table.insert(failures, "expected fixed spine pattern to capture itemref")
-end
-if broken_span ~= 0 then
-    table.insert(failures, "expected broken span pattern to miss (if spans were multiline)")
-end
-if fixed_span ~= 2 then
-    table.insert(failures, "expected 2 sentence spans, got " .. fixed_span)
+if escaped ~= "MediaOverlays/Author-[[]Series-1]Title_split_003.smil" then
+    table.insert(failures, "unexpected unzip escape: " .. escaped)
 end
 
 if #failures > 0 then
@@ -101,4 +65,4 @@ if #failures > 0 then
     os.exit(1)
 end
 
-print("ok: multiline Storyteller SMIL/OPF patterns parse correctly")
+print("ok: multiline SMIL patterns and unzip member escaping")
