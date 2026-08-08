@@ -142,6 +142,7 @@ function AudiobookPlayer:init()
     self.height = Screen:getHeight()
     self.dimen = Geom:new{ w = self.width, h = self.height }
     self._minimized = false
+    self._return_hint_active = false
     self._rotation_mode = Screen:getRotationMode()
     self:setupUI()
 end
@@ -1299,15 +1300,48 @@ function AudiobookPlayer:_updateScrubberPreview(x)
 end
 
 function AudiobookPlayer:_updateMiniWidgets()
-    -- Show track filename (output_name) in mini bar; fall back to title
-    local track = self.output_name
-    if not track or track == "" then
-        track = self.title or _("Audiobook")
+    -- Show track filename (output_name) in mini bar; fall back to title.
+    -- When browsing away from the audio page, the title becomes a clear
+    -- "Return to read-aloud" cue (tapping the bar centers on the sentence).
+    local track
+    if self._return_hint_active then
+        track = _("Return to read-aloud")
+    else
+        track = self.output_name
+        if not track or track == "" then
+            track = self.title or _("Audiobook")
+        end
     end
-    self._mini_title:setText(track)
-    self._mini_time:setText(self.current_time_str or "")
-    local txt = self.is_playing and "⏸" or "▶"
-    self._mini_play_pause:setText(txt, self._mini_play_pause.width)
+    if self._mini_title then
+        self._mini_title:setText(track)
+    end
+    if self._mini_time then
+        self._mini_time:setText(self.current_time_str or "")
+    end
+    if self._mini_play_pause then
+        local txt = self.is_playing and "⏸" or "▶"
+        self._mini_play_pause:setText(txt, self._mini_play_pause.width)
+    end
+    if self._mini_refocus then
+        -- Make the existing ○ control more obvious while the hint is active.
+        local label = self._return_hint_active and "◎" or "○"
+        self._mini_refocus:setText(label, self._mini_refocus.width)
+    end
+end
+
+--- Toggle Readest-style "return to read-aloud" cue on the mini bar.
+-- When active, tapping the mini bar (outside transport buttons) refocuses
+-- instead of expanding the full player.
+function AudiobookPlayer:setReturnHint(active)
+    active = not not active
+    if self._return_hint_active == active then return end
+    self._return_hint_active = active
+    if self._minimized then
+        self:_updateMiniWidgets()
+        UIManager:setDirty(self, function()
+            return "ui", self.dimen
+        end)
+    end
 end
 
 -- Show / hide
@@ -1437,6 +1471,14 @@ function AudiobookPlayer:handleEvent(event)
                         else
                             logger.warn("ABP: refocus button has no callback")
                         end
+                        return true
+                    end
+                    -- While browsing away from the narration page, a tap on
+                    -- the unused mini-bar area means "return to read-aloud"
+                    -- (same as ○), not "expand full player".
+                    if self._return_hint_active and self.on_refocus then
+                        logger.warn("ABP: return-hint bar tap -> refocus")
+                        self:onRefocus()
                         return true
                     end
                     -- Tap anywhere else on the mini bar -> restore full player

@@ -640,8 +640,12 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
             end
         end
     end
-    self._current_sentence_idx = 1
-    self._current_word_idx = 1
+    -- 0 so the first sync tick (sentence 1) enters the highlight / page-follow
+    -- path.  Previously this was 1, which skipped the opening sentence.
+    self._current_sentence_idx = 0
+    self._current_word_idx = 0
+    self._last_hl_idx = nil
+    self._last_page_advance_idx = nil
     self._chain_generation = self._chain_generation + 1
     self._last_progress_pct = -1
     self._last_ui_update_time = nil
@@ -749,6 +753,9 @@ function MediaSync:stop(keep_chapter_menu)
     if self.playback_bar then
         pcall(function() self.playback_bar:hide() end)
     end
+    if self.plugin and self.plugin._hideReturnToReadAloudButton then
+        pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+    end
     if not keep_chapter_menu then
         if self._chapter_menu_window then
             pcall(function() UIManager:close(self._chapter_menu_window) end)
@@ -774,6 +781,13 @@ function MediaSync:pause(auto)
         pcall(function() self.playback_bar:setPlaying(false) end)
     end
     logger.dbg("MediaSync: paused", auto and "(auto)" or "")
+end
+
+function MediaSync:clearSentenceHighlight()
+    if self.highlight_manager then
+        pcall(function() self.highlight_manager:clearHighlights() end)
+        self.highlight_manager._line_cache = nil
+    end
 end
 
 function MediaSync:resume(auto)
@@ -1096,22 +1110,6 @@ function MediaSync:_updateHighlightAtTime(pos)
                 self.plugin._suppress_media_sync_auto_page_follow = nil
             end
         end
-        if sentence.fragment_id and follow_page_turns and not suppress_auto_follow then
-            local ui = self.plugin and self.plugin.ui
-            if ui and ui.rolling and ui.document then
-                pcall(function()
-                    self:_markPageFollowAuto()
-                    local ms = self
-                    local ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, false, sentence.text)
-                    if not ok then
-                        logger.dbg("MediaSync: page-follow failed for", sentence.fragment_id)
-                    end
-                    UIManager:scheduleIn(2.5, function()
-                        ms:_clearPageFollowAuto()
-                    end)
-                end)
-            end
-        end
         if self.highlight_manager and sentence.text then
             -- Build a synthetic sentence object for HighlightManager
             local sent_obj = {
@@ -1126,60 +1124,72 @@ function MediaSync:_updateHighlightAtTime(pos)
             if hl_ok and sentence.fragment_id then
                 self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
             end
-            -- Read-along page advancement: narration flows forward, so when
-            -- the next sequential sentence is not on the visible page it is
-            -- on the following one -- turn and retry once.  Only for
-            -- sequential advancement (not seeks), so a failed text match
-            -- can never page away from where the user is reading.
-            if not hl_ok and self.overlay_mode
-                and sent_idx == (self._last_hl_idx or 0) + 1
+
+            -- If the sentence is not on the visible page, JUMP to its fragment
+            -- (spine/TOC/findText).  Never crawl with GotoViewRel on every
+            -- sentence — that freezes Kindle touch input for minutes.
+            local jump_pending = false
+            if not hl_ok and self.overlay_mode and sentence.fragment_id
                 and follow_page_turns and not suppress_auto_follow then
                 local ui = self.plugin and self.plugin.ui
-                if ui then
-                    local expected_n = self:_getExpectedDocFragmentIndex(sentence.text_doc)
-                    local cur_frag = nil
-                    if ui.document then
-                        local cur_xp = ui.document:getXPointer()
-                        cur_frag = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
-                    end
-                    local cross_doc = expected_n and cur_frag and expected_n ~= cur_frag
-                    if cross_doc and sentence.fragment_id then
-                        pcall(function()
-                            self:_markPageFollowAuto()
-                            local ms = self
-                            self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, true, sentence.text)
-                            UIManager:scheduleIn(0.3, function()
-                                pcall(function()
-                                    self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
-                                end)
-                            end)
-                            UIManager:scheduleIn(2.5, function()
-                                ms:_clearPageFollowAuto()
-                            end)
-                        end)
-                    elseif not cross_doc then
-                        pcall(function()
-                            self:_markPageFollowAuto()
-                            local ms = self
-                            ui:handleEvent(Event:new("GotoViewRel", 1))
-                            self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
-                            if sentence.fragment_id then
-                                self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+                if ui and ui.rolling and ui.document then
+                    jump_pending = true
+                    pcall(function()
+                        self:_markPageFollowAuto()
+                        local ms = self
+                        local target_idx = sent_idx
+                        -- allow_scan=true: direct DocFragment jump, not +1 page.
+                        local jumped = self:_gotoSmilFragment(
+                            sentence.text_doc, sentence.fragment_id, true, sentence.text)
+                        if not jumped then
+                            -- Last resort: a single relative page turn, and only
+                            -- when advancing exactly one sentence (not a seek).
+                            if sent_idx == (self._last_hl_idx or 0) + 1
+                                and self._last_page_advance_idx ~= sent_idx then
+                                self._last_page_advance_idx = sent_idx
+                                ui:handleEvent(Event:new("GotoViewRel", 1))
                             end
-                            UIManager:scheduleIn(2.5, function()
+                        end
+                        if ms.highlight_manager then
+                            ms.highlight_manager._line_cache = nil
+                        end
+                        UIManager:scheduleIn(0.35, function()
+                            if ms.state ~= ms.STATE.PLAYING then
+                                ms:_clearPageFollowAuto()
+                                return
+                            end
+                            if ms._current_sentence_idx ~= target_idx then
+                                ms:_clearPageFollowAuto()
+                                return
+                            end
+                            local retry_ok = false
+                            pcall(function()
+                                retry_ok = ms.highlight_manager:highlightSentence(
+                                    sent_obj, {sentences = {sent_obj}})
+                            end)
+                            if retry_ok then
+                                ms._last_hl_idx = target_idx
+                                ms:_cacheResolvedXPointer(
+                                    sentence.text_doc, sentence.fragment_id)
+                            else
+                                pcall(function()
+                                    ms.highlight_manager:clearHighlights()
+                                end)
+                            end
+                            UIManager:scheduleIn(2.0, function()
                                 ms:_clearPageFollowAuto()
                             end)
                         end)
-                    end
+                    end)
                 end
             end
-            -- If the sentence is genuinely not on the visible page and we
-            -- didn't auto-advance, clear the stale highlight so it isn't
-            -- mirrored at the wrong x,y on the current page.
-            if not hl_ok then
+
+            if not hl_ok and not jump_pending then
                 pcall(function() self.highlight_manager:clearHighlights() end)
             end
-            self._last_hl_idx = sent_idx
+            if hl_ok or not jump_pending then
+                self._last_hl_idx = sent_idx
+            end
         end
     end
 
@@ -1498,6 +1508,9 @@ function MediaSync:showPlaybackBar()
         end,
         on_refocus = self.overlay_mode and function()
             self:refocusToCurrentSentence()
+            if self.plugin and self.plugin._hideReturnToReadAloudButton then
+                pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+            end
         end or nil,
     }
     player:show()
@@ -1510,50 +1523,81 @@ function MediaSync:showPlaybackBar()
     self.playback_bar = player
 end
 
-function MediaSync:navigateToSentenceAtTime(seconds)
-    if not self.overlay_mode then return end
-    if not self.timing_data then return end
+function MediaSync:navigateToSentenceEntry(entry)
+    -- Jump to a specific SMIL timing entry by fragment id (preferred for
+    -- "Play aligned from here", where looking up by start_time can hit the
+    -- wrong sentence when several share similar clip times).
+    if not self.overlay_mode or not self.timing_data or not entry then return false end
     local ui = self.plugin and self.plugin.ui
-    if not ui or not ui.rolling or not ui.document then return end
+    if not ui or not ui.rolling or not ui.document then return false end
 
-    local sent_idx = self:_findSentenceAtTime(seconds)
-    if not sent_idx then
-        logger.warn("MediaSync: navigateToSentenceAtTime found no sentence at", seconds)
-        return
+    local sent_idx = nil
+    if entry.fragment_id then
+        for i, e in ipairs(self.timing_data) do
+            if e.fragment_id == entry.fragment_id
+                and (not entry.text_doc or e.text_doc == entry.text_doc) then
+                sent_idx = i
+                break
+            end
+        end
     end
-    local sentence = self.timing_data[sent_idx]
+    if not sent_idx and entry.start_time then
+        sent_idx = self:_findSentenceAtTime(entry.start_time)
+    end
+    local sentence = sent_idx and self.timing_data[sent_idx]
     if not sentence or not sentence.fragment_id then
-        logger.warn("MediaSync: navigateToSentenceAtTime no fragment for sentence", sent_idx)
-        return
+        logger.warn("MediaSync: navigateToSentenceEntry: no matching sentence")
+        return false
     end
+
     self._current_sentence_idx = sent_idx
-    logger.warn("MediaSync: navigating to sentence", sent_idx, sentence.text_doc, sentence.fragment_id)
+    self._last_hl_idx = sent_idx
+    logger.warn("MediaSync: navigating to entry", sent_idx, sentence.text_doc, sentence.fragment_id)
+
+    if self.plugin and time then
+        self.plugin._suppress_media_sync_auto_page_follow = time.now() + time.s(3.0)
+    end
 
     self:_markPageFollowAuto()
     local ms = self
     local nav_ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, true, sentence.text)
     if not nav_ok then
-        logger.warn("MediaSync: navigateToSentenceAtTime failed for", sentence.text_doc, sentence.fragment_id)
+        logger.warn("MediaSync: navigateToSentenceEntry failed for", sentence.fragment_id)
         self:_clearPageFollowAuto()
-        return
+        return false
     end
     UIManager:scheduleIn(2.5, function()
         ms:_clearPageFollowAuto()
     end)
 
-    -- Re-highlight the sentence after the page settles.
     if self.highlight_manager and sentence.text then
         local sent_obj = {
             text = sentence.text,
             start_pos = sentence.start_pos or 0,
             end_pos = sentence.end_pos or #sentence.text,
         }
+        self.highlight_manager._line_cache = nil
         UIManager:scheduleIn(0.3, function()
             pcall(function()
-                self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                local ok = ms.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                if ok then
+                    ms:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+                end
             end)
         end)
     end
+    return true
+end
+
+function MediaSync:navigateToSentenceAtTime(seconds)
+    if not self.overlay_mode then return end
+    if not self.timing_data then return end
+    local sent_idx = self:_findSentenceAtTime(seconds)
+    if not sent_idx then
+        logger.warn("MediaSync: navigateToSentenceAtTime found no sentence at", seconds)
+        return
+    end
+    self:navigateToSentenceEntry(self.timing_data[sent_idx])
 end
 
 function MediaSync:refocusToCurrentSentence()

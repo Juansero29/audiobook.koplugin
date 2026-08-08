@@ -121,9 +121,12 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
     sent_text = sent_text
         :gsub("[\226\128\152-\226\128\155]", "'")    -- curly quotes → straight '
         :gsub("[\226\128\156-\226\128\159]", '"')    -- curly double quotes → straight "
+        :gsub("\194\171", '"'):gsub("\194\187", '"') -- « » guillemets → straight "
         :gsub("\226\128\147", "-")                    -- en-dash → hyphen
         :gsub("\226\128\148", "-")                    -- em-dash → hyphen
+        :gsub("\226\128\166", "...")                  -- ellipsis …
         :gsub("\194\160", " ")                        -- non-breaking space → space
+        :gsub("\194\173", "")                         -- soft hyphen
         :gsub("[\226\128\139\226\128\169]", "")       -- zero-width chars removed
         :gsub("\239\187\191", "")                     -- BOM removed
 
@@ -170,9 +173,12 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
                 lt = lt
                     :gsub("[\226\128\152-\226\128\155]", "'")
                     :gsub("[\226\128\156-\226\128\159]", '"')
+                    :gsub("\194\171", '"'):gsub("\194\187", '"')
                     :gsub("\226\128\147", "-")
                     :gsub("\226\128\148", "-")
+                    :gsub("\226\128\166", "...")
                     :gsub("\194\160", " ")
+                    :gsub("\194\173", "")
                     :gsub("[\226\128\139\226\128\169]", "")
                     :gsub("\239\187\191", "")
             end
