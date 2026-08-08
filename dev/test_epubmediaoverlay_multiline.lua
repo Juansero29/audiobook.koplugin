@@ -10,9 +10,7 @@ No KOReader install required.
 local RE_ANY_LAZY = "([%z\1-\255]-)"
 
 local function escape_unzip_member(path)
-    path = path:gsub("%[", "[[]")
-    path = path:gsub("%]", "[]]")
-    return path
+    return path:gsub("%[", "[[]")
 end
 
 local function compact_xml(xml)

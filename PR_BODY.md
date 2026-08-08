@@ -20,7 +20,7 @@ Storyteller encodes series tags in filenames, e.g.:
 
 Info-ZIP `unzip` treats `[]` as **wildcards** in member names. `unzip -l` still lists `.smil` files (so overlay detection passes), but `unzip -p` with the raw path returns **empty content** for every bracketed SMIL/HTML file → zero timing entries.
 
-Fix: escape literal `[` as `[[]` and `]` as `[]]` before calling `unzip -p` / `unzip -o`.
+Fix: escape literal `[` as `[[]` before calling `unzip -p` / `unzip -o` (Info-ZIP convention).
 
 This is a follow-up to overlay work from #32 / DroidThug's PW5 merge (manifest href fixes, LuaJIT compile fixes). Those did not cover multiline XML or bracketed Storyteller paths.
 

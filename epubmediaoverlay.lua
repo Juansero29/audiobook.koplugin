@@ -49,10 +49,9 @@ end
 -- detection passes but timing extraction yields zero entries).
 function EpubMediaOverlay:_escapeUnzipMember(path)
     if not path then return path end
-    -- Literal '[' -> '[[]', literal ']' -> '[]]' (Info-ZIP unzip convention).
-    path = path:gsub("%[", "[[]")
-    path = path:gsub("%]", "[]]")
-    return path
+    -- Info-ZIP: literal '[' is written as '[[]'. Do not escape ']' — doing so
+    -- corrupts the '[[]' token (']' inside it would become '[]]').
+    return path:gsub("%[", "[[]")
 end
 
 --- Pretty-printed XML puts newlines inside elements; collapse tag boundaries
