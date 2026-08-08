@@ -9,6 +9,10 @@ Caches extracted audio to persistent storage (not /tmp, to avoid RAM exhaustion)
 local logger = require("logger")
 local _ = require("gettext")
 
+-- Lua patterns: `.` does not match newlines. Storyteller (and many OPF
+-- producers) pretty-print SMIL/OPF with line breaks inside elements.
+local RE_ANY_LAZY = "([%z\1-\255]-)"
+
 local EpubMediaOverlay = {}
 
 function EpubMediaOverlay:new(o)
@@ -142,7 +146,7 @@ function EpubMediaOverlay:_parseOpfManifest(opf_xml)
     local manifest_items = {}
 
     -- Find the manifest section
-    local manifest_block = opf_xml:match("<manifest[^>]*>(.-)</manifest>")
+    local manifest_block = opf_xml:match("<manifest[^>]*>" .. RE_ANY_LAZY .. "</manifest>")
     if not manifest_block then
         logger.warn("EpubMediaOverlay: no manifest found in OPF")
         return nil
@@ -212,7 +216,7 @@ function EpubMediaOverlay:_parseSmil(smil_xml, smil_base_path)
     -- Find all <par> elements.  gmatch with two captures yields two loop
     -- values; the old single-variable loop bound only the attribute
     -- capture and threw away the body that holds <text>/<audio>.
-    for _par_attrs, par_block in smil_xml:gmatch("<par([^>]*)>(.-)</par>") do
+    for _par_attrs, par_block in smil_xml:gmatch("<par([^>]*)>" .. RE_ANY_LAZY .. "</par>") do
         -- Extract text src (match the <text> element specifically; a bare
         -- src= match would also hit <audio src=...>)
         local text_src = par_block:match('<text[^>]-src%s*=%s*"([^"]+)"')
@@ -221,7 +225,7 @@ function EpubMediaOverlay:_parseSmil(smil_xml, smil_base_path)
         -- src paths contain slashes)
         local audio_block = par_block:match("<audio([^>]-)/>")
         if not audio_block then
-            audio_block = par_block:match("<audio(.-)</audio>")
+            audio_block = par_block:match("<audio" .. RE_ANY_LAZY .. "</audio>")
         end
 
         if audio_block then
@@ -273,7 +277,7 @@ function EpubMediaOverlay:_extractSentenceTexts(epub_path, html_zip_path)
     local html = self:_extractFromZip(epub_path, html_zip_path)
     if not html or html == "" then return nil end
     local map = {}
-    for id, body in html:gmatch('<span[^>]-id="([^"]+)"[^>]*>(.-)</span>') do
+    for id, body in html:gmatch('<span[^>]-id="([^"]+)"[^>]*>' .. RE_ANY_LAZY .. '</span>') do
         if not map[id] then
             local txt = body:gsub("<[^>]->", "")
                 :gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
@@ -301,8 +305,8 @@ function EpubMediaOverlay:_loadChapterTitles(epub_path, opf_xml, opf_base)
     local titles = {}
     -- Flat scan is fine for the common non-nested navMap; with nesting the
     -- first label per target document still wins, which is what we want.
-    for block in ncx:gmatch("<navPoint.-</navPoint>") do
-        local label = block:match("<text>(.-)</text>")
+    for block in ncx:gmatch("<navPoint[%z\1-\255]-</navPoint>") do
+        local label = block:match("<text>" .. RE_ANY_LAZY .. "</text>")
         local src = block:match('src="([^"#]+)')
         if label and src then
             local base = src:match("([^/]+)$")
@@ -410,7 +414,7 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
     -- maps the reader's current position to a content document (used to
     -- start narration from the page the user is on).
     self._spine_hrefs = {}
-    local spine_block = opf_xml:match("<spine[^>]*>(.-)</spine>") or ""
+    local spine_block = opf_xml:match("<spine[^>]*>" .. RE_ANY_LAZY .. "</spine>") or ""
     for idref in spine_block:gmatch('<itemref[^>]-idref="([^"]+)"') do
         local it = manifest_items[idref]
         if it and it.href then
