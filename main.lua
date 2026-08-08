@@ -2557,10 +2557,18 @@ function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allo
 
     local parser = self._smil_parser
     local timing_data = self._smil_timing_data
-    if parser and timing_data and self._smil_doc_path ~= doc_path then
-        -- Cached data belongs to a different book; discard it.
-        logger.warn("Audiobook: SMIL cache is for", self._smil_doc_path,
-            "but current doc is", doc_path, "; reloading")
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local cur_fp
+    if ok_lfs and lfs and lfs.attributes then
+        local attr = lfs.attributes(doc_path)
+        if attr and attr.size and attr.modification then
+            cur_fp = string.format("%d:%d", attr.size, attr.modification)
+        end
+    end
+    if parser and timing_data and (self._smil_doc_path ~= doc_path
+        or (cur_fp and self._smil_epub_fp and self._smil_epub_fp ~= cur_fp)) then
+        -- Cached data belongs to a different book or a replaced EPUB.
+        logger.warn("Audiobook: SMIL cache stale for", doc_path, "; reloading")
         parser = nil
         timing_data = nil
         self._smil_parser = nil
@@ -2605,6 +2613,7 @@ function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allo
         self._smil_timing_data = timing_data
         self._smil_page_index = nil
         self._smil_doc_path = doc_path
+        self._smil_epub_fp = cur_fp
     end
 
     local start_entry = self:_matchSmilEntryFromSelection(selected_text, timing_data, parser)
