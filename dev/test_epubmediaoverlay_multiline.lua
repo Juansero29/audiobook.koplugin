@@ -2,9 +2,12 @@
 --[[--
 Smoke test for Storyteller EPUB overlay parsing helpers.
 
-  luajit dev/test_epubmediaoverlay_multiline.lua
+Uses real fixtures extracted from a Storyteller read-aloud EPUB.
+Run from repo root:
+  luajit dev/test_epubmediaoverlay_multiline.lua [fixtures_dir]
 
-No KOReader install required.
+Default fixtures_dir: ../scripts/_fixtures (when run from audiobook.koplugin clone
+next to THE-BEAST scripts) or pass absolute path to scripts/_fixtures.
 --]]
 
 local RE_ANY_LAZY = "([%z\1-\255]-)"
@@ -17,42 +20,83 @@ local function compact_xml(xml)
     return xml:gsub(">%s+<", "><")
 end
 
+local function read_file(path)
+    local f, err = io.open(path, "rb")
+    if not f then return nil, err end
+    local data = f:read("*a")
+    f:close()
+    return data
+end
+
 local function count_par(smil, pattern)
     local n = 0
-    for _ in smil:gmatch(pattern) do
+    for _a, _b in smil:gmatch(pattern) do
         n = n + 1
     end
     return n
 end
 
-local multiline_smil = [[
-<smil>
-  <body>
-    <par id="s0">
-      <text src="../Author-[Series-1]Title.html#s0"/>
-      <audio src="../Audio/00001.mp4" clipBegin="0.000s" clipEnd="12.340s"/>
-    </par>
-  </body>
-</smil>
-]]
+local function count_manifest_overlays(opf_xml)
+    opf_xml = compact_xml(opf_xml)
+    local manifest_block = opf_xml:match("<manifest[^>]*>" .. RE_ANY_LAZY .. "</manifest>")
+    if not manifest_block then return 0, 0 end
+    local items = {}
+    local overlays = 0
+    for item_str in manifest_block:gmatch("<item([^>]-)/>") do
+        local id = item_str:match('id%s*=%s*"([^"]+)"')
+        local href = item_str:match('href%s*=%s*"([^"]+)"')
+        local mo = item_str:match('media%-overlay%s*=%s*"([^"]+)"')
+        if id and href then
+            items[id] = { href = href, mo = mo }
+        end
+    end
+    for id, item in pairs(items) do
+        if item.mo and items[item.mo] then
+            overlays = overlays + 1
+        end
+    end
+    return overlays, #manifest_block
+end
+
+local fixtures = arg[1] or "scripts/_fixtures"
+if not read_file(fixtures .. "/sample.smil") then
+    fixtures = "../scripts/_fixtures"
+end
+
+local failures = {}
+
+local smil, err = read_file(fixtures .. "/sample.smil")
+if not smil then
+    io.stderr:write("FAIL: missing fixture sample.smil: " .. tostring(err) .. "\n")
+    os.exit(1)
+end
+
+local opf = read_file(fixtures .. "/content.opf")
+if not opf then
+    table.insert(failures, "missing fixture content.opf")
+end
 
 local storyteller_member =
     "MediaOverlays/Author-[Series-1]Title_split_003.smil"
 local escaped = escape_unzip_member(storyteller_member)
-
-local broken = count_par(multiline_smil, "<par([^>]*)>(.-)</par>")
-local fixed = count_par(compact_xml(multiline_smil), "<par([^>]*)>" .. RE_ANY_LAZY .. "</par>")
-
-local failures = {}
-
-if broken ~= 0 then
-    table.insert(failures, "broken par pattern should miss multiline SMIL")
-end
-if fixed ~= 1 then
-    table.insert(failures, "expected 1 par after compact+fixed, got " .. fixed)
-end
 if escaped ~= "MediaOverlays/Author-[[]Series-1]Title_split_003.smil" then
     table.insert(failures, "unexpected unzip escape: " .. escaped)
+end
+
+local compact = compact_xml(smil)
+local par_count = count_par(compact, "<par([^>]*)>" .. RE_ANY_LAZY .. "</par>")
+if par_count ~= 23 then
+    table.insert(failures, "expected 23 par blocks in Storyteller sample SMIL, got " .. par_count)
+end
+
+if opf then
+    local overlays, manifest_len = count_manifest_overlays(opf)
+    if overlays ~= 27 then
+        table.insert(failures, "expected 27 overlay mappings in OPF, got " .. overlays)
+    end
+    if manifest_len < 1000 then
+        table.insert(failures, "OPF manifest block too short: " .. manifest_len)
+    end
 end
 
 if #failures > 0 then
@@ -63,4 +107,7 @@ if #failures > 0 then
     os.exit(1)
 end
 
-print("ok: multiline SMIL patterns and unzip member escaping")
+print(string.format(
+    "ok: Storyteller fixtures parsed (%d par, unzip escape verified)",
+    par_count
+))
