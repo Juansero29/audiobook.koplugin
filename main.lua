@@ -1310,13 +1310,7 @@ end
 function Audiobook:_startMediaPlaybackForDocument(doc_path)
     -- Try SMIL Media Overlays first
     if self:_hasMediaOverlays() then
-        UIManager:show(InfoMessage:new{
-            text = _("Loading Media Overlays..."),
-            timeout = 1,
-        })
-        UIManager:scheduleIn(0.5, function()
-            self:_startSmilPlayback(doc_path, nil, true)
-        end)
+        self:_startSmilPlayback(doc_path, nil, true)
         return
     end
 
@@ -1499,17 +1493,35 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         return
     end
 
+    local loading_msg = InfoMessage:new{
+        text = _("Loading Media Overlays..."),
+        timeout = 3600,
+    }
+    UIManager:show(loading_msg)
+
     local parser = EpubMediaOverlay:new()
-    local timing_data, err = parser:loadFromEpub(doc_path, PLUGIN_PATH:sub(1, -2))
+    local plugin_dir = PLUGIN_PATH:sub(1, -2)
+    local timing_data, err = parser:loadFromEpub(doc_path, plugin_dir, function(prog)
+        if not prog then return end
+        if prog.phase == "smil" and prog.total then
+            loading_msg.text = T(_("Parsing overlays: %1 / %2"), prog.current, prog.total)
+        elseif prog.phase == "done" then
+            loading_msg.text = T(_("Loaded %1 timing entries"), prog.current)
+        end
+        UIManager:setDirty(nil, "ui")
+    end)
+
+    UIManager:close(loading_msg)
+
     if not timing_data then
         UIManager:show(InfoMessage:new{
             text = _("No Media Overlays found: ") .. tostring(err),
-            timeout = 3,
+            timeout = 4,
         })
         return
     end
 
-    -- Group timing entries by audio file, preserving narrative order.
+    -- Group timing entries by audio file
     -- Clip times restart at zero for every audio file, so each file plays
     -- with its own timing slice; the playlist mechanism chains the files
     -- and _playAudioFile installs the matching slice on every switch.
@@ -1546,6 +1558,8 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
                 table.insert(slot.chapters, {
                     title = titles[base] or base,
                     start_time = e.start_time,
+                    fragment_id = e.fragment_id,
+                    text_doc = e.text_doc,
                 })
             end
         end
@@ -1558,6 +1572,27 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
             or p:match("([^/]+)$") or p
         table.insert(playlist, { name = nm, path = p })
     end
+
+    -- Flat chapter list for the Chapters menu (all ~27 SMIL sections, not the
+    -- 4 MP4 playlist segments). Playlist still switches audio parts.
+    self._smil_overlay_chapters = {}
+    for _, p in ipairs(files) do
+        for _, ch in ipairs(by_file[p].chapters) do
+            table.insert(self._smil_overlay_chapters, {
+                title = ch.title,
+                start_time = ch.start_time,
+                audio_path = p,
+                fragment_id = ch.fragment_id,
+                text_doc = ch.text_doc,
+            })
+        end
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = T(_("%1 sentences · %2 chapters · %3 audio parts"),
+            #timing_data, #self._smil_overlay_chapters, #files),
+        timeout = 3,
+    })
 
     -- Common startup logic used both for direct starts and after the resume prompt.
     local function do_start(chosen_entry)
@@ -1628,24 +1663,26 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         -- If a specific start entry was requested, resume playback directly at
         -- that time instead of starting at 0:00 and seeking after a delay.
         local start_position = nil
-        if start_time and start_time > 1 then
+        if start_time then
             start_position = start_time
         end
         local started = self.media_sync:start(first, by_file[first].timing,
             by_file[first].chapters, nil, playlist, first, start_position)
         if started and start_position then
-            logger.warn("Audiobook: SMIL playback resumed at", start_position, "for", first:match("([^/]+)$"))
+            logger.warn("Audiobook: SMIL playback started at", start_position, "for", first:match("([^/]+)$"))
         end
-        -- When resuming or starting from a specific selection, move the book view
-        -- to the sentence being read so the screen matches the audio.
-        if started and start_position and self.media_sync.overlay_mode then
-            logger.warn("Audiobook: navigating view to sentence at", start_position)
-            local ok_nav, nav_err = pcall(function()
-                self.media_sync:navigateToSentenceAtTime(start_position)
+        -- Move the book view to the sentence being read.
+        if started and self.media_sync.overlay_mode then
+            local nav_time = start_position or 0
+            logger.warn("Audiobook: navigating view to sentence at", nav_time)
+            UIManager:scheduleIn(0.6, function()
+                local ok_nav, nav_err = pcall(function()
+                    self.media_sync:navigateToSentenceAtTime(nav_time)
+                end)
+                if not ok_nav then
+                    logger.warn("Audiobook: navigateToSentenceAtTime error:", nav_err)
+                end
             end)
-            if not ok_nav then
-                logger.warn("Audiobook: navigateToSentenceAtTime error:", nav_err)
-            end
         end
     end
 

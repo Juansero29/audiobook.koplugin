@@ -391,9 +391,20 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
-function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
+function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
     if not epub_path or not plugin_dir then
         return nil, "missing path or plugin_dir"
+    end
+
+    local function report(phase, current, total, detail)
+        if progress_callback then
+            pcall(progress_callback, {
+                phase = phase,
+                current = current,
+                total = total,
+                detail = detail,
+            })
+        end
     end
 
     self._epub_path = epub_path
@@ -445,8 +456,11 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
         end
     end
     local html_text_cache = {}
+    local audio_path_cache = {}
+    local total_smils = #ordered_overlays
 
-    for _, overlay_info in ipairs(ordered_overlays) do
+    for smil_idx, overlay_info in ipairs(ordered_overlays) do
+        report("smil", smil_idx, total_smils, overlay_info.smil_href)
         local smil_href = overlay_info.smil_href
         if not smil_href then goto continue end
 
@@ -465,12 +479,19 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
         local smil_base = smil_path:match("^(.*)/") or ""
         local timing_data = self:_parseSmil(smil_xml, smil_base)
 
-        -- Extract audio files, resolve sentence texts, and collect entries
+        -- Resolve audio paths once per distinct audio_src (Storyteller books
+        -- reference the same MP4 from thousands of <par> entries).
         for _, entry in ipairs(timing_data) do
             if entry.audio_src then
-                local audio_path = self:_extractAudioFile(epub_path, entry.audio_src, self._cache_dir)
-                if audio_path then
-                    entry.audio_path = audio_path
+                local ap = audio_path_cache[entry.audio_src]
+                if not ap then
+                    ap = self:_extractAudioFile(epub_path, entry.audio_src, self._cache_dir)
+                    audio_path_cache[entry.audio_src] = ap or false
+                elseif ap == false then
+                    ap = nil
+                end
+                if ap then
+                    entry.audio_path = ap
                 end
             end
             -- "../text/part0007.html#id12-s0" -> content doc + fragment id,
@@ -513,7 +534,13 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
     -- interleaves chapters.  Order here is narrative (SMIL) order; the
     -- caller groups by audio file and each group is internally monotonic.
 
-    logger.warn("EpubMediaOverlay: loaded", #all_timing_data, "timing entries")
+    local unique_audio = 0
+    for _ in pairs(audio_path_cache) do unique_audio = unique_audio + 1 end
+    report("done", #all_timing_data, total_smils,
+        string.format("%d timing, %d audio", #all_timing_data, unique_audio))
+
+    logger.warn("EpubMediaOverlay: loaded", #all_timing_data, "timing entries,",
+        unique_audio, "audio files")
     return all_timing_data
 end
 

@@ -200,21 +200,28 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
         return false
     end
 
-    -- 3. Fast cross-document probe: crengine can often resolve a plain id to
-    -- a global page number even when the fragment is not in the currently
-    -- loaded content document.  If it returns a valid page, load it and verify
-    -- the fragment is reachable before scrolling.
+    -- 3. Spine DocFragment jump (reliable for Storyteller EPUBs): use the EPUB
+    -- spine order to know which DocFragment contains the target document.
+    if self:_gotoViaSpineDocFragment(text_doc, fragment_id, start_page) then
+        cache_current_xpointer()
+        if fragment_in_document() then scroll_to_fragment() end
+        UIManager:setDirty("all", "ui")
+        return true
+    end
+
+    -- 4. getPageFromXPointer probe (skip page 1 — bogus on Kindle).
     local ok_fp, page_fp = pcall(function()
         return ui.document:getPageFromXPointer(xp)
     end)
-    if ok_fp and page_fp and page_fp > 0 and page_fp ~= start_page then
+    if ok_fp and page_fp and page_fp > 1 and page_fp ~= start_page then
         logger.warn("MediaSync: getPageFromXPointer page", page_fp, "for", xp)
         if try_page(page_fp) then
             return true
         end
+        pcall(function() ui.document:gotoPage(start_page, false) end)
     end
 
-    -- 4. TOC fallback: match the content document's chapter title against the
+    -- 5. TOC fallback: match the content document's chapter title against the
     -- EPUB table of contents, derive the DocFragment index from the TOC
     -- xpointer, and jump to the fragment with a full internal xpointer.
     if allow_scan then
@@ -226,19 +233,7 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
         end
     end
 
-    -- 4b. Spine DocFragment fallback: use the EPUB spine order to know which
-    -- DocFragment contains the target content document, then build a full
-    -- xpointer to the fragment.
-    if allow_scan then
-        if self:_gotoViaSpineDocFragment(text_doc, fragment_id, start_page) then
-            cache_current_xpointer()
-            if fragment_in_document() then scroll_to_fragment() end
-            UIManager:setDirty("all", "ui")
-            return true
-        end
-    end
-
-    -- 5. Text-search fallback: search the whole rendered book for the sentence
+    -- 6. Text-search fallback: search the whole rendered book for the sentence
     -- text.  crengine cannot resolve a plain fragment id to a global page on
     -- this device, but findText returns full internal xpointers that usually
     -- can be followed.  We accept an occurrence whose DocFragment index matches
@@ -304,12 +299,12 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
                         logger.warn("MediaSync: text-search onGotoXPointer",
                             "ok=", tostring(ok_goto),
                             "page_before=", before_page, "page_after=", after_page)
-                        if ok_goto and after_page and after_page ~= before_page then
-                            cache_current_xpointer()
-                            if fragment_in_document() then scroll_to_fragment() end
-                            UIManager:setDirty("all", "ui")
-                            return true
-                        end
+                        if ok_goto and after_page then
+                cache_current_xpointer()
+                if fragment_in_document() then scroll_to_fragment() end
+                UIManager:setDirty("all", "ui")
+                return true
+            end
                     end
                 end
             end
@@ -458,8 +453,13 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
             logger.warn("MediaSync: onGotoXPointer full xp",
                 "ok=", tostring(ok_goto),
                 "page_before=", before_page, "page_after=", after_page)
-            if ok_goto and after_page and after_page ~= before_page then
-                return true, norm
+            if ok_goto and after_page then
+                if fragment_in_document() then
+                    return true, norm
+                end
+                if after_page ~= before_page then
+                    return true, norm
+                end
             end
         end
     end
@@ -1136,18 +1136,41 @@ function MediaSync:_updateHighlightAtTime(pos)
                 and follow_page_turns and not suppress_auto_follow then
                 local ui = self.plugin and self.plugin.ui
                 if ui then
-                    pcall(function()
-                        self:_markPageFollowAuto()
-                        local ms = self
-                        ui:handleEvent(Event:new("GotoViewRel", 1))
-                        self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
-                        if sentence.fragment_id then
-                            self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
-                        end
-                        UIManager:scheduleIn(2.5, function()
-                            ms:_clearPageFollowAuto()
+                    local expected_n = self:_getExpectedDocFragmentIndex(sentence.text_doc)
+                    local cur_frag = nil
+                    if ui.document then
+                        local cur_xp = ui.document:getXPointer()
+                        cur_frag = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+                    end
+                    local cross_doc = expected_n and cur_frag and expected_n ~= cur_frag
+                    if cross_doc and sentence.fragment_id then
+                        pcall(function()
+                            self:_markPageFollowAuto()
+                            local ms = self
+                            self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, true, sentence.text)
+                            UIManager:scheduleIn(0.3, function()
+                                pcall(function()
+                                    self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                                end)
+                            end)
+                            UIManager:scheduleIn(2.5, function()
+                                ms:_clearPageFollowAuto()
+                            end)
                         end)
-                    end)
+                    elseif not cross_doc then
+                        pcall(function()
+                            self:_markPageFollowAuto()
+                            local ms = self
+                            ui:handleEvent(Event:new("GotoViewRel", 1))
+                            self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                            if sentence.fragment_id then
+                                self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+                            end
+                            UIManager:scheduleIn(2.5, function()
+                                ms:_clearPageFollowAuto()
+                            end)
+                        end)
+                    end
                 end
             end
             -- If the sentence is genuinely not on the visible page and we
@@ -1693,6 +1716,11 @@ function MediaSync:_showModalMenu(opts)
 end
 
 function MediaSync:showChapterList()
+    if self.overlay_mode and self.plugin and self.plugin._smil_overlay_chapters
+        and #self.plugin._smil_overlay_chapters > 0 then
+        self:showOverlayChapterList()
+        return
+    end
     if self.playlist_files and #self.playlist_files > 0 then
         self:showPlaylist()
         return
@@ -1718,6 +1746,61 @@ function MediaSync:showChapterList()
         })
     end
     self:_showModalMenu{ title = _("Chapters"), items = items, current = current_idx }
+end
+
+--- Storyteller read-along: list every SMIL content-document chapter, not just
+--- the four embedded MP4 audio segments shown in the playlist menu.
+function MediaSync:showOverlayChapterList()
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or #chapters == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No chapters available."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local current_time = self.media_engine and self.media_engine:getPosition() or 0
+    local current_path = self.media_engine and self.media_engine.current_path
+    local current_idx = 1
+    for i, ch in ipairs(chapters) do
+        if ch.audio_path == current_path and ch.start_time <= current_time + 1 then
+            current_idx = i
+        end
+    end
+
+    local items = {}
+    for i, ch in ipairs(chapters) do
+        table.insert(items, {
+            text = (ch.title or _("Chapter") .. " " .. i)
+                .. "  (" .. self:_formatTime(ch.start_time) .. ")",
+            callback = function()
+                self:_closeModalMenu()
+                self:seekToOverlayChapter(i)
+            end,
+        })
+    end
+    self:_showModalMenu{ title = _("Chapters"), items = items, current = current_idx }
+end
+
+function MediaSync:seekToOverlayChapter(index)
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or not chapters[index] then return end
+    local ch = chapters[index]
+    if ch.audio_path and self.media_engine
+        and self.media_engine.current_path ~= ch.audio_path then
+        if self.plugin and self.plugin._playAudioFile then
+            self.plugin:_playAudioFile(ch.audio_path, self.playlist_files)
+        end
+    end
+    UIManager:scheduleIn(0.2, function()
+        self:seekToTime(ch.start_time)
+        if self.overlay_mode and ch.fragment_id then
+            UIManager:scheduleIn(0.3, function()
+                self:navigateToSentenceAtTime(ch.start_time)
+            end)
+        end
+    end)
 end
 
 function MediaSync:showPlaylist()
