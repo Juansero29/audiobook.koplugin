@@ -1110,12 +1110,14 @@ function MediaSync:_updateHighlightAtTime(pos)
                 self.plugin._suppress_media_sync_auto_page_follow = nil
             end
         end
-        if self.highlight_manager and sentence.text then
+        if self.highlight_manager and (sentence.text or sentence.fragment_id) then
             -- Build a synthetic sentence object for HighlightManager
             local sent_obj = {
-                text = sentence.text,
+                text = sentence.text or "",
                 start_pos = sentence.start_pos or 0,
-                end_pos = sentence.end_pos or #sentence.text,
+                end_pos = sentence.end_pos or #(sentence.text or ""),
+                fragment_id = sentence.fragment_id,
+                text_doc = sentence.text_doc,
             }
             local hl_ok = false
             pcall(function()
@@ -1216,6 +1218,7 @@ end
 
 function MediaSync:_findSentenceAtTime(pos)
     local data = self.timing_data
+    if not data or #data == 0 then return nil end
     local lo, hi = 1, #data
     while lo <= hi do
         local mid = math.floor((lo + hi) / 2)
@@ -1235,6 +1238,14 @@ function MediaSync:_findSentenceAtTime(pos)
     -- If before the beginning, return first
     if pos < data[1].start_time then
         return 1
+    end
+    -- Gap between clips (Storyteller sometimes leaves tiny holes): keep the
+    -- last sentence that has already started so the highlight does not blink off.
+    if hi >= 1 and hi <= #data and data[hi].start_time <= pos then
+        return hi
+    end
+    if lo >= 1 and lo <= #data and data[lo].start_time <= pos then
+        return lo
     end
     return nil
 end
@@ -1570,11 +1581,13 @@ function MediaSync:navigateToSentenceEntry(entry)
         ms:_clearPageFollowAuto()
     end)
 
-    if self.highlight_manager and sentence.text then
+    if self.highlight_manager and (sentence.text or sentence.fragment_id) then
         local sent_obj = {
-            text = sentence.text,
+            text = sentence.text or "",
             start_pos = sentence.start_pos or 0,
-            end_pos = sentence.end_pos or #sentence.text,
+            end_pos = sentence.end_pos or #(sentence.text or ""),
+            fragment_id = sentence.fragment_id,
+            text_doc = sentence.text_doc,
         }
         self.highlight_manager._line_cache = nil
         UIManager:scheduleIn(0.3, function()
@@ -1646,11 +1659,13 @@ function MediaSync:refocusToCurrentSentence()
     end)
 
     -- Re-highlight the current sentence after the page settles.
-    if self.highlight_manager and sentence.text then
+    if self.highlight_manager and (sentence.text or sentence.fragment_id) then
         local sent_obj = {
-            text = sentence.text,
+            text = sentence.text or "",
             start_pos = sentence.start_pos or 0,
-            end_pos = sentence.end_pos or #sentence.text,
+            end_pos = sentence.end_pos or #(sentence.text or ""),
+            fragment_id = sentence.fragment_id,
+            text_doc = sentence.text_doc,
         }
         UIManager:scheduleIn(0.3, function()
             pcall(function()

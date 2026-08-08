@@ -85,11 +85,74 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
     -- Returns true when the sentence was found and highlighted on the
     -- visible page (callers use this for read-along page advancement).
     if self.ui.rolling then
+        -- Storyteller / EPUB3 Media Overlays: prefer the SMIL fragment id
+        -- (Readest-style) over fuzzy on-screen text matching.
+        if sentence.fragment_id then
+            local ok = self:_highlightByFragmentId(doc, sentence.fragment_id)
+            if ok then return true end
+        end
         return self:_highlightSentenceRolling(sentence, parsed_data, doc)
     else
         -- PDF / paged mode: use view.highlight.temp
         return self:_highlightSentencePaging(sentence, parsed_data, doc)
     end
+end
+
+--- Highlight a SMIL sentence via its DOM id (e.g. "html39-s12").
+-- Works only when that content document is already the current CRe document.
+function HighlightManager:_highlightByFragmentId(doc, fragment_id)
+    if not doc or not fragment_id then return false end
+    local xp0
+    local ok_xp, norm = pcall(function()
+        return doc:getNormalizedXPointer("#" .. fragment_id)
+    end)
+    if not (ok_xp and norm and norm ~= false) then
+        return false
+    end
+    xp0 = norm
+    local xp1 = xp0
+
+    -- Expand to the full sentence/element when CRe supports it.
+    pcall(function()
+        local a, b = doc:extendXPointersToSentenceSegment(xp0, xp0)
+        if a and b then
+            xp0, xp1 = a, b
+        end
+    end)
+
+    local drawn
+    pcall(function()
+        drawn = doc:getTextFromXPointers(xp0, xp1, true)
+    end)
+    if not drawn or drawn == "" then
+        -- Fallback: DOM text + on-screen text match (still better than SMIL
+        -- text that may diverge from CRe's rendered form).
+        local node_text
+        pcall(function() node_text = doc:getTextFromXPointer(xp0) end)
+        pcall(function() doc:clearSelection() end)
+        if node_text and node_text ~= "" then
+            return self:_highlightSentenceRolling({ text = node_text }, nil, doc)
+        end
+        return false
+    end
+
+    self._selection_active = true
+    self.is_highlighting = true
+    self._pending_boxes = nil
+    local boxes
+    pcall(function()
+        boxes = doc:getScreenBoxesFromPositions(xp0, xp1, true)
+    end)
+    if boxes and #boxes > 0 and self.current_style ~= self.STYLES.INVERT then
+        self._pending_boxes = boxes
+        self:_ensureViewModule()
+        pcall(function() doc:clearSelection() end)
+        self._selection_active = false
+        UIManager:setDirty(self.ui.dialog or "all", "ui")
+    else
+        UIManager:setDirty(self.ui.dialog or "all", "ui")
+    end
+    return true
 end
 
 --[[--

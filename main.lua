@@ -1487,6 +1487,28 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
 
     -- Reuse a just-loaded cache (e.g. "Play aligned from here") so we don't
     -- re-parse the whole EPUB and invalidate start_entry.audio_path keys.
+    -- Drop the in-memory cache when the EPUB was replaced in-place (Storyteller
+    -- re-export keeps the same path but changes size/mtime).
+    local function epub_fp(path)
+        local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+        if ok and lfs and lfs.attributes then
+            local attr = lfs.attributes(path)
+            if attr and attr.size and attr.modification then
+                return string.format("%d:%d", attr.size, attr.modification)
+            end
+        end
+        return nil
+    end
+    local cur_fp = epub_fp(doc_path)
+    if self._smil_doc_path == doc_path and cur_fp and self._smil_epub_fp
+        and self._smil_epub_fp ~= cur_fp then
+        logger.warn("Audiobook: EPUB replaced on disk — clearing SMIL memory cache")
+        self._smil_parser = nil
+        self._smil_timing_data = nil
+        self._smil_by_file = nil
+        self._smil_page_index = nil
+    end
+
     local parser = self._smil_parser
     local timing_data = self._smil_timing_data
     if not (parser and timing_data and self._smil_doc_path == doc_path) then
@@ -1670,6 +1692,7 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         self._smil_by_file = by_file
         self._smil_page_index = nil
         self._smil_doc_path = doc_path
+        self._smil_epub_fp = cur_fp or epub_fp(doc_path)
         local first = start_file or files[1]
         -- Guard against a saved resume audio_path that no longer matches the
         -- parsed timing data (e.g., path normalization differences).
