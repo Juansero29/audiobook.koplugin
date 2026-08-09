@@ -91,10 +91,47 @@ end
 -- Every setFocus makes audiomgrd re-ramp gain to its stored level, which
 -- resets the headset volume on each call -- so seeks and track switches
 -- must not re-issue it.  New streams inherit focus from audiomgrd's cache.
-function MediaEngine._takeMusicFocusOnce()
-    if MediaEngine._focus_taken then return end
+-- Exception: Apple AirPods often drop the A2DP audio session after a short
+-- blip; forcing Music focus again on recovery is required to resume sound.
+function MediaEngine._takeMusicFocusOnce(force)
+    if MediaEngine._focus_taken and not force then return end
     os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
     MediaEngine._focus_taken = true
+end
+
+function MediaEngine._clearMusicFocusFlag()
+    MediaEngine._focus_taken = false
+end
+
+--- Best-effort connected headset name from Kindle btfd (for AirPods heuristics).
+function MediaEngine:_kindleConnectedHeadsetName()
+    if not self:_isKindle() then return nil end
+    local h = io.popen("lipc-hash-prop com.lab126.btfd ListConnected 2>/dev/null")
+    if not h then return nil end
+    local out = h:read("*a") or ""
+    h:close()
+    -- Prefer the first non-empty bd_name.
+    for name in out:gmatch('bd_name%s*=%s*"(.-)"') do
+        if name ~= "" then return name end
+    end
+    return nil
+end
+
+function MediaEngine:_isAppleAirPodsHeadset()
+    local name = self:_kindleConnectedHeadsetName()
+    if not name then return false end
+    name = name:lower()
+    return name:find("airpods", 1, true) ~= nil
+        or name:find("beats", 1, true) ~= nil
+end
+
+function MediaEngine:_kindleA2dpRouteUp()
+    if not self:_isKindle() then return true end
+    local h = io.popen("lipc-get-prop com.lab126.audiomgrd audioOutputConnected 2>/dev/null")
+    if not h then return false end
+    local v = h:read("*a") or ""
+    h:close()
+    return v:match("^%s*1") ~= nil
 end
 
 --[[--
@@ -889,16 +926,27 @@ function MediaEngine:_spawnTracked(cmd, gen, opts)
             os.remove(pid_file)
             self:_startPositionPoller(gen)
             self:_startCompletionWatcher(gen)
-        elseif attempt < 3 then
-            UIManager:scheduleIn(0.2, function()
+        elseif attempt < 5 then
+            -- Kindle + AirPods: PID file can lag >0.3s while A2DP renegotiates.
+            -- Retry longer before giving up — never orphan-kill here: that was
+            -- murdering the just-started stream (brief sound, then silence).
+            UIManager:scheduleIn(0.25, function()
                 try_capture_pid(attempt + 1)
             end)
         else
             logger.warn("MediaEngine: " .. name .. " PID capture failed after retries")
-            -- Untracked Kindle gst pipelines are exactly what causes the
-            -- echo/loop; kill them now before they overlap the next seek.
+            -- Last resort: recover PID from the abk-progress ffmpeg cmdline
+            -- without killing anything.
             if name == "kindle-gst" and self:_isKindle() then
-                self:_killOrphanKindleGstPipelines("spawn-fallback", 300000)
+                local ph = io.popen("pgrep -f 'abk-progress-" .. tostring(gen) .. "' 2>/dev/null")
+                if ph then
+                    local recovered = tonumber((ph:read("*l") or ""):match("%d+"))
+                    ph:close()
+                    if recovered then
+                        self.audio_pid = recovered
+                        logger.warn("MediaEngine: recovered kindle-gst PID via pgrep =", recovered)
+                    end
+                end
             end
             os.remove(pid_file)
             self:_startPositionPoller(gen)
@@ -1281,7 +1329,16 @@ function MediaEngine:_playSystemGstLaunch(gen)
     -- (pause/seek), then take audio focus before the stream attaches.
     os.execute("for f in /dev/shm/mstream*; do p=${f#/dev/shm/mstream}; p=${p%%_*};"
         .. " [ -d /proc/$p ] || rm -f \"$f\"; done 2>/dev/null")
-    MediaEngine._takeMusicFocusOnce()
+    local apple = self:_isAppleAirPodsHeadset()
+    if apple and not self:_kindleA2dpRouteUp() then
+        MediaEngine._clearMusicFocusFlag()
+        MediaEngine._takeMusicFocusOnce(true)
+    else
+        MediaEngine._takeMusicFocusOnce()
+    end
+    if apple then
+        self.position_latency_s = 2.2
+    end
 
     -- Nuke any previous audiobook gst-launch-0.10 pipeline before attaching
     -- a new stream to mixersink.  If the old pipeline is still draining its
@@ -1297,9 +1354,14 @@ function MediaEngine:_playSystemGstLaunch(gen)
         .. " ! mixersink stream-type=Music sync=true",
         raw_file:gsub("'", "'\\''"), caps)
     logger.warn("MediaEngine: system gst-launch gen=", gen,
-        "rate=", rate, "ch=", channels, "seek_offset=", self._seek_offset or 0)
+        "rate=", rate, "ch=", channels, "seek_offset=", self._seek_offset or 0,
+        "apple_airpods=", apple and "yes" or "no")
 
-    return self:_spawnTracked(cmd, gen, { name = "kindle-gst", quiet = true })
+    local ok = self:_spawnTracked(cmd, gen, { name = "kindle-gst", quiet = true })
+    if ok then
+        self:_startA2dpWatchdog(gen)
+    end
+    return ok
 end
 
 --[[--
@@ -1332,7 +1394,15 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     self:_killOrphanKindleGstPipelines("kindle-gst-ffmpeg", 150000)
 
     -- Take focus after the old pipeline has had a moment to tear down.
-    MediaEngine._takeMusicFocusOnce()
+    -- AirPods: if the A2DP route is down, force a fresh Music focus so
+    -- audiomgrd re-binds the headset (once-per-session is not enough).
+    local apple = self:_isAppleAirPodsHeadset()
+    if apple and not self:_kindleA2dpRouteUp() then
+        MediaEngine._clearMusicFocusFlag()
+        MediaEngine._takeMusicFocusOnce(true)
+    else
+        MediaEngine._takeMusicFocusOnce()
+    end
 
     local seek = self._seek_offset or 0
 
@@ -1347,40 +1417,45 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     os.remove(progress_file)
     self._progress_file = progress_file
     self._use_progress_position = true
-    -- adelay prepends 0.5 s of silence inside the decoded stream, so out_time
-    -- is 0.5 s larger than the real content time; getPosition() subtracts it.
-    self._progress_adelay_s = 0.5
 
-    -- adelay=500:all=1: lead-in silence absorbing the A2DP datapath resume
-    -- (which otherwise swallows the start); apad: tail silence covering
-    -- the ring/BT buffers at EOS (which otherwise clip the end).
+    -- adelay lead-in absorbs A2DP datapath resume (otherwise swallows start);
+    -- apad covers ring/BT buffers at EOS.  AirPods Pro need a longer lead-in
+    -- before the AAC/SBC sink is ready to accept PCM.
+    local adelay_ms = apple and 900 or 500
+    local apad_s = apple and 1.5 or 1.0
+    -- adelay prepends silence inside the decoded stream; getPosition() subtracts it.
+    self._progress_adelay_s = adelay_ms / 1000
+
     -- :all=1 is required because the input may be stereo: without it adelay
     -- would delay only channel 0 and -ac 1 would mix delayed left with
     -- undelayed right, producing a persistent echo.
     local pipeline = string.format(
         "%s -loglevel error -progress '%s' -nostats -ss %.3f -i '%s'"
         .. " -f s16le -ar 22050 -ac 1"
-        .. " -af adelay=500:all=1%s,apad=pad_dur=1 - 2>/dev/null"
+        .. " -af adelay=%d:all=1%s,apad=pad_dur=%.1f - 2>/dev/null"
         .. " | gst-launch-0.10 fdsrc"
         .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
         .. " ! mixersink stream-type=Music sync=true",
         ffmpeg:gsub("'", "'\\''"), progress_file:gsub("'", "'\\''"), seek,
-        self.current_path:gsub("'", "'\\''"), self:_volumeFilterPart())
+        self.current_path:gsub("'", "'\\''"), adelay_ms, self:_volumeFilterPart(), apad_s)
     -- out_time is the PRODUCER side: it leads what the listener hears by the
     -- whole downstream buffer -- OS pipe (~1.5 s when full) + gst/mixersink
-    -- ring (~0.9 s) + BT chain (~0.3 s) ~= 2.7 s.  The sync loop subtracts
-    -- this so highlights match the audible audio.  Single stable constant
-    -- now (no variable startup mixed in); tune here if needed, the user's
-    -- live nudge handles any residual.
-    self.position_latency_s = 2.7
+    -- ring (~0.9 s) + BT chain (~0.3 s) ~= 2.7 s.  AirPods buffer a bit more.
+    self.position_latency_s = apple and 3.2 or 2.7
     logger.warn("MediaEngine: system gst-launch (ffmpeg stream) gen=", gen,
-        "seek_offset=", seek, "progress=", progress_file)
+        "seek_offset=", seek, "progress=", progress_file,
+        "apple_airpods=", apple and "yes" or "no",
+        "adelay_ms=", adelay_ms)
 
     -- setsid: the wrapper shell becomes a process-group leader so stop()'s
     -- kill(-pid) takes down ffmpeg AND gst-launch; without it the pipeline
     -- would be orphaned and keep playing.  exec=false: it's a pipeline.
-    return self:_spawnTracked(pipeline, gen,
+    local ok = self:_spawnTracked(pipeline, gen,
         { name = "kindle-gst", setsid = true, exec = false, quiet = true })
+    if ok then
+        self:_startA2dpWatchdog(gen)
+    end
+    return ok
 end
 
 -- ---------------------------------------------------------------------------
@@ -1965,6 +2040,50 @@ function MediaEngine:_startPositionPoller(gen)
     self._position_timer = UIManager:scheduleIn(1.0, poll)
 end
 
+--- Kindle A2DP watchdog: if audiomgrd drops the output route mid-play
+--- (common with AirPods Pro renegotiating AAC), re-take Music focus and
+--- soft-restart once at the current position.
+function MediaEngine:_startA2dpWatchdog(gen)
+    if not self:_isKindle() then return end
+    if self._a2dp_watchdog_gen == gen then return end
+    self._a2dp_watchdog_gen = gen
+    local misses = 0
+    local function tick()
+        if self.play_generation ~= gen then return end
+        if not self.is_playing or self.is_paused then return end
+        if self:_kindleA2dpRouteUp() then
+            misses = 0
+            -- Healthy play lasting a few ticks clears one-shot recovery flags.
+            self._a2dp_auto_retry_done = nil
+            self._a2dp_route_restart_done = nil
+        else
+            misses = misses + 1
+            logger.warn("MediaEngine: A2DP route down (miss=", misses, ")")
+            if misses >= 2 then
+                MediaEngine._clearMusicFocusFlag()
+                MediaEngine._takeMusicFocusOnce(true)
+                if self:_isAppleAirPodsHeadset() and not self._a2dp_route_restart_done then
+                    self._a2dp_route_restart_done = true
+                    local pos = 0
+                    pcall(function() pos = self:getPosition() or 0 end)
+                    local complete_cb = self._on_complete
+                    local fail_cb = self._on_fail
+                    self._seek_offset = math.max(0, pos)
+                    logger.warn("MediaEngine: A2DP route recovery restart at", self._seek_offset)
+                    UIManager:scheduleIn(0.4, function()
+                        if self.play_generation ~= gen then return end
+                        self:play(complete_cb, fail_cb)
+                    end)
+                    return
+                end
+                misses = 0
+            end
+        end
+        UIManager:scheduleIn(1.5, tick)
+    end
+    UIManager:scheduleIn(2.0, tick)
+end
+
 function MediaEngine:_startCompletionWatcher(gen)
     -- Watch for process exit via PID polling
     local function check()
@@ -1975,10 +2094,58 @@ function MediaEngine:_startCompletionWatcher(gen)
         if self.audio_pid then
             local h = io.open("/proc/" .. self.audio_pid .. "/status", "r")
             if not h then
-                -- Process exited
+                -- Process exited.  Distinguish EOS from a premature A2DP drop
+                -- (AirPods Pro often kill the stream after a short blip).
+                local pos = 0
+                pcall(function() pos = self:getPosition() or 0 end)
+                local dur = tonumber(self.current_duration) or 0
+                -- Avoid false positives on short SMIL clips (1–3 s): only treat
+                -- as premature when clearly far from natural EOS.
+                local premature = false
+                if dur > 4 then
+                    premature = pos < (dur - 1.5)
+                elseif dur > 0 then
+                    premature = pos < (dur * 0.45)
+                else
+                    premature = pos < 1.0
+                end
+
                 self.is_playing = false
                 self.is_paused = false
                 self.audio_pid = nil
+
+                if premature and self:_isKindle() then
+                    logger.warn("MediaEngine: premature pipeline exit at", pos,
+                        "dur=", dur, "— treating as fail (A2DP recovery)")
+                    MediaEngine._clearMusicFocusFlag()
+                    MediaEngine._takeMusicFocusOnce(true)
+                    local fail_cb = self._on_fail
+                    local complete_cb = self._on_complete
+                    self._on_fail = nil
+                    self._on_complete = nil
+                    -- One automatic restart for Apple headsets / Kindle GST.
+                    if not self._a2dp_auto_retry_done
+                        and (self:_isAppleAirPodsHeadset()
+                            or self.backend == self.BACKENDS.KINDLE_GST_PLAY) then
+                        self._a2dp_auto_retry_done = true
+                        self._seek_offset = math.max(0, pos)
+                        UIManager:scheduleIn(0.6, function()
+                            if self.play_generation ~= gen then return end
+                            logger.warn("MediaEngine: A2DP auto-retry at", self._seek_offset)
+                            self:play(complete_cb, fail_cb)
+                        end)
+                        return
+                    end
+                    if fail_cb then
+                        fail_cb("premature pipeline exit")
+                    elseif complete_cb then
+                        -- No fail handler: avoid advancing SMIL as if EOS.
+                        logger.warn("MediaEngine: premature exit, no on_fail; not completing")
+                    end
+                    return
+                end
+
+                self._a2dp_auto_retry_done = nil
                 if self._on_complete then
                     local cb = self._on_complete
                     self._on_complete = nil
@@ -2281,6 +2448,33 @@ function MediaEngine:seek(seconds, mode)
             target = self:getPosition() + seconds
         end
         target = math.max(0, target)
+
+        -- Kindle A2DP (esp. AirPods): a no-op seek-by-restart right after play
+        -- tears down a healthy pipeline → brief sound, then silence.
+        -- Skip when we are already at/near the requested offset.
+        do
+            local current = self:getPosition() or 0
+            local started_at = self._seek_offset or 0
+            local near_current = math.abs(current - target) < 0.6
+            local near_start = math.abs(started_at - target) < 0.25
+            local just_started = false
+            if self._play_start_time then
+                local ok_ms, age_ms = pcall(function()
+                    return time.to_ms(UIManager:getTime() - self._play_start_time)
+                end)
+                if ok_ms and type(age_ms) == "number" then
+                    just_started = age_ms < 2500
+                elseif near_start and was_playing then
+                    just_started = true
+                end
+            end
+            if was_playing and (near_current or (near_start and just_started)) then
+                logger.warn("MediaEngine: skip no-op seek-by-restart",
+                    "req=", seconds, "target=", target,
+                    "current=", current, "seek_offset=", started_at)
+                return true
+            end
+        end
 
         if self._persistent_pipeline_active then
             logger.warn("MediaEngine: persistent-pipeline seek mode=", mode,
