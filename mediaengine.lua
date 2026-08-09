@@ -175,18 +175,51 @@ function MediaEngine:_startKindleA2dpKeepalive(reason)
     local pid_str = h and h:read("*a") or ""
     if h then h:close() end
     self._keepalive_pid = tonumber(pid_str:match("(%d+)"))
-    logger.warn("MediaEngine: Kindle A2DP keepalive started (", reason or "?",
+    self._keepalive_reason = reason or "?"
+    logger.warn("MediaEngine: Kindle A2DP keepalive started (", self._keepalive_reason,
         ") PID=", self._keepalive_pid)
 end
 
-function MediaEngine:_stopKindleA2dpKeepalive()
+function MediaEngine:_stopKindleA2dpKeepalive(only_if_reason)
+    if only_if_reason and self._keepalive_reason ~= only_if_reason then
+        return
+    end
     local pid = self._keepalive_pid
     self._keepalive_pid = nil
+    self._keepalive_reason = nil
     if not pid then return end
     os.execute("kill -9 " .. tostring(pid) .. " 2>/dev/null")
     -- Also match the distinctive log path in case $! was a wrapper shell.
     os.execute("pkill -9 -f 'abk-keepalive' 2>/dev/null")
     logger.warn("MediaEngine: Kindle A2DP keepalive stopped PID=", pid)
+end
+
+--- Public: cycle BT A2DP and restart content at the current position.
+--- Used by the player "Fix audio" button when AirPods go silent mid-play.
+function MediaEngine:fixKindleA2dpAudio()
+    if not self:_isKindle() then return false end
+    if not self.current_path then return false end
+    local pos = 0
+    pcall(function() pos = self:getPosition() or 0 end)
+    if pos <= 0 then pos = self._seek_offset or 0 end
+    local complete = self._on_complete
+    local fail = self._on_fail
+    local gen = self.play_generation
+    self._seek_offset = math.max(0, pos)
+    logger.warn("MediaEngine: fixKindleA2dpAudio at", self._seek_offset)
+    self:_startKindleA2dpKeepalive("fix-audio")
+    self:_cycleKindleA2dpRoute(function(ok)
+        if self.play_generation ~= gen and not self.is_playing then
+            -- superseded
+        end
+        logger.warn("MediaEngine: fixKindleA2dpAudio route ok=", ok and "yes" or "no")
+        self.is_paused = false
+        self:play(complete, fail)
+        UIManager:scheduleIn(1.5, function()
+            self:_stopKindleA2dpKeepalive("fix-audio")
+        end)
+    end)
+    return true
 end
 
 --- Disconnect/Connect cycle that re-arms A2DP (same as BTManager:connect).
@@ -958,18 +991,16 @@ function MediaEngine:play(on_complete, on_fail)
         return false
     end
 
-    -- Defensive: on Kindle the mixersink can hold a dying stream across a
-    -- stop/play cycle and mix it with the new one, producing an echo/loop.
-    -- Nuke any orphan pipelines before stop() bumps the generation, then
-    -- stop() will also run the same cleanup as a fallback.
-    -- If a pause-keepalive is holding A2DP open, only kill content pipelines
-    -- so the datapath stays up across the resume gap.
-    if self:_isKindle() then
-        if self._keepalive_pid then
-            self:_killOrphanKindleGstPipelines("play-preflight", 100000, { content_only = true })
-        else
-            self:_killOrphanKindleGstPipelines("play-preflight", 300000)
+    -- Kindle A2DP (AirPods): any stop→play gap (seek, track advance, resume)
+    -- lets audiomgrd suspend the datapath.  Park silence first so orphan-kill
+    -- never leaves the mixer empty.
+    if self:_isKindle() and self:_kindleNeedsPipelineRestartOnResume() then
+        if not self._keepalive_pid then
+            self:_startKindleA2dpKeepalive("play-bridge")
         end
+        self:_killOrphanKindleGstPipelines("play-preflight", 100000, { content_only = true })
+    elseif self:_isKindle() then
+        self:_killOrphanKindleGstPipelines("play-preflight", 300000)
     end
 
     self:stop()
@@ -1601,6 +1632,17 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
         { name = "kindle-gst", setsid = true, exec = false, quiet = true })
     if ok then
         self:_startA2dpWatchdog(gen)
+        -- Drop transitional keepalive once content is attached (not pause keepalive).
+        UIManager:scheduleIn(1.5, function()
+            if self.play_generation ~= gen then return end
+            if not self.is_playing or self.is_paused then return end
+            local reason = self._keepalive_reason
+            if reason == "play-bridge" or reason == "seek-bridge"
+                or reason == "track-advance" or reason == "fix-audio"
+                or reason == "route-recovery" then
+                self:_stopKindleA2dpKeepalive(reason)
+            end
+        end)
     end
     return ok
 end
@@ -2743,6 +2785,10 @@ function MediaEngine:seek(seconds, mode)
         self._play_start_time = UIManager:getTime()
         self._total_pause_ms = 0
         self._pause_start_time = nil
+        -- Bridge A2DP across the stop→play gap (AirPods go silent otherwise).
+        if was_playing and self:_kindleNeedsPipelineRestartOnResume() then
+            self:_startKindleA2dpKeepalive("seek-bridge")
+        end
         self:stop()
         -- Capture the generation AFTER stop() (stop bumps it).  The scheduled
         -- restart fires unless something else supersedes it in the 0.5 s gap
@@ -2759,7 +2805,14 @@ function MediaEngine:seek(seconds, mode)
                     logger.dbg("MediaEngine: seek restart cancelled (generation changed)")
                     return
                 end
-                self:play(saved_on_complete, saved_on_fail)
+                if self:_kindleNeedsPipelineRestartOnResume() then
+                    self:_ensureKindleA2dpRoute(function()
+                        if self.play_generation ~= restart_gen then return end
+                        self:play(saved_on_complete, saved_on_fail)
+                    end)
+                else
+                    self:play(saved_on_complete, saved_on_fail)
+                end
             end)
         else
             self.is_playing = true

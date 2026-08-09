@@ -60,6 +60,8 @@ local AudiobookPlayer = InputContainer:extend{
     on_play_pause = nil,
     on_skip_back = nil,
     on_skip_forward = nil,
+    on_fix_audio = nil,
+    show_fix_audio = false,
     on_prev_chapter = nil,
     on_next_chapter = nil,
     on_seek = nil,
@@ -224,10 +226,22 @@ function AudiobookPlayer:setupUI()
         show_parent = self,
     }
 
+    -- Kindle AirPods: reconnect A2DP when the stream goes silent mid-play.
+    self.fix_audio_button = Button:new{
+        text = _("BT"),
+        width = button_size,
+        height = button_size,
+        text_font_size = 14,
+        callback = function() self:onFixAudio() end,
+        bordersize = 0,
+        show_parent = self,
+    }
+
     -- Count visible buttons for title width calculation
     local visible_buttons = 5 -- chapter_list, sleep_timer, speed, minimize, close
     if self.show_shuffle then visible_buttons = visible_buttons + 1 end
     if self.show_loop then visible_buttons = visible_buttons + 1 end
+    if self.show_fix_audio then visible_buttons = visible_buttons + 1 end
     self.title_widget = TextWidget:new{
         text = self.title or _("Audiobook"),
         face = Font:getFace("cfont", 18),
@@ -249,6 +263,10 @@ function AudiobookPlayer:setupUI()
     end
     if self.show_loop then
         table.insert(top_row_items, self.loop_button)
+        table.insert(top_row_items, HorizontalSpan:new{ width = math.floor(spacing / 2) })
+    end
+    if self.show_fix_audio then
+        table.insert(top_row_items, self.fix_audio_button)
         table.insert(top_row_items, HorizontalSpan:new{ width = math.floor(spacing / 2) })
     end
     table.insert(top_row_items, CenterContainer:new{
@@ -778,6 +796,10 @@ end
 
 function AudiobookPlayer:onLoop()
     if self.on_loop then self.on_loop() end
+end
+
+function AudiobookPlayer:onFixAudio()
+    if self.on_fix_audio then self.on_fix_audio() end
 end
 
 function AudiobookPlayer:onSeek(pct)

@@ -18,8 +18,10 @@ same device with Bose QuietComfort Ultra Gen1 and later with AirPods Pro 3.
 | First play after pairing / reconnect from plugin BT UI | Works (audio reaches AirPods) |
 | Continuous Storyteller / audiobook playback | Works |
 | Pause → wait → Play via Kindle UI / plugin controls | Works (v0.1.17.17 keepalive + resume path) |
-| Seek / skip while playing | Works |
+| Seek / skip while playing | Works (v0.1.17.18 bridges A2DP across seek-restart) |
+| Auto-advance to next SMIL/playlist chunk (~4–5 min) | Works (v0.1.17.18 keepalive across track gap) |
 | Manual Disconnect → Connect from plugin BT menu | Restores audio if the A2DP route went stale |
+| **BT** button on full player overlay | Cycles A2DP + restarts at current position (shortcut) |
 | Volume up/down via AirPods stem | Works (system / `audiomgrd` volume path) |
 | ANC on/off via stem long-press / gestures | Works on the headset (Apple BLE); no plugin involvement |
 | **Stem single-press Play/Pause** | **Does not work** (see Limitations) |

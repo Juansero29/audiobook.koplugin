@@ -6,6 +6,7 @@ Mirrors SyncController patterns but without TTS synthesis or sentence prefetch.
 @module koplugin.audiobook.mediasync
 --]]
 
+local Device = require("device")
 local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
@@ -1386,9 +1387,18 @@ function MediaSync:_onPlaybackComplete(gen)
     -- In playlist mode, auto-advance to the next track
     if self.playlist_files and #self.playlist_files > 0 then
         local next_idx = (self.current_playlist_idx or 1) + 1
+        local function advance(idx)
+            -- Bridge Kindle A2DP across the EOS → next-file gap (AirPods).
+            if self.media_engine and self.media_engine._startKindleA2dpKeepalive then
+                pcall(function()
+                    self.media_engine:_startKindleA2dpKeepalive("track-advance")
+                end)
+            end
+            self:switchToPlaylistFile(idx)
+        end
         if next_idx <= #self.playlist_files then
             logger.warn("MediaSync: auto-advancing to playlist track", next_idx)
-            self:switchToPlaylistFile(next_idx)
+            advance(next_idx)
             return
         elseif self.loop_enabled then
             -- Loop: wrap back to start (or random if shuffled)
@@ -1399,7 +1409,7 @@ function MediaSync:_onPlaybackComplete(gen)
                 next_idx = 1
             end
             logger.warn("MediaSync: looping to playlist track", next_idx)
-            self:switchToPlaylistFile(next_idx)
+            advance(next_idx)
             return
         end
     end
@@ -1527,6 +1537,19 @@ function MediaSync:showPlaybackBar()
                 pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
             end
         end or nil,
+        -- Kindle + AirPods: shortcut to cycle BT A2DP when audio goes silent
+        -- while the UI still shows playback progressing.
+        show_fix_audio = Device.isKindle and Device:isKindle() or false,
+        on_fix_audio = function()
+            if not (self.media_engine and self.media_engine.fixKindleA2dpAudio) then
+                return
+            end
+            UIManager:show(InfoMessage:new{
+                text = _("Reconnecting Bluetooth audio…"),
+                timeout = 4,
+            })
+            self.media_engine:fixKindleA2dpAudio()
+        end,
     }
     player:show()
     if self.plugin then
