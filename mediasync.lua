@@ -592,7 +592,8 @@ end
 
 function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position)
     if self.state == self.STATE.PLAYING or self.state == self.STATE.PAUSED then
-        self:stop(true) -- keep chapter menu open during track transitions
+        -- Soft stop: keep A2DP keepalive + player UI across playlist file changes.
+        self:stop(true, { track_transition = true })
     end
 
     if not audio_path or not timing_data or #timing_data == 0 then
@@ -600,6 +601,7 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
         return false
     end
 
+    self._track_advance_pending = nil
     self.state = self.STATE.LOADING
     self.timing_data = timing_data
     self.chapters = chapters or {}
@@ -727,7 +729,11 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     return true
 end
 
-function MediaSync:stop(keep_chapter_menu)
+--- @param keep_chapter_menu boolean|nil
+--- @param opts table|nil  { track_transition = true } spares A2DP keepalive and player UI
+function MediaSync:stop(keep_chapter_menu, opts)
+    opts = opts or {}
+    local track_transition = opts.track_transition and true or false
     local was_playing = self.state ~= self.STATE.STOPPED
     self.state = self.STATE.STOPPED
     self._chain_generation = self._chain_generation + 1
@@ -743,16 +749,19 @@ function MediaSync:stop(keep_chapter_menu)
 
     if self.media_engine then
         pcall(function()
-            -- Hard stop: tear down pause keepalive as well as content audio.
-            self.media_engine._kill_keepalive_on_stop = true
+            -- Hard stop (user close / end of book): tear down keepalive too.
+            -- Track transition: spare keepalive so AirPods A2DP stays armed.
+            self.media_engine._kill_keepalive_on_stop = not track_transition
             self.media_engine:stop()
         end)
     end
     if self.highlight_manager then
         pcall(function() self.highlight_manager:clearHighlights() end)
     end
-    if self.playback_bar then
-        pcall(function() self.playback_bar:hide() end)
+    if not track_transition then
+        if self.playback_bar then
+            pcall(function() self.playback_bar:hide() end)
+        end
     end
     if not keep_chapter_menu then
         if self._chapter_menu_window then
@@ -765,7 +774,7 @@ function MediaSync:stop(keep_chapter_menu)
     end
 
     if was_playing then
-        logger.warn("MediaSync: stopped")
+        logger.warn("MediaSync: stopped", track_transition and "(track transition)" or "")
     end
 end
 
@@ -936,13 +945,34 @@ function MediaSync:prevChapter()
     end
 end
 
+--- Keepalive (+ optional BT Disconnect/Connect) before switching audio files.
+function MediaSync:_bridgeKindleA2dpForTrackChange(then_fn)
+    local me = self.media_engine
+    local cycle_bt = false
+    if self.plugin and self.plugin.getSetting then
+        cycle_bt = self.plugin:getSetting("kindle_bt_reconnect_on_track", false) and true or false
+    end
+    if me and me.prepareKindleTrackAdvance then
+        me:prepareKindleTrackAdvance(function(_ok)
+            if then_fn then then_fn() end
+        end, { cycle_bt = cycle_bt })
+        return
+    end
+    if me and me._startKindleA2dpKeepalive then
+        pcall(function() me:_startKindleA2dpKeepalive("track-advance") end)
+    end
+    if then_fn then then_fn() end
+end
+
 function MediaSync:switchToPlaylistFile(index)
     if not self.playlist_files or not self.playlist_files[index] then return end
     self.current_playlist_idx = index
     local file_path = self.playlist_files[index].path
-    if self.plugin and self.plugin._playAudioFile then
-        self.plugin:_playAudioFile(file_path, self.playlist_files)
-    end
+    self:_bridgeKindleA2dpForTrackChange(function()
+        if self.plugin and self.plugin._playAudioFile then
+            self.plugin:_playAudioFile(file_path, self.playlist_files)
+        end
+    end)
 end
 
 function MediaSync:toggleLoop()
@@ -1339,21 +1369,30 @@ end
 
 function MediaSync:_onPlaybackComplete(gen)
     if self._chain_generation ~= gen then return end
+    if self._track_advance_pending then
+        logger.warn("MediaSync: playback complete ignored (track advance already pending)")
+        return
+    end
     logger.warn("MediaSync: playback complete")
     -- In playlist mode, auto-advance to the next track
     if self.playlist_files and #self.playlist_files > 0 then
         local next_idx = (self.current_playlist_idx or 1) + 1
         local function advance(idx)
-            -- Bridge Kindle A2DP across the EOS → next-file gap (AirPods).
-            if self.media_engine and self.media_engine._startKindleA2dpKeepalive then
-                pcall(function()
-                    self.media_engine:_startKindleA2dpKeepalive("track-advance")
-                end)
+            self._track_advance_pending = true
+            self._chain_generation = self._chain_generation + 1
+            if self._sync_timer then
+                UIManager:unschedule(self._sync_timer)
+                self._sync_timer = nil
             end
+            if self._position_timer then
+                UIManager:unschedule(self._position_timer)
+                self._position_timer = nil
+            end
+            logger.warn("MediaSync: auto-advancing to playlist track", idx,
+                "(A2DP bridge; BT cycle if setting enabled)")
             self:switchToPlaylistFile(idx)
         end
         if next_idx <= #self.playlist_files then
-            logger.warn("MediaSync: auto-advancing to playlist track", next_idx)
             advance(next_idx)
             return
         elseif self.loop_enabled then
@@ -1490,19 +1529,8 @@ function MediaSync:showPlaybackBar()
         on_refocus = self.overlay_mode and function()
             self:refocusToCurrentSentence()
         end or nil,
-        -- Kindle + AirPods: shortcut to cycle BT A2DP when audio goes silent
-        -- while the UI still shows playback progressing.
-        show_fix_audio = Device.isKindle and Device:isKindle() or false,
-        on_fix_audio = function()
-            if not (self.media_engine and self.media_engine.fixKindleA2dpAudio) then
-                return
-            end
-            UIManager:show(InfoMessage:new{
-                text = _("Reconnecting Bluetooth audio…"),
-                timeout = 4,
-            })
-            self.media_engine:fixKindleA2dpAudio()
-        end,
+        -- BT reconnect lives in plugin settings (Reconnect BT on track change).
+        show_fix_audio = false,
     }
     player:show()
     if self.plugin then

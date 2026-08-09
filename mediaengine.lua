@@ -136,11 +136,25 @@ end
 
 function MediaEngine:_kindleConnectedHeadsetMac()
     if not self:_isKindle() then return nil end
-    local h = io.popen("lipc-hash-prop com.lab126.btfd ListConnected 2>/dev/null")
-    if not h then return nil end
-    local out = h:read("*a") or ""
-    h:close()
-    return out:match('bd_address%s*=%s*"([%x:]+)"')
+    -- Prefer ListConnected; fall back to ListPaired when A2DP is stale and
+    -- the headset no longer appears in the connected list (common after
+    -- audiomgrd drops the idle AirPods session).  Finally reuse the last
+    -- MAC we successfully saw this session — cycle was skipping with
+    -- "no connected MAC" even though AirPods were still paired.
+    for _, prop in ipairs({ "ListConnected", "ListPaired" }) do
+        local h = io.popen("lipc-hash-prop com.lab126.btfd " .. prop .. " 2>/dev/null")
+        if h then
+            local out = h:read("*a") or ""
+            h:close()
+            -- Kindle prints "34:0E:22:..." — accept hex + colon only.
+            local mac = out:match('bd_address%s*=%s*"([%x:]+)"')
+            if mac and #mac >= 11 then
+                self._kindle_last_headset_mac = mac
+                return mac
+            end
+        end
+    end
+    return self._kindle_last_headset_mac
 end
 
 --- Kindle A2DP (esp. AirPods): SIGSTOP/SIGCONT leaves the pipeline frozen while
@@ -194,11 +208,44 @@ function MediaEngine:_stopKindleA2dpKeepalive(only_if_reason)
     logger.warn("MediaEngine: Kindle A2DP keepalive stopped PID=", pid)
 end
 
+--- Bridge A2DP across a Storyteller/playlist file boundary.
+--- Always starts silence keepalive. Optionally Disconnect→Connect the headset
+--- when opts.cycle_bt is true (plugin setting kindle_bt_reconnect_on_track).
+--- @param callback function|nil  callback(ok)
+--- @param opts table|nil  { cycle_bt = boolean }
+function MediaEngine:prepareKindleTrackAdvance(callback, opts)
+    opts = opts or {}
+    if not self:_isKindle() then
+        if callback then callback(true) end
+        return
+    end
+    self:_startKindleA2dpKeepalive("track-advance")
+    if not opts.cycle_bt then
+        logger.warn("MediaEngine: prepareKindleTrackAdvance — keepalive only (BT cycle off)")
+        if callback then callback(true) end
+        return
+    end
+    logger.warn("MediaEngine: prepareKindleTrackAdvance — cycling BT before next file")
+    self:_cycleKindleA2dpRoute(function(ok)
+        logger.warn("MediaEngine: track-advance A2DP cycle ok=", ok and "yes" or "no")
+        -- Keep keepalive running across the subsequent MediaSync:start/play gap.
+        if callback then callback(ok) end
+    end)
+end
+
 --- Public: cycle BT A2DP and restart content at the current position.
 --- Used by the player "Fix audio" button when AirPods go silent mid-play.
-function MediaEngine:fixKindleA2dpAudio()
-    if not self:_isKindle() then return false end
-    if not self.current_path then return false end
+--- @param on_done function|nil  optional callback(ok, reason)
+---   reason: "started" | "no_path" | "no_mac" | "route_up" | "route_down"
+function MediaEngine:fixKindleA2dpAudio(on_done)
+    if not self:_isKindle() then
+        if on_done then on_done(false, "not_kindle") end
+        return false
+    end
+    if not self.current_path then
+        if on_done then on_done(false, "no_path") end
+        return false
+    end
     local pos = 0
     pcall(function() pos = self:getPosition() or 0 end)
     if pos <= 0 then pos = self._seek_offset or 0 end
@@ -207,6 +254,12 @@ function MediaEngine:fixKindleA2dpAudio()
     local gen = self.play_generation
     self._seek_offset = math.max(0, pos)
     logger.warn("MediaEngine: fixKindleA2dpAudio at", self._seek_offset)
+    local mac = self:_kindleConnectedHeadsetMac()
+    if not mac then
+        logger.warn("MediaEngine: fixKindleA2dpAudio aborted (no headset MAC)")
+        if on_done then on_done(false, "no_mac") end
+        return false
+    end
     self:_startKindleA2dpKeepalive("fix-audio")
     self:_cycleKindleA2dpRoute(function(ok)
         if self.play_generation ~= gen and not self.is_playing then
@@ -218,6 +271,7 @@ function MediaEngine:fixKindleA2dpAudio()
         UIManager:scheduleIn(1.5, function()
             self:_stopKindleA2dpKeepalive("fix-audio")
         end)
+        if on_done then on_done(ok, ok and "route_up" or "route_down") end
     end)
     return true
 end

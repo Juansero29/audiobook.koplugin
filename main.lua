@@ -551,6 +551,19 @@ function Audiobook:addToMainMenu(menu_items)
                         help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status.\n\nNote: Kindle Paperwhite does not expose an AVRCP input device for AirPods stem presses (no btui / no media-key evdev). Stem play/pause is not available on this firmware; use the on-screen controls or Kindle buttons."),
                     },
                     {
+                        text = _("Reconnect BT on track change"),
+                        enabled_func = function()
+                            return Device.isKindle and Device:isKindle()
+                        end,
+                        checked_func = function()
+                            return self:getSetting("kindle_bt_reconnect_on_track", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("kindle_bt_reconnect_on_track", false)
+                        end,
+                        help_text = _("Kindle + AirPods: when enabled, each playlist/Storyteller audio-file boundary runs a Bluetooth Disconnect→Connect cycle before the next file starts (~5–10 s gap). Off by default; the plugin still keeps a silent A2DP keepalive across the gap. Turn this on only if audio goes silent at chapter/chunk transitions."),
+                    },
+                    {
                         text_func = function()
                             local val = self:getSetting("bt_disconnect_check", 30)
                             if val == 0 then
