@@ -816,7 +816,7 @@ function Audiobook:addToMainMenu(menu_items)
                         callback = function()
                             self:toggleSetting("keep_reader_status_bars", false)
                         end,
-                        help_text = _("When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar (and does not cover it). The CRE alt status bar at the top is left alone. When disabled (default), the mini player sits at the very bottom of the screen."),
+                        help_text = _("When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar / progress bar (alt status bar at the top is unchanged). The page always reflows so book text ends above the mini player — the player never covers readable text. When disabled (default), the mini player sits at the bottom of the screen (may cover the status bar) but text is still reflowed above it."),
                     },
                     {
                         text = _("Sleep timer"),

@@ -21,7 +21,8 @@ Fixes the previous `"no timing data extracted"` failures and later highlight/nar
 - Chapter list jumps across audio files without losing the session
 - EPUB size+mtime fingerprint → wipe stale `cache/overlays/` when the book is re-exported in place
 - Fragment-id highlighting (Readest-style) preferred over fuzzy text match
-- Optional **Keep status bars during read-aloud** — mini player sits above KOReader’s bottom status bar
+- Optional **Keep status bars during read-aloud** — mini player sits above KOReader’s bottom status / progress bar
+- **Page margin reserve for mini player** (v0.1.17.23) — CRE reflows so book text ends above the mini player (same idea as TTS `_reserveBarSpace`); the overlay never covers readable text even with status + alt status + progress bars enabled
 
 ## Manual tests (Kindle + Bose QuietComfort Ultra Gen1 / AirPods Pro 3)
 
@@ -39,6 +40,7 @@ All verified working:
 - [x] **Resume after close** — reopen book, resume near last position
 - [x] **Re-export / cache** — regenerating the Storyteller EPUB invalidates stale overlay audio cache; highlights match new alignment
 - [x] **Bluetooth audio** — Bose QuietComfort Ultra (Gen1) and AirPods Pro 3; sync/highlights track audible narration
+- [x] **Keep status bars** — with bottom status + progress (+ alt status bar), mini player sits in reserved chrome; book text reflows above it (v0.1.17.23)
 
 ## Automated / fixture checks
 

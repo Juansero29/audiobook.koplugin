@@ -738,20 +738,23 @@ function AudiobookPlayer:setupUI()
     end
 end
 
---- Bottom inset so the mini player can sit above KOReader's status bar.
+--- Bottom inset so the mini player can sit above KOReader's status/progress bar.
+--- MediaSync also reflows page margins by this chrome height + mini bar so
+--- book text never renders underneath the player.
 function AudiobookPlayer:_statusBarInset()
     if not self.keep_reader_status_bars then return 0 end
     local ui = self.plugin and self.plugin.ui
     local view = ui and ui.view
-    if not view then return 0 end
-    local inset = 0
-    if view.footer_visible and view.footer then
-        local ok, h = pcall(function() return view.footer:getHeight() end)
-        if ok and type(h) == "number" and h > 0 then
-            inset = inset + h
-        end
-    end
-    return inset
+    if not view or not view.footer_visible or not view.footer then return 0 end
+    local ok, h = pcall(function() return view.footer:getHeight() end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    ok, h = pcall(function()
+        local d = view.footer.dimen
+        return d and d.h or 0
+    end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    -- Last resort: typical status+progress stack on PW11-class screens.
+    return Screen:scaleBySize(36)
 end
 
 function AudiobookPlayer:_miniBarY()
