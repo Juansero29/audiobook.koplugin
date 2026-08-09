@@ -62,6 +62,8 @@ local AudiobookPlayer = InputContainer:extend{
     on_skip_forward = nil,
     on_fix_audio = nil,
     show_fix_audio = false,
+    -- When true, mini bar sits above KOReader's bottom status bar.
+    keep_reader_status_bars = false,
     on_prev_chapter = nil,
     on_next_chapter = nil,
     on_seek = nil,
@@ -144,6 +146,10 @@ function AudiobookPlayer:init()
     self.height = Screen:getHeight()
     self.dimen = Geom:new{ w = self.width, h = self.height }
     self._minimized = false
+    -- Do not claim the whole screen / footer while the mini player is up —
+    -- otherwise ReaderFooter may skip updates ("lost" status bar).
+    self.covers_fullscreen = false
+    self.covers_footer = not self.keep_reader_status_bars
     self._return_hint_active = false
     self._rotation_mode = Screen:getRotationMode()
     self:setupUI()
@@ -727,11 +733,37 @@ function AudiobookPlayer:setupUI()
     -- follow are the UI) with only the mini bar for transport control,
     -- instead of covering the text with the full-screen player.
     if self.start_minimized then
-        self._minimized = true
-        self.dimen.h = self._mini_height
-        self.dimen.y = self.height - self._mini_height
+        self:_applyMinimizedGeometry()
         self:_updateMiniWidgets()
     end
+end
+
+--- Bottom inset so the mini player can sit above KOReader's status bar.
+function AudiobookPlayer:_statusBarInset()
+    if not self.keep_reader_status_bars then return 0 end
+    local ui = self.plugin and self.plugin.ui
+    local view = ui and ui.view
+    if not view then return 0 end
+    local inset = 0
+    if view.footer_visible and view.footer then
+        local ok, h = pcall(function() return view.footer:getHeight() end)
+        if ok and type(h) == "number" and h > 0 then
+            inset = inset + h
+        end
+    end
+    return inset
+end
+
+function AudiobookPlayer:_miniBarY()
+    return self.height - self._mini_height - self:_statusBarInset()
+end
+
+function AudiobookPlayer:_applyMinimizedGeometry()
+    self._minimized = true
+    self.covers_fullscreen = false
+    self.covers_footer = not self.keep_reader_status_bars
+    self.dimen.h = self._mini_height
+    self.dimen.y = self:_miniBarY()
 end
 
 -- Callback handlers
@@ -760,14 +792,12 @@ function AudiobookPlayer:onClose()
 end
 
 function AudiobookPlayer:onMinimize()
-    self._minimized = true
     self._scrubber_dragging = false
     self._scrubber_drag_pct = nil
     self:_updateMiniWidgets()
     -- Shrink dimen to only cover the mini bar area at the bottom
     -- so touch events pass through to the rest of the screen.
-    self.dimen.h = self._mini_height
-    self.dimen.y = self.height - self._mini_height
+    self:_applyMinimizedGeometry()
     logger.warn("AudiobookPlayer: minimized, dimen=",
         self.dimen.x, self.dimen.y, self.dimen.w, self.dimen.h)
     -- Full refresh to erase the full-screen player image and redraw only the
@@ -780,6 +810,9 @@ function AudiobookPlayer:_restore()
     self._minimized = false
     self._scrubber_dragging = false
     self._scrubber_drag_pct = nil
+    -- Full-screen player covers the book (and status bars) while expanded.
+    self.covers_fullscreen = true
+    self.covers_footer = true
     -- Restore dimen to full screen so we receive all events again
     self.dimen.h = self.height
     self.dimen.y = 0
@@ -1436,8 +1469,9 @@ function AudiobookPlayer:handleEvent(event)
                 self.plugin.session_recorder:recordGesture(ges, "audiobookplayer")
             end
             if ges and ges.pos then
-                local mini_y = self.height - self._mini_height
+                local mini_y = self:_miniBarY()
                 local on_bar = ges.pos.y >= mini_y
+                    and ges.pos.y < mini_y + self._mini_height
                 if on_bar and ges.ges == "tap" then
                     -- Tap on play/pause button?
                     if self:_isTapOnWidget(ges.pos, self._mini_play_pause) then
@@ -1704,11 +1738,12 @@ function AudiobookPlayer:_doRebuild(new_w, new_h)
     self:_updateMiniWidgets()
     -- Position at the correct coordinates for the new dimensions
     self.visible = true
-    self._minimized = was_minimized
     if was_minimized then
-        self.dimen.h = self._mini_height
-        self.dimen.y = self.height - self._mini_height
+        self:_applyMinimizedGeometry()
     else
+        self._minimized = false
+        self.covers_fullscreen = true
+        self.covers_footer = true
         self.dimen.h = self.height
         self.dimen.y = 0
     end
@@ -1758,11 +1793,11 @@ end
 function AudiobookPlayer:paintTo(bb, x, y)
     if not self.visible then return end
     if self._minimized then
-        -- Draw only the mini player bar at bottom.
+        -- Draw only the mini player bar at bottom (optionally above status bar).
         -- UIManager's window.y for this widget is always 0 (set when first shown),
         -- so we must add the bottom offset ourselves.
         if self._mini_bar and self._mini_bar.paintTo then
-            self._mini_bar:paintTo(bb, x or 0, (y or 0) + self.height - self._mini_height)
+            self._mini_bar:paintTo(bb, x or 0, (y or 0) + self:_miniBarY())
         end
         return
     end

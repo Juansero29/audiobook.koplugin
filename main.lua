@@ -551,6 +551,19 @@ function Audiobook:addToMainMenu(menu_items)
                         help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status.\n\nNote: Kindle Paperwhite does not expose an AVRCP input device for AirPods stem presses (no btui / no media-key evdev). Stem play/pause is not available on this firmware; use the on-screen controls or Kindle buttons."),
                     },
                     {
+                        text = _("Reconnect BT on track change"),
+                        enabled_func = function()
+                            return Device.isKindle and Device:isKindle()
+                        end,
+                        checked_func = function()
+                            return self:getSetting("kindle_bt_reconnect_on_track", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("kindle_bt_reconnect_on_track", false)
+                        end,
+                        help_text = _("Kindle + AirPods: when enabled, each playlist/Storyteller audio-file boundary runs a Bluetooth Disconnect→Connect cycle before the next file starts (~5–10 s gap). Off by default; the plugin still keeps a silent A2DP keepalive across the gap. Turn this on only if audio goes silent at chapter/chunk transitions."),
+                    },
+                    {
                         text_func = function()
                             local val = self:getSetting("bt_disconnect_check", 30)
                             if val == 0 then
@@ -784,7 +797,7 @@ function Audiobook:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = _("Follow page turns in aligned audiobook"),
+                        text = _("Follow narration page (aligned)"),
                         enabled_func = function() return (self.ui and self.ui.document) or false end,
                         checked_func = function()
                             return self:getSetting("media_follow_page_turn", true)
@@ -792,7 +805,18 @@ function Audiobook:addToMainMenu(menu_items)
                         callback = function()
                             self:toggleSetting("media_follow_page_turn", true)
                         end,
-                        help_text = _("When enabled (default), an aligned audiobook will automatically turn pages to keep the narration in view, and manually turning the page will seek narration to the new page. When disabled, pages do not auto-follow and manual turns do not seek audio; only the currently visible text is highlighted."),
+                        help_text = _("When enabled (default), the book view auto-turns to keep the current narration sentence on screen while you stay with the read-aloud. Manually turning a page never seeks or restarts audio: highlighting pauses and a “Return to read-aloud” cue appears until you jump back or the narration catches up."),
+                    },
+                    {
+                        text = _("Keep status bars during read-aloud"),
+                        enabled_func = function() return (self.ui and self.ui.document) or false end,
+                        checked_func = function()
+                            return self:getSetting("keep_reader_status_bars", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("keep_reader_status_bars", false)
+                        end,
+                        help_text = _("When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar (and does not cover it). The CRE alt status bar at the top is left alone. When disabled (default), the mini player sits at the very bottom of the screen."),
                     },
                     {
                         text = _("Sleep timer"),
@@ -3183,6 +3207,7 @@ function Audiobook:_handlePageTurnFollow()
     if not self.media_sync.overlay_mode then return end
     if self.media_sync.state ~= self.media_sync.STATE.PLAYING
        and self.media_sync.state ~= self.media_sync.STATE.PAUSED then
+        self._readaloud_browsing_away = false
         self:_hideReturnToReadAloudButton()
         return
     end
@@ -3202,61 +3227,17 @@ function Audiobook:_handlePageTurnFollow()
     local ok, err = pcall(function()
         local on_audio_page = self:_currentAudioSentenceVisible()
 
-        if self.media_sync.state == self.media_sync.STATE.PAUSED then
-            -- Browsing while paused: drop the stale highlight (it would
-            -- otherwise be redrawn at the wrong place on the new page) and
-            -- offer a Readest-style return button.
-            pcall(function() self.media_sync:clearSentenceHighlight() end)
-            if on_audio_page then
-                self:_hideReturnToReadAloudButton()
-            else
-                self:_showReturnToReadAloudButton()
-            end
-            return
-        end
-
-        -- PLAYING
-        if not on_audio_page then
+        -- Manual page turns must NEVER seek/restart audio. Audio keeps
+        -- playing; we only pause highlighting and show a return cue
+        -- (Readest-style) until the user jumps back or narration catches up.
+        if on_audio_page then
+            self._readaloud_browsing_away = false
+            self:_hideReturnToReadAloudButton()
+        else
+            self._readaloud_browsing_away = true
             pcall(function() self.media_sync:clearSentenceHighlight() end)
             self:_showReturnToReadAloudButton()
-        else
-            self:_hideReturnToReadAloudButton()
         end
-
-        if not self:getSetting("media_follow_page_turn", true) then return end
-
-        local start_entry = self:_findCurrentPageSmilEntry()
-        if not start_entry or not start_entry.audio_path then return end
-
-        -- If the current audio position is already inside the current page's
-        -- narration range, do not seek.
-        local current_path = self.media_sync.media_engine and self.media_sync.media_engine.current_path
-        local current_pos = self.media_sync.media_engine and self.media_sync.media_engine:getPosition()
-        if current_path == start_entry.audio_path and current_pos then
-            local page_end = start_entry.end_time or start_entry.start_time
-            for _, e in ipairs(self._smil_timing_data or {}) do
-                if e.audio_path == current_path and e.text_doc == start_entry.text_doc then
-                    if e.end_time and e.end_time > page_end then
-                        page_end = e.end_time
-                    end
-                end
-            end
-            if current_pos >= start_entry.start_time and current_pos <= page_end then
-                return
-            end
-        end
-
-        if Time then
-            self._suppress_media_sync_auto_page_follow = Time.now() + Time.s(3.0)
-        end
-
-        if current_path and current_path ~= start_entry.audio_path then
-            self.media_sync:stop()
-            self:_startSmilPlayback(self.ui.document.file_path or self.ui.document.file, start_entry, false)
-        else
-            self.media_sync:seekToTime(start_entry.start_time)
-        end
-        self:_hideReturnToReadAloudButton()
     end)
     self._in_handle_page_turn_follow = false
     if not ok then
