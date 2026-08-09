@@ -1602,11 +1602,7 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
                 "start_time=", start_time)
         end
 
-        pcall(function()
-            if self:getSetting("bt_media_control", true) and BtMediaControl then
-                BtMediaControl.start(self)
-            end
-        end)
+        pcall(function() self:_ensureBtMediaControl() end)
 
         -- Cache parser/timing for page-follow and selection restarts.
         -- If we are switching to a different EPUB, drop the resolved-xpointer
@@ -1764,11 +1760,7 @@ function Audiobook:_playAudioFile(file_path, playlist_files)
         local slot = self._smil_by_file[file_path]
         self.media_sync:start(file_path, slot.timing, slot.chapters, nil,
             playlist_files or self.media_sync.playlist_files, file_path)
-        pcall(function()
-            if self:getSetting("bt_media_control", true) and BtMediaControl then
-                BtMediaControl.start(self)
-            end
-        end)
+        pcall(function() self:_ensureBtMediaControl() end)
         return
     end
 
@@ -2705,6 +2697,22 @@ function Audiobook:stopReadAlong()
     pcall(function() self.tts_engine:forceKillAll() end)
 end
 
+--- Ensure headset media buttons (AirPods stem) are listened for.
+-- On Kindle, auto-enable the setting: BlueZ AVRCP is absent and the stem
+-- only works if we advertise as an AVRCP target + scan for media input.
+function Audiobook:_ensureBtMediaControl()
+    if not BtMediaControl then return end
+    if Device.isKindle and Device:isKindle() then
+        if not self:getSetting("bt_media_control", true) then
+            self:setSetting("bt_media_control", true)
+            logger.warn("Audiobook: enabled bt_media_control for Kindle headset buttons")
+        end
+    end
+    if self:getSetting("bt_media_control", true) then
+        BtMediaControl.start(self)
+    end
+end
+
 function Audiobook:pauseReadAlong()
     if not self._init_ok then return end
     -- Pause media playback if active
@@ -2724,11 +2732,13 @@ function Audiobook:resumeReadAlong()
     if not self._init_ok then return end
     -- Resume media playback if active
     if self.media_sync and self.media_sync.state == "paused" then
+        pcall(function() self:_ensureBtMediaControl() end)
         pcall(function() self.media_sync:resume() end)
         pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
         return
     end
     if self.sync_controller then
+        pcall(function() self:_ensureBtMediaControl() end)
         pcall(function() self.sync_controller:resume() end)
         pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
     end
@@ -2831,9 +2841,19 @@ end
 
 function Audiobook:onMediaPlayPause()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() then
+    -- Prefer media_sync (Storyteller / audiobook) over TTS sync_controller.
+    local media_active = self.media_sync and self.media_sync.state ~= "stopped"
+    if media_active then
+        if self.media_sync.state == "playing" then
+            self:pauseReadAlong()
+        elseif self.media_sync.state == "paused" then
+            self:resumeReadAlong()
+        end
+        return true
+    end
+    if self.sync_controller and self.sync_controller:isPlaying() then
         self:pauseReadAlong()
-    elseif self.sync_controller:isPaused() then
+    elseif self.sync_controller and self.sync_controller:isPaused() then
         self:resumeReadAlong()
     end
     return true
@@ -2841,17 +2861,13 @@ end
 
 function Audiobook:onMediaPlay()
     if not self._init_ok then return true end
-    if self.sync_controller:isPaused() then
-        self:resumeReadAlong()
-    end
+    self:resumeReadAlong()
     return true
 end
 
 function Audiobook:onMediaPause()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() then
-        self:pauseReadAlong()
-    end
+    self:pauseReadAlong()
     return true
 end
 
@@ -2864,7 +2880,11 @@ end
 
 function Audiobook:onMediaNext()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() or self.sync_controller:isPaused() then
+    if self.media_sync and self.media_sync.state ~= "stopped" then
+        self.media_sync:nextChapter()
+        return true
+    end
+    if self.sync_controller and (self.sync_controller:isPlaying() or self.sync_controller:isPaused()) then
         self.sync_controller:nextSentence()
     end
     return true
@@ -2872,7 +2892,11 @@ end
 
 function Audiobook:onMediaPrev()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() or self.sync_controller:isPaused() then
+    if self.media_sync and self.media_sync.state ~= "stopped" then
+        self.media_sync:prevChapter()
+        return true
+    end
+    if self.sync_controller and (self.sync_controller:isPlaying() or self.sync_controller:isPaused()) then
         self.sync_controller:prevSentence()
     end
     return true

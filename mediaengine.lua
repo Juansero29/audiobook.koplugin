@@ -134,6 +134,42 @@ function MediaEngine:_kindleA2dpRouteUp()
     return v:match("^%s*1") ~= nil
 end
 
+--- Kindle A2DP (esp. AirPods): SIGSTOP/SIGCONT leaves the pipeline frozen while
+--- audiomgrd drops the idle headset session — resume must re-attach Music focus
+--- and restart the gst pipeline at the pause position.
+function MediaEngine:_kindleNeedsPipelineRestartOnResume()
+    if not self:_isKindle() then return false end
+    return self.backend == self.BACKENDS.KINDLE_GST_PLAY
+        or self.backend == self.BACKENDS.GST_PLAY
+        or self.backend == self.BACKENDS.GST_PIPELINE
+        or self.backend == self.BACKENDS.FFMPEG_PIPE
+end
+
+--- Halt the Kindle ffmpeg|gst pipeline without clearing pause/callbacks.
+function MediaEngine:_haltKindlePipelineForPause(reason)
+    self:_nextGeneration() -- cancel completion / position watchers
+    if self._position_timer then
+        UIManager:unschedule(self._position_timer)
+        self._position_timer = nil
+    end
+    local pid = self.audio_pid
+    self.audio_pid = nil
+    if pid and ffi.C.kill then
+        pcall(function() ffi.C.kill(-pid, 15) end) -- SIGTERM group
+        pcall(function() ffi.C.kill(pid, 15) end)
+        pcall(function() ffi.C.kill(-pid, 9) end)
+        pcall(function() ffi.C.kill(pid, 9) end)
+    end
+    if self:_isKindle() then
+        self:_killOrphanKindleGstPipelines(reason or "pause-halt", 150000)
+    end
+    if self._progress_file then
+        os.remove(self._progress_file)
+        self._progress_file = nil
+    end
+    self._use_progress_position = false
+end
+
 --[[--
 Build an ffmpeg atempo filter string for the given playback speed.
 atempo accepts 0.5..2.0; chain multiple filters for speeds outside that range.
@@ -2213,6 +2249,7 @@ function MediaEngine:pause()
         elseif self._fifo_path then
             self:_mpvSendFifo("set pause yes")
         end
+        return
     elseif self.backend == self.BACKENDS.MPLAYER then
         if self._ipc_file then
             local f = io.open(self._ipc_file, "w")
@@ -2221,7 +2258,24 @@ function MediaEngine:pause()
                 f:close()
             end
         end
-    elseif self.audio_pid and ffi.C.kill then
+        return
+    end
+
+    -- Kindle gst/AirPods: do NOT SIGSTOP.  Idle A2DP is torn down by
+    -- audiomgrd within seconds; SIGCONT then produces a silent "playing"
+    -- pipeline.  Halt cleanly and remember the position for resume-restart.
+    if self:_kindleNeedsPipelineRestartOnResume() then
+        local pos = 0
+        pcall(function() pos = self:getPosition() or 0 end)
+        self._paused_position = math.max(0, pos)
+        self._seek_offset = self._paused_position
+        logger.warn("MediaEngine: Kindle A2DP pause-halt at", self._paused_position,
+            "apple=", self:_isAppleAirPodsHeadset() and "yes" or "no")
+        self:_haltKindlePipelineForPause("pause-halt")
+        return
+    end
+
+    if self.audio_pid and ffi.C.kill then
         -- Signal the whole process group: for the ffmpeg|gst-launch
         -- pipeline audio_pid is a setsid'd wrapper shell, and stopping
         -- only the shell leaves both pipeline halves playing.
@@ -2258,11 +2312,31 @@ function MediaEngine:resume()
         return
     end
 
-    self.is_paused = false
     if self._pause_start_time then
         self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
         self._pause_start_time = nil
     end
+
+    -- Kindle A2DP: always restart at pause position with fresh Music focus.
+    if self:_kindleNeedsPipelineRestartOnResume() then
+        local pos = self._paused_position
+        if pos == nil then
+            pcall(function() pos = self:getPosition() or 0 end)
+        end
+        pos = math.max(0, tonumber(pos) or 0)
+        local complete = self._on_complete
+        local fail = self._on_fail
+        self.is_paused = false
+        self._paused_position = nil
+        self._seek_offset = pos
+        MediaEngine._clearMusicFocusFlag()
+        MediaEngine._takeMusicFocusOnce(true)
+        logger.warn("MediaEngine: Kindle A2DP resume-restart at", pos)
+        self:play(complete, fail)
+        return
+    end
+
+    self.is_paused = false
 
     if self.backend == self.BACKENDS.MPV then
         if self:_hasLuaSocket() and self._socket_path then
@@ -2287,7 +2361,7 @@ function MediaEngine:resume()
         -- After a paused seek the process was killed; restart it.
         if self.audio_pid and ffi.C.kill then
             ffi.C.kill(-self.audio_pid, 18) -- SIGCONT group
-        ffi.C.kill(self.audio_pid, 18)  -- SIGCONT pid
+            ffi.C.kill(self.audio_pid, 18)  -- SIGCONT pid
         else
             self:play(self._on_complete, self._on_fail)
         end
@@ -2476,6 +2550,11 @@ function MediaEngine:seek(seconds, mode)
             end
         end
 
+        -- Keep pause-resume position in sync when seeking while paused.
+        if self.is_paused then
+            self._paused_position = target
+        end
+
         if self._persistent_pipeline_active then
             logger.warn("MediaEngine: persistent-pipeline seek mode=", mode,
                 "req=", seconds, "current=", self:getPosition(),
@@ -2633,6 +2712,11 @@ function MediaEngine:getPosition()
             return self._seek_offset
         end
         return 0
+    end
+
+    -- Kindle A2DP pause-halt: pipeline is gone; hold the saved pause position.
+    if self.is_paused and self._paused_position ~= nil then
+        return self._paused_position
     end
 
     -- ffmpeg -progress backed position (EPUB read-along path): anchored to the
