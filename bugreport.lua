@@ -616,6 +616,13 @@ local function collectAudioInfo(plugin, skip_intensive)
         end
         info.kindle_abk_gst_pids = shellCapture(
             "pgrep -af 'abk-progress|gst-launch-0.10|mixersink' 2>/dev/null | head -15", 3) or "none"
+        -- Input / AVRCP discovery for AirPods stem play-pause.
+        info.kindle_input_devices = shellCapture(
+            "cat /proc/bus/input/devices 2>/dev/null | head -120", 3) or "n/a"
+        info.kindle_input_event_nodes = shellCapture(
+            "ls -la /dev/input/ 2>/dev/null | head -40", 2) or "n/a"
+        info.kindle_btui = shellCapture(
+            "command -v btui 2>/dev/null; ls -la /usr/bin/btui 2>/dev/null", 2) or "not found"
         -- Full ALSA config: v0.1.5.24 showed dmix0 on hw:0,0 -- we need
         -- the complete config to see all defined PCMs and their routing.
         info.kindle_asound_conf_full = shellCapture("cat /etc/asound.conf 2>/dev/null", 5) or "not found"
