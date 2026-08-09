@@ -1734,9 +1734,24 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
             end
             -- Extra seek after start: some Kindle backends ignore #t= on the
             -- first play(); seekToTime restarts at the correct clip time.
+            -- Skip when MediaEngine already started at start_position — a
+            -- redundant seek-by-restart kills A2DP (AirPods: brief sound then silence).
             if start_position and start_position > 0 and self.media_sync.seekToTime then
-                UIManager:scheduleIn(0.4, function()
-                    pcall(function() self.media_sync:seekToTime(start_position) end)
+                UIManager:scheduleIn(0.8, function()
+                    pcall(function()
+                        if not self.media_sync or not self.media_sync.media_engine then return end
+                        local eng = self.media_sync.media_engine
+                        if not eng.is_playing or eng.is_paused then return end
+                        local pos = eng:getPosition() or 0
+                        local started_at = eng._seek_offset or 0
+                        if math.abs(pos - start_position) < 1.0
+                            or math.abs(started_at - start_position) < 0.25 then
+                            logger.warn("Audiobook: skip post-start seek (already near",
+                                start_position, "pos=", pos, "seek_offset=", started_at, ")")
+                            return
+                        end
+                        self.media_sync:seekToTime(start_position)
+                    end)
                 end)
             end
             if Time then
