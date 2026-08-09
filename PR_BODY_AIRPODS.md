@@ -14,6 +14,7 @@ Root cause: Kindle `audiomgrd` drops the A2DP datapath when `mixersink` goes idl
 - Cached headset MAC (`ListConnected` → `ListPaired` → last-seen) so BT cycles don’t skip with “no connected MAC”
 - Menu: **Bluetooth settings → Reconnect BT on track change** (`kindle_bt_reconnect_on_track`, **off by default**) — optional forced Disconnect→Connect (~5–10 s) before the next file; keepalive still runs either way
 - Overlay **BT** shortcut button removed (v0.1.17.22); use the menu setting / plugin BT menu instead
+- Companion Storyteller UX (same field device): mini-player **page-margin reserve** so read-aloud chrome never covers book text when status/progress bars stay visible (v0.1.17.23; full page-turn / status-bar UX lives in the Storyteller PR)
 - Bug report: Apple headset detection, `btfd` lists, input devices, `btui` probe
 - Field doc: [`docs/AIRPODS_PRO3_KINDLE.md`](docs/AIRPODS_PRO3_KINDLE.md)
 

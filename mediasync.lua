@@ -699,6 +699,8 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
 
     -- Show playback bar in scrubber mode
     self:showPlaybackBar()
+    -- Reflow page so book text ends above the mini player (never covered).
+    self:_reserveMiniBarSpace()
 
     -- Resume from saved position on initial start, if any.
     if self._start_position and self._start_position > 0 then
@@ -762,6 +764,8 @@ function MediaSync:stop(keep_chapter_menu, opts)
         if self.playback_bar then
             pcall(function() self.playback_bar:hide() end)
         end
+        -- Restore page margins only on hard stop (keep reservation across tracks).
+        self:_releaseMiniBarSpace()
     end
     if not keep_chapter_menu then
         if self._chapter_menu_window then
@@ -775,6 +779,70 @@ function MediaSync:stop(keep_chapter_menu, opts)
 
     if was_playing then
         logger.warn("MediaSync: stopped", track_transition and "(track transition)" or "")
+    end
+end
+
+--- Footer height (status bar + progress) for positioning / margin math.
+function MediaSync:_readerFooterHeight()
+    local ui = self.plugin and self.plugin.ui
+    local view = ui and ui.view
+    if not view or not view.footer or not view.footer_visible then return 0 end
+    local ok, h = pcall(function() return view.footer:getHeight() end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    ok, h = pcall(function()
+        local d = view.footer.dimen
+        return d and d.h or 0
+    end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    return 0
+end
+
+--[[--
+Reserve the mini player's height in the document bottom margin so book text
+reflows above it (same approach as SyncController:_reserveBarSpace for TTS).
+--]]
+function MediaSync:_reserveMiniBarSpace()
+    if self._bar_space_reserved then return end
+    if not self.overlay_mode then return end
+    if not (self.plugin and self.plugin.ui and self.plugin.ui.rolling) then return end
+    local ui = self.plugin.ui
+    local tp = ui.typeset
+    if not (tp and tp.unscaled_margins and ui.document and ui.document.setPageMargins) then
+        return
+    end
+    local bar = self.playback_bar
+    local bar_h = bar and (bar._mini_height or (bar.dimen and bar.dimen.h)) or 0
+    if not bar_h or bar_h <= 0 then
+        bar_h = Screen:scaleBySize(44)
+    end
+    local m = tp.unscaled_margins
+    local bottom = Screen:scaleBySize(m[4]) + bar_h
+    local keep_bars = self.plugin and self.plugin.getSetting
+        and self.plugin:getSetting("keep_reader_status_bars", false)
+    if keep_bars then
+        bottom = bottom + self:_readerFooterHeight()
+    end
+    local ok = pcall(ui.document.setPageMargins, ui.document,
+        Screen:scaleBySize(m[1]), Screen:scaleBySize(m[2]),
+        Screen:scaleBySize(m[3]), bottom)
+    if ok then
+        self._bar_space_reserved = true
+        self._reserved_mini_bar_h = bar_h
+        ui:handleEvent(Event:new("UpdatePos"))
+        logger.warn("MediaSync: reserved", bar_h, "px bottom margin for mini player")
+    end
+end
+
+function MediaSync:_releaseMiniBarSpace()
+    if not self._bar_space_reserved then return end
+    self._bar_space_reserved = false
+    self._reserved_mini_bar_h = nil
+    if not (self.plugin and self.plugin.ui) then return end
+    local ui = self.plugin.ui
+    local tp = ui.typeset
+    if tp and tp.unscaled_margins then
+        ui:handleEvent(Event:new("SetPageMargins", tp.unscaled_margins))
+        logger.warn("MediaSync: restored user page margins after mini player")
     end
 end
 
@@ -1427,6 +1495,7 @@ end
 
 function MediaSync:showPlaybackBar()
     if self.playback_bar and self.playback_bar:isVisible() then
+        self:_reserveMiniBarSpace()
         return
     end
     -- For standalone audio (scrubber mode), use full-screen AudiobookPlayer overlay
@@ -1531,6 +1600,10 @@ function MediaSync:showPlaybackBar()
         end or nil,
         -- BT reconnect lives in plugin settings (Reconnect BT on track change).
         show_fix_audio = false,
+        keep_reader_status_bars = self.plugin
+            and self.plugin.getSetting
+            and self.plugin:getSetting("keep_reader_status_bars", false)
+            or false,
     }
     player:show()
     if self.plugin then
@@ -1540,6 +1613,7 @@ function MediaSync:showPlaybackBar()
         end)
     end
     self.playback_bar = player
+    self:_reserveMiniBarSpace()
 end
 
 function MediaSync:navigateToSentenceAtTime(seconds)

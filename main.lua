@@ -808,6 +808,17 @@ function Audiobook:addToMainMenu(menu_items)
                         help_text = _("When enabled (default), an aligned audiobook will automatically turn pages to keep the narration in view, and manually turning the page will seek narration to the new page. When disabled, pages do not auto-follow and manual turns do not seek audio; only the currently visible text is highlighted."),
                     },
                     {
+                        text = _("Keep status bars during read-aloud"),
+                        enabled_func = function() return (self.ui and self.ui.document) or false end,
+                        checked_func = function()
+                            return self:getSetting("keep_reader_status_bars", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("keep_reader_status_bars", false)
+                        end,
+                        help_text = _("When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar / progress bar (alt status bar at the top is unchanged). The page always reflows so book text ends above the mini player — the player never covers readable text. When disabled (default), the mini player sits at the bottom of the screen (may cover the status bar) but text is still reflowed above it."),
+                    },
+                    {
                         text = _("Sleep timer"),
                         sub_item_table = {
                             {
