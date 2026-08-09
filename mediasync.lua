@@ -6,6 +6,7 @@ Mirrors SyncController patterns but without TTS synthesis or sentence prefetch.
 @module koplugin.audiobook.mediasync
 --]]
 
+local Device = require("device")
 local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
@@ -591,7 +592,10 @@ end
 
 function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position)
     if self.state == self.STATE.PLAYING or self.state == self.STATE.PAUSED then
-        self:stop(true) -- keep chapter menu open during track transitions
+        -- Soft stop: keep A2DP keepalive + player UI across playlist file changes.
+        -- A hard stop was killing track-advance keepalive and hiding the bar,
+        -- which left AirPods silent and the play button dead (STOPPED).
+        self:stop(true, { track_transition = true })
     end
 
     if not audio_path or not timing_data or #timing_data == 0 then
@@ -599,6 +603,7 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
         return false
     end
 
+    self._track_advance_pending = nil
     self.state = self.STATE.LOADING
     self.timing_data = timing_data
     self.chapters = chapters or {}
@@ -730,7 +735,11 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     return true
 end
 
-function MediaSync:stop(keep_chapter_menu)
+--- @param keep_chapter_menu boolean|nil
+--- @param opts table|nil  { track_transition = true } spares A2DP keepalive and player UI
+function MediaSync:stop(keep_chapter_menu, opts)
+    opts = opts or {}
+    local track_transition = opts.track_transition and true or false
     local was_playing = self.state ~= self.STATE.STOPPED
     self.state = self.STATE.STOPPED
     self._chain_generation = self._chain_generation + 1
@@ -745,16 +754,23 @@ function MediaSync:stop(keep_chapter_menu)
     end
 
     if self.media_engine then
-        pcall(function() self.media_engine:stop() end)
+        pcall(function()
+            -- Hard stop (user close / end of book): tear down keepalive too.
+            -- Track transition: spare keepalive so AirPods A2DP stays armed.
+            self.media_engine._kill_keepalive_on_stop = not track_transition
+            self.media_engine:stop()
+        end)
     end
     if self.highlight_manager then
         pcall(function() self.highlight_manager:clearHighlights() end)
     end
-    if self.playback_bar then
-        pcall(function() self.playback_bar:hide() end)
-    end
-    if self.plugin and self.plugin._hideReturnToReadAloudButton then
-        pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+    if not track_transition then
+        if self.playback_bar then
+            pcall(function() self.playback_bar:hide() end)
+        end
+        if self.plugin and self.plugin._hideReturnToReadAloudButton then
+            pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+        end
     end
     if not keep_chapter_menu then
         if self._chapter_menu_window then
@@ -767,7 +783,7 @@ function MediaSync:stop(keep_chapter_menu)
     end
 
     if was_playing then
-        logger.warn("MediaSync: stopped")
+        logger.warn("MediaSync: stopped", track_transition and "(track transition)" or "")
     end
 end
 
@@ -909,7 +925,30 @@ function MediaSync:prevSentence()
     self:seekToTime(self.timing_data[idx].start_time)
 end
 
+--- Index of the current Storyteller SMIL content-document chapter (not audio part).
+function MediaSync:_currentOverlayChapterIndex()
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or #chapters == 0 then return nil, nil end
+    local current_time = self.media_engine and self.media_engine:getPosition() or 0
+    local current_path = self.media_engine and self.media_engine.current_path
+    local current_idx = 1
+    for i, ch in ipairs(chapters) do
+        if ch.audio_path == current_path and (ch.start_time or 0) <= current_time + 1 then
+            current_idx = i
+        end
+    end
+    return current_idx, chapters
+end
+
 function MediaSync:nextChapter()
+    -- Storyteller read-along: ⏭ means next SMIL chapter, not next ~4 min audio part.
+    if self.overlay_mode then
+        local idx, chapters = self:_currentOverlayChapterIndex()
+        if chapters and idx and idx < #chapters then
+            self:seekToOverlayChapter(idx + 1)
+        end
+        return
+    end
     if self.playlist_files and #self.playlist_files > 0 then
         local idx = (self.current_playlist_idx or 1) + 1
         if idx <= #self.playlist_files then
@@ -928,6 +967,13 @@ function MediaSync:nextChapter()
 end
 
 function MediaSync:prevChapter()
+    if self.overlay_mode then
+        local idx, chapters = self:_currentOverlayChapterIndex()
+        if chapters and idx and idx > 1 then
+            self:seekToOverlayChapter(idx - 1)
+        end
+        return
+    end
     if self.playlist_files and #self.playlist_files > 0 then
         local idx = (self.current_playlist_idx or 1) - 1
         if idx >= 1 then
@@ -945,13 +991,36 @@ function MediaSync:prevChapter()
     end
 end
 
+--- Keepalive (+ optional BT Disconnect/Connect) before switching audio files.
+--- @param then_fn function  called after the bridge (or immediately off-Kindle)
+function MediaSync:_bridgeKindleA2dpForTrackChange(then_fn)
+    local me = self.media_engine
+    local cycle_bt = false
+    if self.plugin and self.plugin.getSetting then
+        cycle_bt = self.plugin:getSetting("kindle_bt_reconnect_on_track", false) and true or false
+    end
+    if me and me.prepareKindleTrackAdvance then
+        me:prepareKindleTrackAdvance(function(_ok)
+            if then_fn then then_fn() end
+        end, { cycle_bt = cycle_bt })
+        return
+    end
+    if me and me._startKindleA2dpKeepalive then
+        pcall(function() me:_startKindleA2dpKeepalive("track-advance") end)
+    end
+    if then_fn then then_fn() end
+end
+
 function MediaSync:switchToPlaylistFile(index)
     if not self.playlist_files or not self.playlist_files[index] then return end
     self.current_playlist_idx = index
     local file_path = self.playlist_files[index].path
-    if self.plugin and self.plugin._playAudioFile then
-        self.plugin:_playAudioFile(file_path, self.playlist_files)
-    end
+    -- Manual ⏭/⏮ and playlist picks: same BT reconnect as natural EOS advance.
+    self:_bridgeKindleA2dpForTrackChange(function()
+        if self.plugin and self.plugin._playAudioFile then
+            self.plugin:_playAudioFile(file_path, self.playlist_files)
+        end
+    end)
 end
 
 function MediaSync:toggleLoop()
@@ -1092,17 +1161,15 @@ function MediaSync:_updateHighlightAtTime(pos)
         -- The SMIL fragment id resolves as a "#id" xpointer in crengine;
         -- turn the page before highlighting so the text-matching
         -- highlighter can find the sentence on the visible page.
-        -- This auto-follow is gated by the same setting as manual
-        -- page-turn seeking so users who disable page-follow stay in
-        -- control of the page.
+        -- Auto page-follow while the user stays with the narration.
+        -- Manual browsing away (_readaloud_browsing_away) must not yank the
+        -- page back or restart audio — only pause highlighting.
         local follow_page_turns = true
         if self.plugin and self.plugin.getSetting then
             follow_page_turns = self.plugin:getSetting("media_follow_page_turn", true)
         end
-        -- After a manual page turn the plugin seeks/restarts playback at the
-        -- new page. Suppress MediaSync's own auto-follow briefly so that seek
-        -- does not immediately trigger another page turn.
-        local suppress_auto_follow = false
+        local browsing_away = self.plugin and self.plugin._readaloud_browsing_away
+        local suppress_auto_follow = browsing_away and true or false
         if self.plugin and self.plugin._suppress_media_sync_auto_page_follow and time then
             if time.now() < self.plugin._suppress_media_sync_auto_page_follow then
                 suppress_auto_follow = true
@@ -1126,10 +1193,22 @@ function MediaSync:_updateHighlightAtTime(pos)
             if hl_ok and sentence.fragment_id then
                 self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
             end
+            -- Narration caught up to the page the user was browsing.
+            if hl_ok and browsing_away and self.plugin then
+                self.plugin._readaloud_browsing_away = false
+                browsing_away = false
+                if self.plugin._hideReturnToReadAloudButton then
+                    pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+                end
+            elseif browsing_away and not hl_ok then
+                -- Stay off-page: drop the failed highlight attempt immediately.
+                pcall(function() self.highlight_manager:clearHighlights() end)
+            end
 
             -- If the sentence is not on the visible page, JUMP to its fragment
             -- (spine/TOC/findText).  Never crawl with GotoViewRel on every
             -- sentence — that freezes Kindle touch input for minutes.
+            -- Skip while the user has manually browsed away.
             local jump_pending = false
             if not hl_ok and self.overlay_mode and sentence.fragment_id
                 and follow_page_turns and not suppress_auto_follow then
@@ -1378,13 +1457,34 @@ end
 
 function MediaSync:_onPlaybackComplete(gen)
     if self._chain_generation ~= gen then return end
+    if self._track_advance_pending then
+        logger.warn("MediaSync: playback complete ignored (track advance already pending)")
+        return
+    end
     logger.warn("MediaSync: playback complete")
     -- In playlist mode, auto-advance to the next track
     if self.playlist_files and #self.playlist_files > 0 then
         local next_idx = (self.current_playlist_idx or 1) + 1
+        local function advance(idx)
+            -- Freeze sync loops for the BT-cycle window (~5–10 s) so we do not
+            -- re-enter complete → double-advance.
+            self._track_advance_pending = true
+            self._chain_generation = self._chain_generation + 1
+            if self._sync_timer then
+                UIManager:unschedule(self._sync_timer)
+                self._sync_timer = nil
+            end
+            if self._position_timer then
+                UIManager:unschedule(self._position_timer)
+                self._position_timer = nil
+            end
+            -- Natural EOS: keepalive + forced BT reconnect, then next file.
+            logger.warn("MediaSync: auto-advancing to playlist track", idx,
+                "(A2DP bridge + BT cycle)")
+            self:switchToPlaylistFile(idx)
+        end
         if next_idx <= #self.playlist_files then
-            logger.warn("MediaSync: auto-advancing to playlist track", next_idx)
-            self:switchToPlaylistFile(next_idx)
+            advance(next_idx)
             return
         elseif self.loop_enabled then
             -- Loop: wrap back to start (or random if shuffled)
@@ -1395,7 +1495,7 @@ function MediaSync:_onPlaybackComplete(gen)
                 next_idx = 1
             end
             logger.warn("MediaSync: looping to playlist track", next_idx)
-            self:switchToPlaylistFile(next_idx)
+            advance(next_idx)
             return
         end
     end
@@ -1422,7 +1522,21 @@ function MediaSync:showPlaybackBar()
     end
     -- For standalone audio (scrubber mode), use full-screen AudiobookPlayer overlay
     local AudiobookPlayer = dofile(PLUGIN_PATH .. "audiobookplayer.lua")
-    local title = self.timing_data and self.timing_data[1] and self.timing_data[1].text or _("Audiobook")
+    -- Top-bar title = book name (NOT the first SMIL sentence text — that looked
+    -- like random words next to the BT button).
+    local title = _("Audiobook")
+    local ui = self.plugin and self.plugin.ui
+    if ui and ui.document then
+        local ok_props, props = pcall(function() return ui.document:getProps() end)
+        if ok_props and props and props.title and props.title ~= "" then
+            title = props.title
+        end
+    end
+    if title == _("Audiobook") and self.plugin and self.plugin._smil_doc_path then
+        title = self.plugin._smil_doc_path:match("([^/]+)%.[^./]+$")
+            or self.plugin._smil_doc_path:match("([^/]+)$")
+            or title
+    end
     -- Derive output name: use original playlist filename when available
     local output_name = ""
     if self.playlist_files and self.current_playlist_idx then
@@ -1458,6 +1572,26 @@ function MediaSync:showPlaybackBar()
                 self:pause()
             elseif self.state == self.STATE.PAUSED then
                 self:resume()
+            elseif self.media_engine and self.media_engine.current_path then
+                -- After a hard stop / botched track advance the bar can stay
+                -- visible while state is STOPPED — play must restart audio.
+                logger.warn("MediaSync: play from STOPPED — restarting current file")
+                local gen = self._chain_generation + 1
+                self._chain_generation = gen
+                self.state = self.STATE.PLAYING
+                local ok = self.media_engine:play(
+                    function() self:_onPlaybackComplete(gen) end,
+                    function(err) self:_onPlaybackFail(gen, err) end
+                )
+                if ok then
+                    self:_startSyncLoop(gen)
+                    self:_startPositionPoller(gen)
+                    if self.playback_bar and self.playback_bar.setPlaying then
+                        pcall(function() self.playback_bar:setPlaying(true) end)
+                    end
+                else
+                    self.state = self.STATE.STOPPED
+                end
             end
         end,
         on_skip_back = function()
@@ -1518,11 +1652,21 @@ function MediaSync:showPlaybackBar()
             end
         end,
         on_refocus = self.overlay_mode and function()
+            if self.plugin then
+                self.plugin._readaloud_browsing_away = false
+            end
             self:refocusToCurrentSentence()
             if self.plugin and self.plugin._hideReturnToReadAloudButton then
                 pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
             end
         end or nil,
+        -- BT reconnect lives in plugin settings (Reconnect BT on track change)
+        -- and the Bluetooth menu — no overlay "BT" button.
+        show_fix_audio = false,
+        keep_reader_status_bars = self.plugin
+            and self.plugin.getSetting
+            and self.plugin:getSetting("keep_reader_status_bars", false)
+            or false,
     }
     player:show()
     if self.plugin then
@@ -1846,20 +1990,28 @@ function MediaSync:seekToOverlayChapter(index)
     local chapters = self.plugin and self.plugin._smil_overlay_chapters
     if not chapters or not chapters[index] then return end
     local ch = chapters[index]
+    local function after_audio_ready()
+        UIManager:scheduleIn(0.2, function()
+            self:seekToTime(ch.start_time)
+            if self.overlay_mode and ch.fragment_id then
+                UIManager:scheduleIn(0.3, function()
+                    self:navigateToSentenceAtTime(ch.start_time)
+                end)
+            end
+        end)
+    end
     if ch.audio_path and self.media_engine
         and self.media_engine.current_path ~= ch.audio_path then
-        if self.plugin and self.plugin._playAudioFile then
-            self.plugin:_playAudioFile(ch.audio_path, self.playlist_files)
-        end
+        -- Cross-file chapter jump: BT reconnect then load the new audio part.
+        self:_bridgeKindleA2dpForTrackChange(function()
+            if self.plugin and self.plugin._playAudioFile then
+                self.plugin:_playAudioFile(ch.audio_path, self.playlist_files)
+            end
+            after_audio_ready()
+        end)
+        return
     end
-    UIManager:scheduleIn(0.2, function()
-        self:seekToTime(ch.start_time)
-        if self.overlay_mode and ch.fragment_id then
-            UIManager:scheduleIn(0.3, function()
-                self:navigateToSentenceAtTime(ch.start_time)
-            end)
-        end
-    end)
+    after_audio_ready()
 end
 
 function MediaSync:showPlaylist()
