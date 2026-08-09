@@ -242,7 +242,10 @@ devices.
 
 ## 4. Kindle
 
-**Confirmed device:** Kindle Basic 2022 (11th Gen) -- speakerless
+**Confirmed device:** Kindle Basic 2022 (11th Gen) -- speakerless  
+**Also field-tested:** Kindle Paperwhite 11th gen + Apple AirPods Pro 3 (see
+[AIRPODS_PRO3_KINDLE.md](./AIRPODS_PRO3_KINDLE.md) for playback fixes, pause
+keepalive, and AVRCP stem limitations).
 
 ### Bluetooth
 
@@ -260,6 +263,11 @@ devices.
 **NOTE:** Read and write properties may differ by name and type across Kindle
 generations (e.g., `BTstate` for reading vs `BTenable` for writing on the
 Basic 2022).
+
+**AVRCP / headset buttons:** Kindle `btfd` does **not** expose a Linux
+`(AVRCP)` input device for third-party `mixersink` players. AirPods stem
+volume/ANC can still work; stem Play/Pause does not reach the plugin.
+Kobo `mtkbtd` is different — see `btmediacontrol.lua` and the AirPods doc.
 
 ### Audio Pipeline
 
