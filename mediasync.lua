@@ -745,7 +745,11 @@ function MediaSync:stop(keep_chapter_menu)
     end
 
     if self.media_engine then
-        pcall(function() self.media_engine:stop() end)
+        pcall(function()
+            -- Hard stop: tear down pause keepalive as well as content audio.
+            self.media_engine._kill_keepalive_on_stop = true
+            self.media_engine:stop()
+        end)
     end
     if self.highlight_manager then
         pcall(function() self.highlight_manager:clearHighlights() end)
