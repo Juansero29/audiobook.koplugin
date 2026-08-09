@@ -999,19 +999,68 @@ function MediaSync:prevSentence()
     self:seekToTime(self.timing_data[idx].start_time)
 end
 
---- Index of the current Storyteller SMIL content-document chapter (not audio part).
-function MediaSync:_currentOverlayChapterIndex()
+--- Resolve the current Storyteller SMIL content-document chapter (not ~4 min audio part).
+-- Chapters are keyed by (audio_path, start_time within that file). Across playlist
+-- advances we must compare playlist order, not only the current file's local clock.
+function MediaSync:_resolveOverlayChapter()
     local chapters = self.plugin and self.plugin._smil_overlay_chapters
     if not chapters or #chapters == 0 then return nil, nil end
     local current_time = self.media_engine and self.media_engine:getPosition() or 0
     local current_path = self.media_engine and self.media_engine.current_path
+    local path_order = {}
+    if self.playlist_files then
+        for i, f in ipairs(self.playlist_files) do
+            if f.path then path_order[f.path] = i end
+        end
+    end
+    local cur_order = (current_path and path_order[current_path])
+        or self.current_playlist_idx
+        or 1
     local current_idx = 1
     for i, ch in ipairs(chapters) do
-        if ch.audio_path == current_path and (ch.start_time or 0) <= current_time + 1 then
+        local ch_order = (ch.audio_path and path_order[ch.audio_path]) or 0
+        local st = ch.start_time or 0
+        if ch_order < cur_order
+            or (ch.audio_path == current_path and st <= current_time + 1) then
             current_idx = i
         end
     end
-    return current_idx, chapters
+    return chapters[current_idx], current_idx
+end
+
+--- Index of the current Storyteller SMIL content-document chapter (not audio part).
+function MediaSync:_currentOverlayChapterIndex()
+    local ch, idx = self:_resolveOverlayChapter()
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not ch then return nil, chapters end
+    return idx, chapters
+end
+
+--- Push the live chapter title into the player (full + mini bar).
+function MediaSync:_refreshPlaybackBarTitles()
+    if not self.playback_bar then return end
+    local ch = self:getCurrentChapter()
+    local label = ch and ch.title or nil
+    if (not label or label == "") and self.playlist_files and self.current_playlist_idx then
+        local f = self.playlist_files[self.current_playlist_idx]
+        label = f and f.name or nil
+    end
+    if not label or label == "" then return end
+    pcall(function()
+        -- Force mini refresh even when the chapter label is unchanged (e.g. first
+        -- paint used the book title before chapter_title was applied).
+        local bar = self.playback_bar
+        if bar.chapter_title == label and bar._mini_title then
+            bar:_updateMiniWidgets()
+        end
+        bar:updateChapterTitle(label)
+        if ch and bar.setCurrentChapter then
+            bar:setCurrentChapter(ch)
+        end
+        if not self.overlay_mode and bar.updateOutputName then
+            bar:updateOutputName(label)
+        end
+    end)
 end
 
 function MediaSync:nextChapter()
@@ -1498,13 +1547,10 @@ function MediaSync:_startPositionPoller(gen)
             pcall(function()
                 self.playback_bar:updateTimeDisplay(pos or 0, dur or 0)
             end)
-            -- Update chapter title and current chapter info
+            -- Update chapter title (overlay: SMIL chapter across audio parts)
             local ok_ch, ch, ch_idx = pcall(function() return self:getCurrentChapter() end)
-            if ok_ch and ch then
-                pcall(function()
-                    self.playback_bar:updateChapterTitle(ch.title or "")
-                    self.playback_bar:setCurrentChapter(ch)
-                end)
+            if ok_ch then
+                pcall(function() self:_refreshPlaybackBarTitles() end)
                 -- Update chapter menu highlight if it's open (chapter mode only;
                 -- playlist mode uses playlist index, not chapter index)
                 if self._chapter_menu and ch_idx and not self.playlist_files then
@@ -1592,6 +1638,9 @@ end
 
 function MediaSync:showPlaybackBar()
     if self.playback_bar and self.playback_bar:isVisible() then
+        -- Track transitions soft-stop and reuse the same player UI — refresh
+        -- the chapter label so we don't keep the first playlist entry forever.
+        self:_refreshPlaybackBarTitles()
         self:_reserveMiniBarSpace()
         return
     end
@@ -1612,17 +1661,27 @@ function MediaSync:showPlaybackBar()
             or self.plugin._smil_doc_path:match("([^/]+)$")
             or title
     end
-    -- Derive output name: use original playlist filename when available
+    -- Derive output name: book title in overlay mode (chapter goes in
+    -- chapter_title / mini bar). Standalone playlists keep the track name.
     local output_name = ""
-    if self.playlist_files and self.current_playlist_idx then
+    if self.overlay_mode then
+        output_name = title
+    elseif self.playlist_files and self.current_playlist_idx then
         output_name = self.playlist_files[self.current_playlist_idx].name
     elseif self.media_engine and self.media_engine.current_path then
         output_name = self.media_engine.current_path:match("([^/]+)$") or ""
     end
 
+    local initial_chapter = ""
+    if self.overlay_mode then
+        local ch = self:getCurrentChapter()
+        if ch and ch.title then initial_chapter = ch.title end
+    end
+
     local player = AudiobookPlayer:new{
         plugin = self.plugin,
         title = title,
+        chapter_title = initial_chapter,
         output_name = output_name,
         cover_image_path = self.cover_path,
         -- Read-along (EPUB overlay) mode: start minimized so the book page
@@ -1751,6 +1810,7 @@ function MediaSync:showPlaybackBar()
         end)
     end
     self.playback_bar = player
+    self:_refreshPlaybackBarTitles()
     self:_reserveMiniBarSpace()
 end
 
@@ -2039,14 +2099,9 @@ function MediaSync:showOverlayChapterList()
         return
     end
 
-    local current_time = self.media_engine and self.media_engine:getPosition() or 0
-    local current_path = self.media_engine and self.media_engine.current_path
     local current_idx = 1
-    for i, ch in ipairs(chapters) do
-        if ch.audio_path == current_path and ch.start_time <= current_time + 1 then
-            current_idx = i
-        end
-    end
+    local _, idx = self:_resolveOverlayChapter()
+    if idx then current_idx = idx end
 
     local items = {}
     for i, ch in ipairs(chapters) do
@@ -2150,6 +2205,12 @@ end
 -- ---------------------------------------------------------------------------
 
 function MediaSync:getCurrentChapter()
+    -- Storyteller / Media Overlay: prefer the flat SMIL chapter list so the
+    -- title follows the content document across ~4 min audio-file boundaries.
+    if self.overlay_mode then
+        local ch, idx = self:_resolveOverlayChapter()
+        if ch then return ch, idx end
+    end
     if not self.chapters or #self.chapters == 0 then return nil end
     local pos = self.media_engine:getPosition()
     for i = #self.chapters, 1, -1 do

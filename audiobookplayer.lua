@@ -678,7 +678,8 @@ function AudiobookPlayer:setupUI()
     -- Create the centered title/time stack now that side buttons have reserved
     -- their full width, so the text cannot overlap the volume/sync buttons.
     self._mini_title = TextWidget:new{
-        text = self.output_name or self.title or _("Audiobook"),
+        text = (self.chapter_title and self.chapter_title ~= "" and self.chapter_title)
+            or self.output_name or self.title or _("Audiobook"),
         face = Font:getFace("cfont", 13),
         max_width = center_max_width,
         truncate_left = false,
@@ -904,9 +905,18 @@ end
 function AudiobookPlayer:updateChapterTitle(title)
     if title and title ~= self.chapter_title then
         self.chapter_title = title
-        self.chapter_widget:setText(title)
+        if self.chapter_widget then
+            self.chapter_widget:setText(title)
+        end
+        -- Mini bar prefers chapter_title for read-aloud (see _updateMiniWidgets).
+        if self._mini_title then
+            self:_updateMiniWidgets()
+        end
         UIManager:setDirty(self, function()
-            return "ui", self.chapter_widget.dimen
+            if self._minimized then
+                return "ui", self.dimen
+            end
+            return "ui", self.chapter_widget and self.chapter_widget.dimen or self.dimen
         end)
     end
 end
@@ -1097,9 +1107,16 @@ function AudiobookPlayer:updateOutputName(name)
     if name and name ~= self.output_name then
         self.output_name = name
         self.output_widget = self:_buildOutputWidget(name)
-        UIManager:setDirty(self, function()
-            return "ui", self.output_widget.dimen
-        end)
+        if self._minimized then
+            self:_updateMiniWidgets()
+            UIManager:setDirty(self, function()
+                return "ui", self.dimen
+            end)
+        else
+            UIManager:setDirty(self, function()
+                return "ui", self.output_widget and self.output_widget.dimen or self.dimen
+            end)
+        end
     end
 end
 
@@ -1358,14 +1375,18 @@ function AudiobookPlayer:_updateScrubberPreview(x)
 end
 
 function AudiobookPlayer:_updateMiniWidgets()
-    -- Show track filename (output_name) in mini bar; fall back to title.
+    -- Read-aloud: show the live SMIL chapter title. Fall back to output_name
+    -- (track/book) when no chapter is known yet.
     -- When browsing away from the audio page, the title becomes a clear
     -- "Return to read-aloud" cue (tapping the bar centers on the sentence).
     local track
     if self._return_hint_active then
         track = _("Return to read-aloud")
     else
-        track = self.output_name
+        track = self.chapter_title
+        if not track or track == "" then
+            track = self.output_name
+        end
         if not track or track == "" then
             track = self.title or _("Audiobook")
         end
