@@ -6,6 +6,7 @@ Mirrors SyncController patterns but without TTS synthesis or sentence prefetch.
 @module koplugin.audiobook.mediasync
 --]]
 
+local Device = require("device")
 local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
@@ -591,7 +592,8 @@ end
 
 function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position)
     if self.state == self.STATE.PLAYING or self.state == self.STATE.PAUSED then
-        self:stop(true) -- keep chapter menu open during track transitions
+        -- Soft stop: keep A2DP keepalive + player UI across playlist file changes.
+        self:stop(true, { track_transition = true })
     end
 
     if not audio_path or not timing_data or #timing_data == 0 then
@@ -599,6 +601,7 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
         return false
     end
 
+    self._track_advance_pending = nil
     self.state = self.STATE.LOADING
     self.timing_data = timing_data
     self.chapters = chapters or {}
@@ -696,6 +699,8 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
 
     -- Show playback bar in scrubber mode
     self:showPlaybackBar()
+    -- Reflow page so book text ends above the mini player (never covered).
+    self:_reserveMiniBarSpace()
 
     -- Resume from saved position on initial start, if any.
     if self._start_position and self._start_position > 0 then
@@ -726,7 +731,11 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     return true
 end
 
-function MediaSync:stop(keep_chapter_menu)
+--- @param keep_chapter_menu boolean|nil
+--- @param opts table|nil  { track_transition = true } spares A2DP keepalive and player UI
+function MediaSync:stop(keep_chapter_menu, opts)
+    opts = opts or {}
+    local track_transition = opts.track_transition and true or false
     local was_playing = self.state ~= self.STATE.STOPPED
     self.state = self.STATE.STOPPED
     self._chain_generation = self._chain_generation + 1
@@ -741,13 +750,22 @@ function MediaSync:stop(keep_chapter_menu)
     end
 
     if self.media_engine then
-        pcall(function() self.media_engine:stop() end)
+        pcall(function()
+            -- Hard stop (user close / end of book): tear down keepalive too.
+            -- Track transition: spare keepalive so AirPods A2DP stays armed.
+            self.media_engine._kill_keepalive_on_stop = not track_transition
+            self.media_engine:stop()
+        end)
     end
     if self.highlight_manager then
         pcall(function() self.highlight_manager:clearHighlights() end)
     end
-    if self.playback_bar then
-        pcall(function() self.playback_bar:hide() end)
+    if not track_transition then
+        if self.playback_bar then
+            pcall(function() self.playback_bar:hide() end)
+        end
+        -- Restore page margins only on hard stop (keep reservation across tracks).
+        self:_releaseMiniBarSpace()
     end
     if not keep_chapter_menu then
         if self._chapter_menu_window then
@@ -760,7 +778,71 @@ function MediaSync:stop(keep_chapter_menu)
     end
 
     if was_playing then
-        logger.warn("MediaSync: stopped")
+        logger.warn("MediaSync: stopped", track_transition and "(track transition)" or "")
+    end
+end
+
+--- Footer height (status bar + progress) for positioning / margin math.
+function MediaSync:_readerFooterHeight()
+    local ui = self.plugin and self.plugin.ui
+    local view = ui and ui.view
+    if not view or not view.footer or not view.footer_visible then return 0 end
+    local ok, h = pcall(function() return view.footer:getHeight() end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    ok, h = pcall(function()
+        local d = view.footer.dimen
+        return d and d.h or 0
+    end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    return 0
+end
+
+--[[--
+Reserve the mini player's height in the document bottom margin so book text
+reflows above it (same approach as SyncController:_reserveBarSpace for TTS).
+--]]
+function MediaSync:_reserveMiniBarSpace()
+    if self._bar_space_reserved then return end
+    if not self.overlay_mode then return end
+    if not (self.plugin and self.plugin.ui and self.plugin.ui.rolling) then return end
+    local ui = self.plugin.ui
+    local tp = ui.typeset
+    if not (tp and tp.unscaled_margins and ui.document and ui.document.setPageMargins) then
+        return
+    end
+    local bar = self.playback_bar
+    local bar_h = bar and (bar._mini_height or (bar.dimen and bar.dimen.h)) or 0
+    if not bar_h or bar_h <= 0 then
+        bar_h = Screen:scaleBySize(44)
+    end
+    local m = tp.unscaled_margins
+    local bottom = Screen:scaleBySize(m[4]) + bar_h
+    local keep_bars = self.plugin and self.plugin.getSetting
+        and self.plugin:getSetting("keep_reader_status_bars", false)
+    if keep_bars then
+        bottom = bottom + self:_readerFooterHeight()
+    end
+    local ok = pcall(ui.document.setPageMargins, ui.document,
+        Screen:scaleBySize(m[1]), Screen:scaleBySize(m[2]),
+        Screen:scaleBySize(m[3]), bottom)
+    if ok then
+        self._bar_space_reserved = true
+        self._reserved_mini_bar_h = bar_h
+        ui:handleEvent(Event:new("UpdatePos"))
+        logger.warn("MediaSync: reserved", bar_h, "px bottom margin for mini player")
+    end
+end
+
+function MediaSync:_releaseMiniBarSpace()
+    if not self._bar_space_reserved then return end
+    self._bar_space_reserved = false
+    self._reserved_mini_bar_h = nil
+    if not (self.plugin and self.plugin.ui) then return end
+    local ui = self.plugin.ui
+    local tp = ui.typeset
+    if tp and tp.unscaled_margins then
+        ui:handleEvent(Event:new("SetPageMargins", tp.unscaled_margins))
+        logger.warn("MediaSync: restored user page margins after mini player")
     end
 end
 
@@ -931,13 +1013,34 @@ function MediaSync:prevChapter()
     end
 end
 
+--- Keepalive (+ optional BT Disconnect/Connect) before switching audio files.
+function MediaSync:_bridgeKindleA2dpForTrackChange(then_fn)
+    local me = self.media_engine
+    local cycle_bt = false
+    if self.plugin and self.plugin.getSetting then
+        cycle_bt = self.plugin:getSetting("kindle_bt_reconnect_on_track", false) and true or false
+    end
+    if me and me.prepareKindleTrackAdvance then
+        me:prepareKindleTrackAdvance(function(_ok)
+            if then_fn then then_fn() end
+        end, { cycle_bt = cycle_bt })
+        return
+    end
+    if me and me._startKindleA2dpKeepalive then
+        pcall(function() me:_startKindleA2dpKeepalive("track-advance") end)
+    end
+    if then_fn then then_fn() end
+end
+
 function MediaSync:switchToPlaylistFile(index)
     if not self.playlist_files or not self.playlist_files[index] then return end
     self.current_playlist_idx = index
     local file_path = self.playlist_files[index].path
-    if self.plugin and self.plugin._playAudioFile then
-        self.plugin:_playAudioFile(file_path, self.playlist_files)
-    end
+    self:_bridgeKindleA2dpForTrackChange(function()
+        if self.plugin and self.plugin._playAudioFile then
+            self.plugin:_playAudioFile(file_path, self.playlist_files)
+        end
+    end)
 end
 
 function MediaSync:toggleLoop()
@@ -1334,13 +1437,31 @@ end
 
 function MediaSync:_onPlaybackComplete(gen)
     if self._chain_generation ~= gen then return end
+    if self._track_advance_pending then
+        logger.warn("MediaSync: playback complete ignored (track advance already pending)")
+        return
+    end
     logger.warn("MediaSync: playback complete")
     -- In playlist mode, auto-advance to the next track
     if self.playlist_files and #self.playlist_files > 0 then
         local next_idx = (self.current_playlist_idx or 1) + 1
+        local function advance(idx)
+            self._track_advance_pending = true
+            self._chain_generation = self._chain_generation + 1
+            if self._sync_timer then
+                UIManager:unschedule(self._sync_timer)
+                self._sync_timer = nil
+            end
+            if self._position_timer then
+                UIManager:unschedule(self._position_timer)
+                self._position_timer = nil
+            end
+            logger.warn("MediaSync: auto-advancing to playlist track", idx,
+                "(A2DP bridge; BT cycle if setting enabled)")
+            self:switchToPlaylistFile(idx)
+        end
         if next_idx <= #self.playlist_files then
-            logger.warn("MediaSync: auto-advancing to playlist track", next_idx)
-            self:switchToPlaylistFile(next_idx)
+            advance(next_idx)
             return
         elseif self.loop_enabled then
             -- Loop: wrap back to start (or random if shuffled)
@@ -1351,7 +1472,7 @@ function MediaSync:_onPlaybackComplete(gen)
                 next_idx = 1
             end
             logger.warn("MediaSync: looping to playlist track", next_idx)
-            self:switchToPlaylistFile(next_idx)
+            advance(next_idx)
             return
         end
     end
@@ -1374,6 +1495,7 @@ end
 
 function MediaSync:showPlaybackBar()
     if self.playback_bar and self.playback_bar:isVisible() then
+        self:_reserveMiniBarSpace()
         return
     end
     -- For standalone audio (scrubber mode), use full-screen AudiobookPlayer overlay
@@ -1476,6 +1598,12 @@ function MediaSync:showPlaybackBar()
         on_refocus = self.overlay_mode and function()
             self:refocusToCurrentSentence()
         end or nil,
+        -- BT reconnect lives in plugin settings (Reconnect BT on track change).
+        show_fix_audio = false,
+        keep_reader_status_bars = self.plugin
+            and self.plugin.getSetting
+            and self.plugin:getSetting("keep_reader_status_bars", false)
+            or false,
     }
     player:show()
     if self.plugin then
@@ -1485,6 +1613,7 @@ function MediaSync:showPlaybackBar()
         end)
     end
     self.playback_bar = player
+    self:_reserveMiniBarSpace()
 end
 
 function MediaSync:navigateToSentenceAtTime(seconds)

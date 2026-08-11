@@ -613,6 +613,31 @@ local function collectAudioInfo(plugin, skip_intensive)
         info.kindle_audiomgrd_output_connected = shellCapture("lipc-get-prop com.lab126.audiomgrd audioOutputConnected 2>/dev/null", 2) or "n/a"
         info.kindle_audiomgrd_current_output = shellCapture("lipc-get-prop com.lab126.audiomgrd audioCurrentOutput 2>/dev/null", 2) or "n/a"
         info.kindle_audiomgrd_volume = shellCapture("lipc-get-prop com.lab126.audiomgrd speakerVolume 2>/dev/null", 2) or "n/a"
+        -- AirPods Pro / Apple headset diagnostics (btfd hash lists + route).
+        -- Used to confirm A2DP is up when audio dies after a short blip.
+        info.kindle_btfd_list_connected = shellCapture(
+            "lipc-hash-prop com.lab126.btfd ListConnected 2>/dev/null | head -40", 3) or "n/a"
+        info.kindle_btfd_list_paired = shellCapture(
+            "lipc-hash-prop com.lab126.btfd ListPaired 2>/dev/null | head -40", 3) or "n/a"
+        local connected_dump = info.kindle_btfd_list_connected or ""
+        local apple_name = connected_dump:match('bd_name%s*=%s*"(.-)"')
+        info.kindle_apple_headset = "no"
+        if apple_name and apple_name:lower():find("airpods", 1, true) then
+            info.kindle_apple_headset = "airpods:" .. apple_name
+        elseif apple_name and apple_name:lower():find("beats", 1, true) then
+            info.kindle_apple_headset = "beats:" .. apple_name
+        elseif apple_name then
+            info.kindle_apple_headset = "other:" .. apple_name
+        end
+        info.kindle_abk_gst_pids = shellCapture(
+            "pgrep -af 'abk-progress|gst-launch-0.10|mixersink' 2>/dev/null | head -15", 3) or "none"
+        -- Input / AVRCP discovery for AirPods stem play-pause.
+        info.kindle_input_devices = shellCapture(
+            "cat /proc/bus/input/devices 2>/dev/null | head -120", 3) or "n/a"
+        info.kindle_input_event_nodes = shellCapture(
+            "ls -la /dev/input/ 2>/dev/null | head -40", 2) or "n/a"
+        info.kindle_btui = shellCapture(
+            "command -v btui 2>/dev/null; ls -la /usr/bin/btui 2>/dev/null", 2) or "not found"
         -- Full ALSA config: v0.1.5.24 showed dmix0 on hw:0,0 -- we need
         -- the complete config to see all defined PCMs and their routing.
         info.kindle_asound_conf_full = shellCapture("cat /etc/asound.conf 2>/dev/null", 5) or "not found"

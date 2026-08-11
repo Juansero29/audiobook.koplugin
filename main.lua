@@ -548,7 +548,20 @@ function Audiobook:addToMainMenu(menu_items)
                                 BtMediaControl.stop()
                             end
                         end,
-                        help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status."),
+                        help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status.\n\nNote: Kindle Paperwhite does not expose an AVRCP input device for AirPods stem presses (no btui / no media-key evdev). Stem play/pause is not available on this firmware; use the on-screen controls or Kindle buttons."),
+                    },
+                    {
+                        text = _("Reconnect BT on track change"),
+                        enabled_func = function()
+                            return Device.isKindle and Device:isKindle()
+                        end,
+                        checked_func = function()
+                            return self:getSetting("kindle_bt_reconnect_on_track", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("kindle_bt_reconnect_on_track", false)
+                        end,
+                        help_text = _("Kindle + AirPods: when enabled, each playlist/Storyteller audio-file boundary runs a Bluetooth Disconnect→Connect cycle before the next file starts (~5–10 s gap). Off by default; the plugin still keeps a silent A2DP keepalive across the gap. Turn this on only if audio goes silent at chapter/chunk transitions."),
                     },
                     {
                         text_func = function()
@@ -793,6 +806,17 @@ function Audiobook:addToMainMenu(menu_items)
                             self:toggleSetting("media_follow_page_turn", true)
                         end,
                         help_text = _("When enabled (default), an aligned audiobook will automatically turn pages to keep the narration in view, and manually turning the page will seek narration to the new page. When disabled, pages do not auto-follow and manual turns do not seek audio; only the currently visible text is highlighted."),
+                    },
+                    {
+                        text = _("Keep status bars during read-aloud"),
+                        enabled_func = function() return (self.ui and self.ui.document) or false end,
+                        checked_func = function()
+                            return self:getSetting("keep_reader_status_bars", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("keep_reader_status_bars", false)
+                        end,
+                        help_text = _("When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar / progress bar (alt status bar at the top is unchanged). The page always reflows so book text ends above the mini player — the player never covers readable text. When disabled (default), the mini player sits at the bottom of the screen (may cover the status bar) but text is still reflowed above it."),
                     },
                     {
                         text = _("Sleep timer"),
@@ -1606,11 +1630,7 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
                 "start_time=", start_time)
         end
 
-        pcall(function()
-            if self:getSetting("bt_media_control", true) and BtMediaControl then
-                BtMediaControl.start(self)
-            end
-        end)
+        pcall(function() self:_ensureBtMediaControl() end)
 
         -- Cache parser/timing for page-follow and selection restarts.
         -- If we are switching to a different EPUB, drop the resolved-xpointer
@@ -1768,11 +1788,7 @@ function Audiobook:_playAudioFile(file_path, playlist_files)
         local slot = self._smil_by_file[file_path]
         self.media_sync:start(file_path, slot.timing, slot.chapters, nil,
             playlist_files or self.media_sync.playlist_files, file_path)
-        pcall(function()
-            if self:getSetting("bt_media_control", true) and BtMediaControl then
-                BtMediaControl.start(self)
-            end
-        end)
+        pcall(function() self:_ensureBtMediaControl() end)
         return
     end
 
@@ -2709,6 +2725,22 @@ function Audiobook:stopReadAlong()
     pcall(function() self.tts_engine:forceKillAll() end)
 end
 
+--- Ensure headset media buttons (AirPods stem) are listened for.
+-- On Kindle, auto-enable the setting: BlueZ AVRCP is absent and the stem
+-- only works if we advertise as an AVRCP target + scan for media input.
+function Audiobook:_ensureBtMediaControl()
+    if not BtMediaControl then return end
+    if Device.isKindle and Device:isKindle() then
+        if not self:getSetting("bt_media_control", true) then
+            self:setSetting("bt_media_control", true)
+            logger.warn("Audiobook: enabled bt_media_control for Kindle headset buttons")
+        end
+    end
+    if self:getSetting("bt_media_control", true) then
+        BtMediaControl.start(self)
+    end
+end
+
 function Audiobook:pauseReadAlong()
     if not self._init_ok then return end
     -- Pause media playback if active
@@ -2728,11 +2760,13 @@ function Audiobook:resumeReadAlong()
     if not self._init_ok then return end
     -- Resume media playback if active
     if self.media_sync and self.media_sync.state == "paused" then
+        pcall(function() self:_ensureBtMediaControl() end)
         pcall(function() self.media_sync:resume() end)
         pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
         return
     end
     if self.sync_controller then
+        pcall(function() self:_ensureBtMediaControl() end)
         pcall(function() self.sync_controller:resume() end)
         pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
     end
@@ -2835,9 +2869,19 @@ end
 
 function Audiobook:onMediaPlayPause()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() then
+    -- Prefer media_sync (Storyteller / audiobook) over TTS sync_controller.
+    local media_active = self.media_sync and self.media_sync.state ~= "stopped"
+    if media_active then
+        if self.media_sync.state == "playing" then
+            self:pauseReadAlong()
+        elseif self.media_sync.state == "paused" then
+            self:resumeReadAlong()
+        end
+        return true
+    end
+    if self.sync_controller and self.sync_controller:isPlaying() then
         self:pauseReadAlong()
-    elseif self.sync_controller:isPaused() then
+    elseif self.sync_controller and self.sync_controller:isPaused() then
         self:resumeReadAlong()
     end
     return true
@@ -2845,17 +2889,13 @@ end
 
 function Audiobook:onMediaPlay()
     if not self._init_ok then return true end
-    if self.sync_controller:isPaused() then
-        self:resumeReadAlong()
-    end
+    self:resumeReadAlong()
     return true
 end
 
 function Audiobook:onMediaPause()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() then
-        self:pauseReadAlong()
-    end
+    self:pauseReadAlong()
     return true
 end
 
@@ -2868,7 +2908,11 @@ end
 
 function Audiobook:onMediaNext()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() or self.sync_controller:isPaused() then
+    if self.media_sync and self.media_sync.state ~= "stopped" then
+        self.media_sync:nextChapter()
+        return true
+    end
+    if self.sync_controller and (self.sync_controller:isPlaying() or self.sync_controller:isPaused()) then
         self.sync_controller:nextSentence()
     end
     return true
@@ -2876,7 +2920,11 @@ end
 
 function Audiobook:onMediaPrev()
     if not self._init_ok then return true end
-    if self.sync_controller:isPlaying() or self.sync_controller:isPaused() then
+    if self.media_sync and self.media_sync.state ~= "stopped" then
+        self.media_sync:prevChapter()
+        return true
+    end
+    if self.sync_controller and (self.sync_controller:isPlaying() or self.sync_controller:isPaused()) then
         self.sync_controller:prevSentence()
     end
     return true

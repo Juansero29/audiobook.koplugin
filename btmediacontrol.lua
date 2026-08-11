@@ -84,6 +84,14 @@ function BtMediaControl.start(plugin)
         return true
     end
 
+    -- Kindle: no BlueZ AVRCP — advertise playback state via btui (if present)
+    -- and keep rescanning input nodes; AirPods stem needs an AVRCP target.
+    if Device.isKindle and Device:isKindle() then
+        logger.warn("BtMediaControl: Kindle AVRCP path (no BlueZ evdev)")
+        BtMediaControl._startKindleAvrcpSupport()
+        return true
+    end
+
     -- Fall back to D-Bus key monitoring
     logger.warn("BtMediaControl: No AVRCP evdev device found, trying D-Bus polling")
     BtMediaControl._startDbusPolling()
@@ -96,6 +104,7 @@ Stop listening for BT media button events.
 function BtMediaControl.stop()
     BtMediaControl._stopEvdev()
     BtMediaControl._stopDbusPolling()
+    BtMediaControl._stopKindleAvrcpSupport()
     BtMediaControl._plugin = nil
 end
 
@@ -150,41 +159,76 @@ function BtMediaControl._findAvrcpEvdevDevice()
         end
     end
 
-    -- Method 2: check /proc/bus/input/devices for AVRCP
+    -- Method 2: check /proc/bus/input/devices for AVRCP / media keys.
+    -- Blocks end at a blank line; KEY= usually appears after Handlers=.
     handle = io.popen("cat /proc/bus/input/devices 2>/dev/null")
     if handle then
         local output = handle:read("*a")
         handle:close()
-        -- Parse blocks separated by empty lines
-        local current_name = nil
-        local current_handlers = nil
-        for line in output:gmatch("[^\n]+") do
-            local name = line:match('^N: Name="(.-)"')
-            if name then
-                current_name = name
-                current_handlers = nil
-            end
-            local handlers = line:match("^H: Handlers=(.*)")
-            if handlers then
-                current_handlers = handlers
-            end
-            -- Check if this was an AVRCP device
-            if current_name and current_handlers
-                    and (current_name:lower():find("avrcp")
-                         or current_name:lower():find("media key")
-                         or current_name:lower():find("bluetooth.*key")) then
-                local event_dev = current_handlers:match("(event%d+)")
-                if event_dev then
-                    local dev_path = "/dev/input/" .. event_dev
-                    logger.warn("BtMediaControl: Found AVRCP in /proc/bus/input:",
-                        dev_path, "name:", current_name)
-                    return dev_path, current_name
-                end
+        local current_name, current_handlers, current_key_bitmap = nil, nil, nil
+        local function consider_block()
+            if not current_name or not current_handlers then return nil end
+            local lname = current_name:lower()
+            local name_hit = lname:find("avrcp", 1, true)
+                or lname:find("media key", 1, true)
+                or lname:find("consumer control", 1, true)
+                or lname:find("airpods", 1, true)
+                or lname:find("beats", 1, true)
+                or lname:find("headset", 1, true)
+                or lname:find("headphone", 1, true)
+            local key_hit = current_key_bitmap
+                and (BtMediaControl._keyBitmapHasCode(current_key_bitmap, KEY_PLAYPAUSE)
+                    or BtMediaControl._keyBitmapHasCode(current_key_bitmap, KEY_PLAYCD)
+                    or BtMediaControl._keyBitmapHasCode(current_key_bitmap, KEY_PAUSECD))
+            if not (name_hit or key_hit) then return nil end
+            local event_dev = current_handlers:match("(event%d+)")
+            if not event_dev then return nil end
+            local dev_path = "/dev/input/" .. event_dev
+            logger.warn("BtMediaControl: Found media input:",
+                dev_path, "name:", current_name,
+                "name_hit=", name_hit and "yes" or "no",
+                "key_hit=", key_hit and "yes" or "no")
+            return dev_path, current_name
+        end
+        for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+            if line == "" then
+                local path, name = consider_block()
+                if path then return path, name end
+                current_name, current_handlers, current_key_bitmap = nil, nil, nil
+            else
+                local name = line:match('^N: Name="(.-)"')
+                if name then current_name = name end
+                local handlers = line:match("^H: Handlers=(.*)")
+                if handlers then current_handlers = handlers end
+                local keys = line:match("^B: KEY=(.*)")
+                if keys then current_key_bitmap = keys end
             end
         end
+        local path, name = consider_block()
+        if path then return path, name end
     end
 
     return nil, nil
+end
+
+--- Return true if a /proc/bus/input/devices KEY= bitmap includes keycode.
+function BtMediaControl._keyBitmapHasCode(bitmap, keycode)
+    if not bitmap or not keycode then return false end
+    -- KEY= words are little-endian hex longs (native long width).  Use 32-bit
+    -- words as a practical common case on Kindle ARM; also try 64-bit.
+    local words = {}
+    for hex in bitmap:gmatch("%x+") do
+        table.insert(words, tonumber(hex, 16) or 0)
+    end
+    for _, bits_per_word in ipairs({32, 64}) do
+        local idx = math.floor(keycode / bits_per_word) + 1
+        local bit = keycode % bits_per_word
+        local word = words[idx]
+        if word and math.floor(word / (2 ^ bit)) % 2 == 1 then
+            return true
+        end
+    end
+    return false
 end
 
 --[[--
@@ -482,6 +526,87 @@ function BtMediaControl._dispatchMediaEvent(event_name)
 end
 
 
+-- ── Kindle AVRCP (AirPods stem / headset buttons) ────────────────────
+-- Kindle uses Lab126 btfd/Bluedroid, not BlueZ.  There is often no
+-- "(AVRCP)" evdev node.  We:
+--   1) advertise playback state via `btui` when available (AVRCP TG),
+--   2) periodically rescan /dev/input for media-key devices,
+--   3) poll lipc for playermgr / btfd hints that a remote command arrived.
+
+function BtMediaControl._startKindleAvrcpSupport()
+    if BtMediaControl._kindle_avrcp_active then return end
+    BtMediaControl._kindle_avrcp_active = true
+    BtMediaControl._kindleAdvertisePlaybackState("paused")
+    BtMediaControl._pollKindleAvrcp()
+end
+
+function BtMediaControl._stopKindleAvrcpSupport()
+    BtMediaControl._kindle_avrcp_active = false
+end
+
+function BtMediaControl._btuiAvailable()
+    if BtMediaControl._btui_checked then
+        return BtMediaControl._btui_path ~= nil
+    end
+    BtMediaControl._btui_checked = true
+    local h = io.popen("command -v btui 2>/dev/null; ls /usr/bin/btui 2>/dev/null")
+    if not h then return false end
+    local out = h:read("*a") or ""
+    h:close()
+    local path = out:match("(/[^\n]+btui)")
+    BtMediaControl._btui_path = path
+    return path ~= nil
+end
+
+--- Best-effort AVRCP target state via Amazon's btui test UI (menu 33).
+--- 1=stopped 2=paused 3=playing
+function BtMediaControl._kindleAdvertisePlaybackState(status)
+    if not BtMediaControl._btuiAvailable() then return end
+    local state = ({ playing = 3, paused = 2, stopped = 1 })[status] or 1
+    -- btui is an interactive menu; feed "33" (UpdatePlayBackState) + value + quit.
+    local cmd = string.format(
+        "( printf '33\\n%d\\n0\\n' | timeout 2 %s ) >/dev/null 2>&1 &",
+        state, BtMediaControl._btui_path or "btui")
+    os.execute(cmd)
+    logger.warn("BtMediaControl: Kindle btui UpdatePlayBackState", state, "(", status, ")")
+end
+
+function BtMediaControl._pollKindleAvrcp()
+    if not BtMediaControl._kindle_avrcp_active then return end
+
+    -- Late-appearing media input nodes after AirPods reconnect.
+    if not BtMediaControl._evdev_active then
+        if BtMediaControl._tryEvdevApproach() then
+            logger.warn("BtMediaControl: Kindle media input appeared on rescan")
+        end
+    end
+
+    -- Some firmwares toggle playermgr InPlayback when the headset sends AVRCP.
+    local h = io.popen("lipc-get-prop com.lab126.playermgr InPlayback 2>/dev/null")
+    if h then
+        local v = (h:read("*a") or ""):match("(%d+)")
+        h:close()
+        if v then
+            local n = tonumber(v)
+            if BtMediaControl._last_kindle_inplayback ~= nil
+                    and n ~= BtMediaControl._last_kindle_inplayback then
+                logger.warn("BtMediaControl: playermgr InPlayback",
+                    BtMediaControl._last_kindle_inplayback, "→", n)
+                if n == 0 then
+                    BtMediaControl._dispatchMediaEvent("MediaPause")
+                elseif n == 1 then
+                    BtMediaControl._dispatchMediaEvent("MediaPlay")
+                end
+            end
+            BtMediaControl._last_kindle_inplayback = n
+        end
+    end
+
+    if BtMediaControl._kindle_avrcp_active then
+        UIManager:scheduleIn(1.5, BtMediaControl._pollKindleAvrcp)
+    end
+end
+
 -- ══════════════════════════════════════════════════════════════════════
 -- SENDING FEEDBACK TO BT DEVICE
 -- ══════════════════════════════════════════════════════════════════════
@@ -493,11 +618,19 @@ Kobo's mtkbtd exposes MediaTransport1 (not MediaPlayer1), so we update
 the transport State property.  Some headsets reflect this as a status
 indicator or voice prompt.
 
+On Kindle, advertise via btui UpdatePlayBackState so AirPods treat us as
+an AVRCP target (required for stem play/pause to generate events).
+
 @param status string  "playing", "paused", or "stopped"
 --]]
 function BtMediaControl.sendPlaybackStatus(status)
     if BtMediaControl._last_sent_status == status then return end
     BtMediaControl._last_sent_status = status
+
+    if Device.isKindle and Device:isKindle() then
+        BtMediaControl._kindleAdvertisePlaybackState(status)
+        return
+    end
 
     local transport_path = BtMediaControl._findMediaTransportPath()
     if not transport_path then
