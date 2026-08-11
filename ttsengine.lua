@@ -3295,7 +3295,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 logger.warn("TTSEngine: kindle-gst-play using system gst-launch, PID=", pid)
             end
         end
-        if not pid then
+        if not pid and self._kindle_gst_play_bin then
             -- Launch gst-play in background, capture PID.
             -- Capture stderr to a log file for diagnostics (was previously
             -- discarded, making it impossible to debug silent failures).
@@ -3308,6 +3308,21 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             if h then h:close() end
             pid = tonumber(pid_str:match("(%d+)"))
             logger.warn("TTSEngine: kindle-gst-play launched, PID=", pid)
+        end
+        if not pid then
+            -- Neither the system pipeline nor a bundled binary could launch
+            -- (system-pipeline-only selection where gst-launch failed at
+            -- runtime, or no binary present).  Fail fast instead of entering
+            -- the poll loop with a nil pid, which would misread a stale log
+            -- as an early exit or a silent completion.
+            logger.err("TTSEngine: kindle-gst-play could not launch any pipeline")
+            self._gst_play_pid = nil
+            self.is_speaking = false
+            self:cleanup()
+            if self.on_fail_callback then
+                self.on_fail_callback()
+            end
+            return false
         end
         self._gst_play_pid = pid
         self._audio_launched_at = UIManager:getTime()
@@ -4199,6 +4214,35 @@ function TTSEngine:findAudioPlayer()
         end
     end
 
+    -- 0c-ii) Kindle gst-play WITHOUT playermgr (issue #28): on PW4-class
+    -- firmware playermgr never answers InPlayback, so the gst-play detection
+    -- nested inside 0c is unreachable and probing falls through to a bare
+    -- aplay on a device with zero ALSA cards -- every TTS attempt then dies
+    -- with "No audio output available" even though the SAME bundled gst-play
+    -- (mixersink -> audiomgrd -> BT) plays music files fine via MediaEngine,
+    -- which probes it without any playermgr gate.  Mirror that probe here so
+    -- TTS WAV playback uses the working path and keeps the user's voice.
+    -- Runs before the rescue probe: a confirmed mixersink path beats
+    -- aggressive audiomgrd initialization, and the probe only loads GStreamer
+    -- plugins (no audio focus taken).
+    if Device:isKindle() and not self.audio_player_type then
+        local gst_play_cmd = nil
+        if not self._gst_play_broken then
+            gst_play_cmd = self:_probeKindleGstPlayBin()
+        end
+        local has_system_gst = self:commandExists("gst-launch-0.10")
+        if gst_play_cmd or has_system_gst then
+            self.audio_player_type = "kindle-gst-play"
+            -- May be nil when only the system pipeline exists; play()
+            -- prefers _trySystemGstLaunch and skips a nil binary.
+            self._kindle_gst_play_bin = gst_play_cmd
+            self._no_real_audio_output = false
+            logger.warn("TTSEngine: selected kindle-gst-play without playermgr (issue #28), bin=",
+                tostring(gst_play_cmd), "system_gst=", has_system_gst)
+            return "kindle-gst-play"
+        end
+    end
+
     -- 0d) Kindle rescue probe: when all native paths fail, try aggressive
     -- initialization sequences to wake up audiomgrd or force ALSA card
     -- registration.  Some firmwares (e.g. PW11 5.17.1.0.3) need a specific
@@ -5071,6 +5115,55 @@ function TTSEngine:_probeKindleGstPlayWav(gst_play_cmd)
             "out=", out:gsub("\n", " "))
     end
     return false
+end
+
+--- Probe the bundled kindle/gst-play helper candidates and return the first
+--- command whose --probe reports mixersink=found, or nil.
+--- Mirrors MediaEngine:_detectKindleGstPlay (which runs without any playermgr
+--- gate and is why music playback works on PW4-class Kindles whose playermgr
+--- never answers InPlayback, issue #28): bare compat binary, linker-wrapped
+--- compat binary, then the native-glibc KinAMP-parity builds (soft-float pw2
+--- first, hard-float last).
+-- @treturn string|nil working gst-play command prefix, nil if none probe OK
+function TTSEngine:_probeKindleGstPlayBin()
+    local plugin_dir = Utils.normalizeDirPath(self.plugin_dir or ".")
+    local gst_play_bin = plugin_dir .. "/kindle/gst-play"
+    local candidates = {}
+    local gf = io.open(gst_play_bin, "r")
+    if gf then
+        gf:close()
+        table.insert(candidates, gst_play_bin)
+        if self.espeak_linker then
+            table.insert(candidates, string.format(
+                "%s --library-path %s:/usr/lib/tts:/usr/lib:/lib %s",
+                self.espeak_linker, self.espeak_lib_path, gst_play_bin))
+        end
+    end
+    for _, native_bin in ipairs({
+        plugin_dir .. "/kindle/gst-play-native-pw2",
+        plugin_dir .. "/kindle/gst-play-native",
+    }) do
+        local nf = io.open(native_bin, "r")
+        if nf then
+            nf:close()
+            table.insert(candidates, native_bin)
+        end
+    end
+    for _, cand in ipairs(candidates) do
+        local ph = io.popen(cand .. " --probe 2>&1")
+        if ph then
+            local probe = ph:read("*a") or ""
+            ph:close()
+            if probe:match("mixersink=found")
+                and not probe:match("mixersink=broken")
+                and not probe:match("gstreamer=not_found") then
+                logger.warn("TTSEngine: gst-play probe OK:", cand)
+                return cand
+            end
+            logger.dbg("TTSEngine: gst-play probe failed:", cand, "->", probe:gsub("\n", " "):sub(1, 120))
+        end
+    end
+    return nil
 end
 
 --- Keep the Kindle A2DP datapath alive between sentences.
