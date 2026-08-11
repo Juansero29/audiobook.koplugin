@@ -157,6 +157,10 @@ local function downloadFile(url, dest, expected_size)
 
     local max_retries = 5
     local retry_count = 0
+    -- Hard cap on total attempts so a connection that creeps forward one
+    -- byte at a time cannot loop forever (progress resets retry_count).
+    local max_total_attempts = 25
+    local total_attempts = 0
 
     -- Stale-partial guard: only resume a previous partial when it was
     -- downloaded against the same expected size.
@@ -260,15 +264,31 @@ local function downloadFile(url, dest, expected_size)
                     tostring(math.floor(bytes_after / 1048576)))
             end
             logger.warn("Updater: download request failed:", tostring(code or status), "size:", bytes_after)
-            retry_count = retry_count + 1
-            if retry_count > max_retries then
+            if bytes_after > bytes_before then
+                -- The attempt stalled mid-read (LuaSec "wantread", seen on
+                -- Kindle Wi-Fi at ~47-57 MB into the zip, issue #46) but it
+                -- DID advance the partial file, so resume is making real
+                -- progress.  Do not burn a retry on forward motion: only
+                -- consecutive no-progress attempts count toward the abort
+                -- limit, otherwise a connection that stalls every ~10 MB
+                -- exhausts all retries while advancing every time.
+                logger.warn("Updater: request failed but made progress (",
+                    bytes_before, "->", bytes_after, "), resuming")
+                retry_count = 0
+            else
+                retry_count = retry_count + 1
+            end
+            total_attempts = total_attempts + 1
+            if retry_count > max_retries or total_attempts > max_total_attempts then
                 -- Keep the partial file: the next attempt resumes here.
                 return false, T(_("Download failed (%1) at %2 bytes.\nTrying again will resume from that point."),
                     tostring(code or status or "no response"), tostring(bytes_after))
             end
         end
 
-        require("socket").sleep(1)
+        -- Back off briefly on failures so a transiently congested link can
+        -- recover; progress resets retry_count, so this stays short.
+        require("socket").sleep(math.min(retry_count * 2, 10))
     end
 end
 
