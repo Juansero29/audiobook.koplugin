@@ -291,6 +291,69 @@ local function benchPiper(engine, model_path, text)
     return { synth_ms = synth_ms, wav_ms = wav_ms, wav_bytes = wav_bytes }
 end
 
+--- Synthesize one sentence with the Android system TTS (blocking).
+-- Uses the same JNI bridge as normal playback but times synthesis only
+-- (no audio playback).  Completion callbacks run on the Java worker
+-- thread, so blocking the Lua main thread while polling does not stall
+-- them.  The per-sentence cap is generous on purpose: a pathologically
+-- slow engine is exactly what this benchmark exists to measure (issue
+-- #53, engines taking 1-2 minutes per sentence).
+-- @param engine TTSEngine
+-- @param text string
+-- @return table {synth_ms, wav_ms, wav_bytes, error?}
+local ANDROID_BENCH_TIMEOUT_S = 120
+local function benchAndroid(engine, text)
+    local atts = engine._android_tts
+    if not atts then return nil end
+    local temp_dir = atts:getTempDir() or "/tmp"
+    local audio_file = temp_dir .. "/bench_android_" .. os.time() .. "_" .. math.random(1000, 9999) .. ".wav"
+
+    -- Match the settings used for real playback so the numbers reflect
+    -- what the user hears.  Both setters queue on the Java worker thread
+    -- ahead of the synthesis request, so order is preserved.
+    atts:setRate(engine.rate or 1.0)
+    local android_pitch = 0.5 + ((engine.pitch or 50) / 99) * 1.5
+    atts:setPitch(android_pitch)
+
+    local dispatch = atts:synthesizeToFile(text, audio_file)
+    if dispatch ~= 0 then
+        return { synth_ms = 0, wav_ms = 0, wav_bytes = 0,
+                 error = "dispatch failed (" .. tostring(dispatch) .. ")" }
+    end
+
+    local t0 = time.now()
+    local status = -1
+    local timed_out = false
+    while true do
+        status = atts:getSynthStatus()
+        if status == 1 or status == 2 then break end
+        if time.to_ms(time.since(t0)) > ANDROID_BENCH_TIMEOUT_S * 1000 then
+            timed_out = true
+            break
+        end
+        -- 100ms between polls.  usleep is available in every supported
+        -- Android shell and already used elsewhere in the plugin.
+        os.execute("usleep 100000")
+    end
+    local synth_ms = time.to_ms(time.since(t0))
+
+    local wav_bytes = getFileSize(audio_file) or 0
+    local wav_ms = WavUtils.getDurationMs(audio_file)
+    os.remove(audio_file)
+
+    if timed_out then
+        -- wav_bytes > 0 here means the engine wrote audio but never
+        -- reported completion: a callback problem, not a speed problem.
+        return { synth_ms = synth_ms, wav_ms = wav_ms, wav_bytes = wav_bytes,
+                 error = "timed out after " .. ANDROID_BENCH_TIMEOUT_S .. "s" }
+    end
+    if status == 2 or wav_bytes == 0 then
+        return { synth_ms = synth_ms, wav_ms = wav_ms, wav_bytes = wav_bytes,
+                 error = "synthesis failed (status " .. tostring(status) .. ")" }
+    end
+    return { synth_ms = synth_ms, wav_ms = wav_ms, wav_bytes = wav_bytes }
+end
+
 -- ── Report generation ────────────────────────────────────────────────
 
 --- Format a single engine's benchmark results as text lines.
@@ -366,7 +429,39 @@ function BenchmarkRunner.run(plugin, progress_cb)
     end
     table.insert(report_lines, "")
 
+    -- ── Android system TTS benchmark ──
+    -- Synthesis-only timing through the JNI bridge.  Placed first because
+    -- it is the primary backend on Android devices; the bundled
+    -- espeak-ng/Piper binaries are Linux e-ink builds and unused there.
+    if engine and engine._android_tts then
+        local engine_pkg = "unknown"
+        local ok_pkg, pkg = pcall(function() return engine._android_tts:getDefaultEngine() end)
+        if ok_pkg and pkg then engine_pkg = pkg end
+        local results = {}
+        for i, s in ipairs(BENCH_SENTENCES) do
+            if progress_cb then
+                progress_cb(string.format(
+                    "Benchmarking Android TTS (%d/%d)...\nA slow engine can take minutes per sentence.",
+                    i, #BENCH_SENTENCES))
+            end
+            local r = benchAndroid(engine, s.text)
+            if r then
+                r.label = s.label
+            else
+                r = { label = s.label, synth_ms = 0, wav_ms = 0, wav_bytes = 0, error = "synthesis failed" }
+            end
+            table.insert(results, r)
+        end
+        local lines = formatEngineResults("Android TTS (" .. engine_pkg .. ")", results)
+        for _, line in ipairs(lines) do table.insert(report_lines, line) end
+        table.insert(report_lines, "")
+    end
+
     -- ── espeak-ng benchmark ──
+    local linux_only_note = ""
+    if Device.isAndroid and Device:isAndroid() then
+        linux_only_note = " (Linux binaries are not used on Android; see the Android section)"
+    end
     if engine and engine.espeak_bin then
         if progress_cb then progress_cb("Benchmarking espeak-ng...") end
         local results = {}
@@ -384,7 +479,7 @@ function BenchmarkRunner.run(plugin, progress_cb)
         table.insert(report_lines, "")
     else
         table.insert(report_lines, "── espeak-ng ──")
-        table.insert(report_lines, "  (not available on this device)")
+        table.insert(report_lines, "  (not available on this device)" .. linux_only_note)
         table.insert(report_lines, "")
     end
 
@@ -446,7 +541,7 @@ function BenchmarkRunner.run(plugin, progress_cb)
         end
     else
         table.insert(report_lines, "── Piper ──")
-        table.insert(report_lines, "  (not available on this device)")
+        table.insert(report_lines, "  (not available on this device)" .. linux_only_note)
         table.insert(report_lines, "")
     end
 

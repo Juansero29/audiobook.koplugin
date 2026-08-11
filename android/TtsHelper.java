@@ -72,6 +72,10 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     private volatile int pipelineGeneration = 0;
     /** Result of the most recent setLanguage() (TextToSpeech result code). */
     private volatile int lastLangResult = 0;
+    /** Package name of the active TTS engine (e.g. com.google.android.tts).
+     *  Filled on the worker thread after init; never queried from the main
+     *  thread because getDefaultEngine() is a binder call. */
+    private volatile String defaultEnginePackage = null;
 
     public TtsHelper(Context context) {
         workerThread = new HandlerThread("audiobook-tts");
@@ -86,8 +90,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         initStatus = status;
         if (status == TextToSpeech.SUCCESS) {
             tts.setLanguage(Locale.US);
-            tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                @Override
+            tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {                @Override
                 public void onStart(String utteranceId) {}
 
                 @Override
@@ -130,12 +133,38 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                     }
                 }
             });
+            // Identify the active engine on the worker thread: getDefaultEngine()
+            // is a binder call and must not run on the main thread.
+            worker.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        String pkg = tts.getDefaultEngine();
+                        defaultEnginePackage = (pkg != null) ? pkg : "unknown";
+                    } catch (Exception e) {
+                        defaultEnginePackage = "unknown";
+                    }
+                }
+            });
         }
     }
 
     /** Returns -1 while TTS engine is loading, 0 on success, >0 on error. */
     public int getInitStatus() {
         return initStatus;
+    }
+
+    /**
+     * Package name of the active TTS engine (e.g. "com.google.android.tts").
+     * Main-thread safe: returns a cached value, never calls into the TTS
+     * service.  "pending" until the worker thread fills it after init,
+     * "not_ready" if the engine never initialized.
+     */
+    public String getDefaultEngine() {
+        if (defaultEnginePackage != null) {
+            return defaultEnginePackage;
+        }
+        return (initStatus == TextToSpeech.SUCCESS) ? "pending" : "not_ready";
     }
 
     /**

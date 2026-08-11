@@ -198,6 +198,10 @@ local function collectPluginInfo(plugin)
             if engine._android_tts then
                 local ok_st, st = pcall(function() return engine._android_tts:getInitStatus() end)
                 info.android_tts_init = ok_st and tostring(st) or "error"
+                -- Which system TTS engine is active; the key datapoint for
+                -- slow-synthesis reports (issue #53).
+                local ok_eng, eng = pcall(function() return engine._android_tts:getDefaultEngine() end)
+                info.android_tts_engine = ok_eng and tostring(eng) or "error"
             end
         end
 

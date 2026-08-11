@@ -223,6 +223,8 @@ function AndroidTts:init()
             "getPipelineDurationMs", "()I")
         self._method.stopPipeline = env[0].GetMethodID(env, helper_class,
             "stopPipeline", "()V")
+        self._method.getDefaultEngine = env[0].GetMethodID(env, helper_class,
+            "getDefaultEngine", "()Ljava/lang/String;")
 
         if checkException(env) then
             logger.err("AndroidTts: Failed to resolve one or more method IDs")
@@ -573,6 +575,28 @@ function AndroidTts:stopPipeline()
     android.jni:context(android.app.activity.vm, function(jni)
         jni.env[0].CallVoidMethod(jni.env,
             self._helper_ref, self._method.stopPipeline)
+    end)
+end
+
+--[[--
+Package name of the active system TTS engine (e.g. "com.google.android.tts").
+Main-thread safe: the Java side returns a cached value.  "pending" until the
+worker thread fills it after init, "not_ready" if the engine is not up.
+@return string|nil  nil when the bridge is not initialized
+--]]
+function AndroidTts:getDefaultEngine()
+    if not self._initialized or not self._helper_ref then return nil end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local j_str = jni.env[0].CallObjectMethod(jni.env,
+            self._helper_ref, self._method.getDefaultEngine)
+        if checkException(jni.env) or j_str == nil then
+            logger.err("AndroidTts: getDefaultEngine threw exception")
+            return nil
+        end
+        local result = jni:to_string(j_str)
+        jni.env[0].DeleteLocalRef(jni.env, j_str)
+        return result
     end)
 end
 
