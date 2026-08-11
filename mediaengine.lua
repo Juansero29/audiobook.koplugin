@@ -203,8 +203,9 @@ function MediaEngine:_stopKindleA2dpKeepalive(only_if_reason)
     self._keepalive_reason = nil
     if not pid then return end
     os.execute("kill -9 " .. tostring(pid) .. " 2>/dev/null")
-    -- Also match the distinctive log path in case $! was a wrapper shell.
-    os.execute("pkill -9 -f 'abk-keepalive' 2>/dev/null")
+    -- Fallback in case $! was a wrapper shell: match the gst-launch argv.
+    -- (abk-keepalive only appears in the log redirection, never in cmdline.)
+    os.execute("pkill -9 -f 'filesrc location=/dev/zero' 2>/dev/null")
     logger.warn("MediaEngine: Kindle A2DP keepalive stopped PID=", pid)
 end
 

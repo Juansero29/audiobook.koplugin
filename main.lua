@@ -2725,17 +2725,11 @@ function Audiobook:stopReadAlong()
     pcall(function() self.tts_engine:forceKillAll() end)
 end
 
---- Ensure headset media buttons (AirPods stem) are listened for.
--- On Kindle, auto-enable the setting: BlueZ AVRCP is absent and the stem
--- only works if we advertise as an AVRCP target + scan for media input.
+--- Ensure headset media buttons are listened for.
+-- The setting defaults to on; an explicit user "off" is always honored,
+-- including on Kindle (AVRCP scan does not run without consent).
 function Audiobook:_ensureBtMediaControl()
     if not BtMediaControl then return end
-    if Device.isKindle and Device:isKindle() then
-        if not self:getSetting("bt_media_control", true) then
-            self:setSetting("bt_media_control", true)
-            logger.warn("Audiobook: enabled bt_media_control for Kindle headset buttons")
-        end
-    end
     if self:getSetting("bt_media_control", true) then
         BtMediaControl.start(self)
     end
