@@ -190,6 +190,17 @@ local function collectPluginInfo(plugin)
         info.audio_player_cached = engine._cached_player or "not set"
         info.no_real_audio_output = engine._no_real_audio_output and "yes" or "no"
 
+        -- Android bridge state: on Android every CLI probe fails by design,
+        -- so the bundled-binary fields alone make a working setup look
+        -- broken (issue #44).  Report the JNI bridge explicitly.
+        if Device:isAndroid() then
+            info.android_tts_bridge = engine._android_tts and "loaded" or "not loaded"
+            if engine._android_tts then
+                local ok_st, st = pcall(function() return engine._android_tts:getInitStatus() end)
+                info.android_tts_init = ok_st and tostring(st) or "error"
+            end
+        end
+
         -- PocketBook pre-flight snapshot from the most recent play() attempt
         -- (BT-adapter gate that prevents direct ALSA on PB632/PB700c).
         if engine._pb_pre_flight_state then

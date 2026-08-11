@@ -792,6 +792,18 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
     -- Build a list of available backends with friendly labels
     local available = {}
 
+    -- Android system TTS: the JNI bridge to the device's TextToSpeech
+    -- engine.  Listed explicitly; without it the menu showed "No TTS
+    -- engines found" on Android even though the bridge was working
+    -- (issue #44), because every other entry probes CLI binaries that
+    -- do not exist there.
+    if engine._android_tts then
+        table.insert(available, {
+            id = engine.BACKENDS.ANDROID,
+            label = _("Android (system TTS engine)"),
+        })
+    end
+
     -- espeak-ng: available if we detected it during init
     if engine.espeak_lib_path or Utils.commandExists("espeak-ng") or Utils.commandExists("espeak") then
         table.insert(available, {

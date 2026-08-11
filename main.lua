@@ -1031,7 +1031,11 @@ function Audiobook:addToMainMenu(menu_items)
                         }
                         table.insert(lines, T(_("TTS backend: %1"), backend_labels[backend_name] or backend_name))
                         -- Audio player
-                        local player = engine.audio_player_type or "none"
+                        -- findAudioPlayer() only runs at first playback, so
+                        -- before that the type is unset; on Android the JNI
+                        -- bridge alone tells us the player is MediaPlayer.
+                        local player = engine.audio_player_type
+                            or (engine._android_tts and "android" or "none")
                         table.insert(lines, T(_("Audio player: %1"), player))
                     end
                     -- Plugin directory

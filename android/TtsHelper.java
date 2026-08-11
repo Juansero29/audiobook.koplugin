@@ -1,8 +1,11 @@
 package org.koreader.plugin.audiobook;
 
 import android.content.Context;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -250,19 +253,51 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     // --- Audio focus ---
 
+    /** Speech attributes for playback and focus: route read-along audio the
+     *  same way the platform TTS speak() path is routed, not as music.
+     *  USAGE_MEDIA lands clips on the deep-buffer/offload music path, which
+     *  some HALs (MTK e-ink, Bigme HiBreak, issue #44) tear down ~130 ms
+     *  into a sentence-length clip without ever delivering completion.
+     *  The speak() path works on those devices, so mirror it. */
+    private static AudioAttributes speechAttributes() {
+        return new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build();
+    }
+
+    /** Kept as Object so the class still loads on API < 26 where
+     *  AudioFocusRequest does not exist. */
+    private Object audioFocusRequest = null;
+
     @SuppressWarnings("deprecation")
     private void requestAudioFocus() {
-        if (audioManager != null) {
-            audioManager.requestAudioFocus(null,
-                AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
-        }
+        if (audioManager == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(speechAttributes())
+                    .build();
+                audioFocusRequest = req;
+                audioManager.requestAudioFocus(req);
+            } else {
+                audioManager.requestAudioFocus(null,
+                    AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            }
+        } catch (Exception ignored) {}
     }
 
     @SuppressWarnings("deprecation")
     private void abandonAudioFocus() {
-        if (audioManager != null) {
-            audioManager.abandonAudioFocus(null);
-        }
+        if (audioManager == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 26 && audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest((AudioFocusRequest) audioFocusRequest);
+                audioFocusRequest = null;
+            } else {
+                audioManager.abandonAudioFocus(null);
+            }
+        } catch (Exception ignored) {}
     }
 
     // --- Synth-then-play pipeline ---
@@ -356,41 +391,56 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     private final Object mpLock = new Object();
     private MediaPlayer mediaPlayer;
     private volatile boolean playbackDone = false;
+    /** Set after start() succeeds, cleared on completion/error/stop.  Read
+     *  by isPlaying() on the JNI calling thread; keeps that path free of
+     *  locks and binder calls (issue #44). */
+    private volatile boolean playbackActive = false;
 
     /**
-     * Play a WAV file through the default audio output.
+     * Play a WAV file through the speech audio output.
      * If a pipeline is active, it is cancelled first (direct playFile
      * implies the caller is bypassing the pipeline).
-     * Returns the duration in ms, or -1 on error.
+     * Returns 0 when dispatched, or -1 if playback is impossible.
      *
      * NOTE: legacy direct API, not used by the synth-then-play pipeline.
-     * It runs startPlayback() on the caller's thread; prefer the pipeline
-     * for anything user-facing.
+     * startPlayback() runs on the worker thread so the caller (Lua main
+     * thread via JNI) never blocks in media-server binder calls (issue #44).
      */
-    public int playFile(String path) {
+    public int playFile(final String path) {
         if (pipelineActive) {
             pipelineActive = false;
             pipelineStatus = -1;
             pipelineDurationMs = 0;
             pendingPlayFile = null;
         }
-        return startPlayback(path);
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                startPlayback(path);
+            }
+        });
+        return 0;
     }
 
     /**
-     * Internal: start MediaPlayer on a file.  Runs on the worker thread
-     * except in the legacy playFile() path.
+     * Internal: start MediaPlayer on a file.  Runs on the worker thread.
      */
     private int startPlayback(String path) {
         stopPlaybackInternal();
         playbackDone = false;
+        playbackActive = false;
         requestAudioFocus();
         synchronized (mpLock) {
             try {
                 mediaPlayer = new MediaPlayer();
+                // Route as speech/assistance, not music: the deep-buffer
+                // music path kills sentence-length clips on some HALs
+                // (Bigme HiBreak, issue #44).
+                mediaPlayer.setAudioAttributes(speechAttributes());
                 mediaPlayer.setDataSource(path);
                 mediaPlayer.setOnCompletionListener(mp -> {
                     playbackDone = true;
+                    playbackActive = false;
                     if (pipelineActive) {
                         pipelineStatus = 2;
                         pipelineActive = false;
@@ -399,6 +449,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 });
                 mediaPlayer.setOnErrorListener((mp, what, extra) -> {
                     playbackDone = true;
+                    playbackActive = false;
                     if (pipelineActive) {
                         pipelineStatus = 3;
                         pipelineActive = false;
@@ -408,9 +459,11 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 });
                 mediaPlayer.prepare();
                 mediaPlayer.start();
+                playbackActive = true;
                 return mediaPlayer.getDuration();
             } catch (Exception e) {
                 playbackDone = true;
+                playbackActive = false;
                 if (pipelineActive) {
                     pipelineStatus = 3;
                     pipelineActive = false;
@@ -425,15 +478,15 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         }
     }
 
-    /** Check if audio is still playing. */
+    /**
+     * Check if audio is still playing.  Volatile flag only: never lock and
+     * never call MediaPlayer.isPlaying() here -- this runs on the Lua main
+     * thread via JNI, and both the lock (held by the worker across blocking
+     * media-server calls in startPlayback) and the binder call itself can
+     * freeze the whole app when the media server wedges (issue #44).
+     */
     public boolean isPlaying() {
-        synchronized (mpLock) {
-            try {
-                return mediaPlayer != null && mediaPlayer.isPlaying();
-            } catch (IllegalStateException e) {
-                return false;
-            }
-        }
+        return playbackActive;
     }
 
     /** Check if playback finished (completed or error). */
@@ -475,6 +528,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 mediaPlayer = null;
             }
             playbackDone = false;
+            playbackActive = false;
         }
         abandonAudioFocus();
     }
@@ -486,8 +540,9 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
             public void run() {
                 synchronized (mpLock) {
                     try {
-                        if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                        if (mediaPlayer != null && playbackActive) {
                             mediaPlayer.pause();
+                            playbackActive = false;
                         }
                     } catch (IllegalStateException ignored) {}
                 }
@@ -502,8 +557,9 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
             public void run() {
                 synchronized (mpLock) {
                     try {
-                        if (mediaPlayer != null && !mediaPlayer.isPlaying()) {
+                        if (mediaPlayer != null && !playbackActive) {
                             mediaPlayer.start();
+                            playbackActive = true;
                         }
                     } catch (IllegalStateException ignored) {}
                 }
