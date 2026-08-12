@@ -43,9 +43,12 @@ jobs:
           # Install minimal Android SDK components for dex compilation
           export ANDROID_HOME="$HOME/android-sdk"
           mkdir -p "$ANDROID_HOME"
-          # Download command-line tools
+          # Download command-line tools (retry on transient failures, then
+          # verify the archive before unzipping: dl.google.com occasionally
+          # serves a truncated body or an error page, and curl -s hides it)
           CMDLINE_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-          curl -sL -o /tmp/cmdline-tools.zip "$CMDLINE_URL"
+          curl -sL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/cmdline-tools.zip "$CMDLINE_URL"
+          unzip -tq /tmp/cmdline-tools.zip > /dev/null
           unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/"
           mv "$ANDROID_HOME/cmdline-tools" "$ANDROID_HOME/cmdline-tools-tmp"
           mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
