@@ -717,6 +717,25 @@ function Audiobook:addToMainMenu(menu_items)
                         help_text = _("By default, PocketBooks with a Bluetooth adapter only play through Bluetooth audio, because direct hardware access can damage the amplifier. This toggle lifts the Bluetooth requirement ONLY for daemon-routed devices (tts_sm, hwout_mix), which go through the PocketBook audio daemon like the system's own TTS and never touch the hardware directly. Direct-hardware choices (plughw:0) remain blocked without Bluetooth. Use at your own risk."),
                     },
                     {
+                        text_func = function()
+                            if self.tts_engine and self.tts_engine._android_pcm_auto then
+                                return _("Android: persistent audio stream (auto-enabled)")
+                            end
+                            return _("Android: persistent audio stream")
+                        end,
+                        checked_func = function()
+                            return self:getSetting("android_pcm_stream", false)
+                                or (self.tts_engine and self.tts_engine._android_pcm_auto) or false
+                        end,
+                        callback = function()
+                            self:toggleSetting("android_pcm_stream", false)
+                        end,
+                        enabled_func = function()
+                            return (Device.isAndroid and Device:isAndroid()) or false
+                        end,
+                        help_text = _("Workaround for Android devices where read-aloud audio cuts off mid-sentence and stalls (seen on some MTK e-readers). Plays synthesized audio through one persistent, continuously-fed audio track instead of a fresh media player per sentence, the same way the system's own TTS plays. Off by default; the plugin also switches to it automatically for the rest of the session when it detects a stalled clip. Takes effect from the next sentence."),
+                    },
+                    {
                         text = _("Keep playing when lid is closed"),
                         checked_func = function()
                             return self:getSetting("keep_playing_on_lid_close", false)

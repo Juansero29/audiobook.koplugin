@@ -205,6 +205,10 @@ local function collectPluginInfo(plugin)
                 local ok_eng, eng = pcall(function() return engine._android_tts:getDefaultEngine() end)
                 info.android_tts_engine = ok_eng and tostring(eng) or "error"
             end
+            -- PCM streamer state (issue #44): the persisted toggle plus the
+            -- session-only auto-degrade flag that flips after a stalled clip.
+            info.android_pcm_stream = tostring(plugin:getSetting("android_pcm_stream", false))
+            info.android_pcm_auto = tostring(engine._android_pcm_auto or false)
         end
 
         -- PocketBook pre-flight snapshot from the most recent play() attempt

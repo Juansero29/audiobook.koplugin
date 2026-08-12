@@ -266,6 +266,8 @@ function AndroidTts:init()
             "stopPipeline", "()V")
         self._method.getDefaultEngine = getMethod(env, helper_class,
             "getDefaultEngine", "()Ljava/lang/String;")
+        self._method.setPcmMode = env[0].GetMethodID(env, helper_class,
+            "setPcmMode", "(Z)V")
 
         if not self._method.getInitStatus
             or not self._method.playFile
@@ -693,6 +695,26 @@ function AndroidTts:getDefaultEngine()
         local result = jni:to_string(j_str)
         jni.env[0].DeleteLocalRef(jni.env, j_str)
         return result
+    end)
+end
+
+--[[--
+Switch pipeline playback between per-sentence MediaPlayer (default) and the
+persistent PCM streamer: one app-owned AudioTrack, continuously fed with
+sentence PCM or silence by a dedicated writer thread.  Workaround for HALs
+that tear down short MediaPlayer clips mid-sentence with no completion
+(issue #44, Bigme HiBreak/MTK).  Session-only; not persisted Java-side.
+@param enabled boolean
+--]]
+function AndroidTts:setPcmMode(enabled)
+    if not self._initialized or not self._helper_ref then return end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local args = ffi.new("jvalue[1]")
+        args[0].z = enabled and 1 or 0
+        env[0].CallVoidMethodA(env,
+            self._helper_ref, self._method.setPcmMode, args)
     end)
 end
 

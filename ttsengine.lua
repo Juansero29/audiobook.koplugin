@@ -1369,6 +1369,18 @@ function TTSEngine:_androidChunkLanguage(text)
     return book or "en-US"
 end
 
+--[[--
+Whether Android playback uses the persistent PCM streamer: the menu
+setting (persisted, default off) or the session-only stall auto-degrade
+(issue #44).  Applied at every pipeline dispatch so mid-session toggles
+and the auto-degrade both take effect from the next sentence.
+@return boolean
+--]]
+function TTSEngine:_androidPcmActive()
+    if self._android_pcm_auto then return true end
+    return self.plugin and self.plugin:getSetting("android_pcm_stream", false) or false
+end
+
 function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     local atts = self._android_tts
     if not atts then
@@ -1382,6 +1394,9 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     -- around 1.0.  Map 0-99 to 0.5-2.0 range.
     local android_pitch = 0.5 + ((self.pitch or 50) / 99) * 1.5
     atts:setPitch(android_pitch)
+    -- Playback path: per-sentence MediaPlayer by default, persistent PCM
+    -- stream when the user enabled it or a stall was auto-detected (#44).
+    atts:setPcmMode(self:_androidPcmActive())
     -- Language: the Java helper initializes with Locale.US and nothing ever
     -- changed it, so non-English books were read with the en-US voice or
     -- stayed silent (issue #45).  Resolve per chunk (manual override > CJK
@@ -2991,6 +3006,8 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         -- Poll for pipeline completion
         local engine = self
         local poll_count = 0
+        local played_ms = 0  -- accumulated on unpaused polls only
+        local pcm_active = engine:_androidPcmActive()
         local max_polls = math.max(300, math.floor(dur_ms * 3 / 100))
         local function pollPipelineDone()
             if (engine.play_generation or 0) ~= my_gen then return end
@@ -3000,7 +3017,23 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 return
             end
             poll_count = poll_count + 1
+            played_ms = played_ms + 100  -- 0.1 s poll cadence
             local status = atts:getPipelineStatus()
+            if status == 1 and played_ms > dur_ms + 1500 and not pcm_active then
+                -- Stall signature from issue #44: the clip should have
+                -- finished long ago but no completion ever arrives (the
+                -- HAL tore down the MediaPlayer track mid-sentence).
+                -- Switch to the persistent PCM stream for the rest of the
+                -- session.  The interrupted sentence is completed (its
+                -- tail died with the track); the next one plays via PCM.
+                logger.warn("TTSEngine: Android playback stalled", played_ms,
+                    "ms into a", dur_ms, "ms clip with no completion; switching to PCM stream playback for this session (issue #44)")
+                engine._android_pcm_auto = true
+                atts:setPcmMode(true)
+                atts:stopPipeline()
+                engine:onPlaybackComplete()
+                return
+            end
             if status == 2 then
                 logger.dbg("TTSEngine: Android pipeline complete")
                 engine:onPlaybackComplete()
