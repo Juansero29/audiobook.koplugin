@@ -1332,8 +1332,10 @@ function MediaEngine:_playAndroid(gen)
     end
 
     self._android_playback_confirmed = false
-    -- Small BT/output chain lag; sync loop subtracts this from position.
-    self.position_latency_s = 0.15
+    -- Output / BT chain lag subtracted by MediaSync highlight loop.
+    -- Wall-clock is locked once at audible start; this small latency keeps
+    -- highlights from leading the spoken audio on Boox.
+    self.position_latency_s = 0.25
 
     logger.warn("MediaEngine: Android play", self.current_path,
         "offset=", offset, "duration=", self.current_duration)
