@@ -201,21 +201,28 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
         return false
     end
 
-    -- 3. Fast cross-document probe: crengine can often resolve a plain id to
-    -- a global page number even when the fragment is not in the currently
-    -- loaded content document.  If it returns a valid page, load it and verify
-    -- the fragment is reachable before scrolling.
+    -- 3. Spine DocFragment jump (reliable for Storyteller EPUBs): use the EPUB
+    -- spine order to know which DocFragment contains the target document.
+    if self:_gotoViaSpineDocFragment(text_doc, fragment_id, start_page) then
+        cache_current_xpointer()
+        if fragment_in_document() then scroll_to_fragment() end
+        UIManager:setDirty("all", "ui")
+        return true
+    end
+
+    -- 4. getPageFromXPointer probe (skip page 1 — bogus on Kindle).
     local ok_fp, page_fp = pcall(function()
         return ui.document:getPageFromXPointer(xp)
     end)
-    if ok_fp and page_fp and page_fp > 0 and page_fp ~= start_page then
+    if ok_fp and page_fp and page_fp > 1 and page_fp ~= start_page then
         logger.warn("MediaSync: getPageFromXPointer page", page_fp, "for", xp)
         if try_page(page_fp) then
             return true
         end
+        pcall(function() ui.document:gotoPage(start_page, false) end)
     end
 
-    -- 4. TOC fallback: match the content document's chapter title against the
+    -- 5. TOC fallback: match the content document's chapter title against the
     -- EPUB table of contents, derive the DocFragment index from the TOC
     -- xpointer, and jump to the fragment with a full internal xpointer.
     if allow_scan then
@@ -227,19 +234,7 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
         end
     end
 
-    -- 4b. Spine DocFragment fallback: use the EPUB spine order to know which
-    -- DocFragment contains the target content document, then build a full
-    -- xpointer to the fragment.
-    if allow_scan then
-        if self:_gotoViaSpineDocFragment(text_doc, fragment_id, start_page) then
-            cache_current_xpointer()
-            if fragment_in_document() then scroll_to_fragment() end
-            UIManager:setDirty("all", "ui")
-            return true
-        end
-    end
-
-    -- 5. Text-search fallback: search the whole rendered book for the sentence
+    -- 6. Text-search fallback: search the whole rendered book for the sentence
     -- text.  crengine cannot resolve a plain fragment id to a global page on
     -- this device, but findText returns full internal xpointers that usually
     -- can be followed.  We accept an occurrence whose DocFragment index matches
@@ -305,12 +300,12 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
                         logger.warn("MediaSync: text-search onGotoXPointer",
                             "ok=", tostring(ok_goto),
                             "page_before=", before_page, "page_after=", after_page)
-                        if ok_goto and after_page and after_page ~= before_page then
-                            cache_current_xpointer()
-                            if fragment_in_document() then scroll_to_fragment() end
-                            UIManager:setDirty("all", "ui")
-                            return true
-                        end
+                        if ok_goto and after_page then
+                cache_current_xpointer()
+                if fragment_in_document() then scroll_to_fragment() end
+                UIManager:setDirty("all", "ui")
+                return true
+            end
                     end
                 end
             end
@@ -459,8 +454,13 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
             logger.warn("MediaSync: onGotoXPointer full xp",
                 "ok=", tostring(ok_goto),
                 "page_before=", before_page, "page_after=", after_page)
-            if ok_goto and after_page and after_page ~= before_page then
-                return true, norm
+            if ok_goto and after_page then
+                if fragment_in_document() then
+                    return true, norm
+                end
+                if after_page ~= before_page then
+                    return true, norm
+                end
             end
         end
     end
@@ -593,6 +593,8 @@ end
 function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position)
     if self.state == self.STATE.PLAYING or self.state == self.STATE.PAUSED then
         -- Soft stop: keep A2DP keepalive + player UI across playlist file changes.
+        -- A hard stop was killing track-advance keepalive and hiding the bar,
+        -- which left AirPods silent and the play button dead (STOPPED).
         self:stop(true, { track_transition = true })
     end
 
@@ -643,8 +645,12 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
             end
         end
     end
-    self._current_sentence_idx = 1
-    self._current_word_idx = 1
+    -- 0 so the first sync tick (sentence 1) enters the highlight / page-follow
+    -- path.  Previously this was 1, which skipped the opening sentence.
+    self._current_sentence_idx = 0
+    self._current_word_idx = 0
+    self._last_hl_idx = nil
+    self._last_page_advance_idx = nil
     self._chain_generation = self._chain_generation + 1
     self._last_progress_pct = -1
     self._last_ui_update_time = nil
@@ -764,6 +770,9 @@ function MediaSync:stop(keep_chapter_menu, opts)
         if self.playback_bar then
             pcall(function() self.playback_bar:hide() end)
         end
+        if self.plugin and self.plugin._hideReturnToReadAloudButton then
+            pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+        end
         -- Restore page margins only on hard stop (keep reservation across tracks).
         self:_releaseMiniBarSpace()
     end
@@ -800,9 +809,12 @@ end
 --[[--
 Reserve the mini player's height in the document bottom margin so book text
 reflows above it (same approach as SyncController:_reserveBarSpace for TTS).
+Never leave the mini bar covering readable text — including when the user
+keeps KOReader's status / progress bars visible under the mini player.
 --]]
 function MediaSync:_reserveMiniBarSpace()
     if self._bar_space_reserved then return end
+    -- Full-screen (non-overlay) player intentionally covers the book.
     if not self.overlay_mode then return end
     if not (self.plugin and self.plugin.ui and self.plugin.ui.rolling) then return end
     local ui = self.plugin.ui
@@ -816,6 +828,9 @@ function MediaSync:_reserveMiniBarSpace()
         bar_h = Screen:scaleBySize(44)
     end
     local m = tp.unscaled_margins
+    -- Bottom inset from screen edge so CRE text ends above the mini player.
+    -- With "Keep status bars": also clear the footer/progress stack under the mini bar.
+    -- Without it: mini bar sits on the bottom edge (may cover the footer); text clears the bar only.
     local bottom = Screen:scaleBySize(m[4]) + bar_h
     local keep_bars = self.plugin and self.plugin.getSetting
         and self.plugin:getSetting("keep_reader_status_bars", false)
@@ -856,6 +871,13 @@ function MediaSync:pause(auto)
         pcall(function() self.playback_bar:setPlaying(false) end)
     end
     logger.dbg("MediaSync: paused", auto and "(auto)" or "")
+end
+
+function MediaSync:clearSentenceHighlight()
+    if self.highlight_manager then
+        pcall(function() self.highlight_manager:clearHighlights() end)
+        self.highlight_manager._line_cache = nil
+    end
 end
 
 function MediaSync:resume(auto)
@@ -977,7 +999,79 @@ function MediaSync:prevSentence()
     self:seekToTime(self.timing_data[idx].start_time)
 end
 
+--- Resolve the current Storyteller SMIL content-document chapter (not ~4 min audio part).
+-- Chapters are keyed by (audio_path, start_time within that file). Across playlist
+-- advances we must compare playlist order, not only the current file's local clock.
+function MediaSync:_resolveOverlayChapter()
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or #chapters == 0 then return nil, nil end
+    local current_time = self.media_engine and self.media_engine:getPosition() or 0
+    local current_path = self.media_engine and self.media_engine.current_path
+    local path_order = {}
+    if self.playlist_files then
+        for i, f in ipairs(self.playlist_files) do
+            if f.path then path_order[f.path] = i end
+        end
+    end
+    local cur_order = (current_path and path_order[current_path])
+        or self.current_playlist_idx
+        or 1
+    local current_idx = 1
+    for i, ch in ipairs(chapters) do
+        local ch_order = (ch.audio_path and path_order[ch.audio_path]) or 0
+        local st = ch.start_time or 0
+        if ch_order < cur_order
+            or (ch.audio_path == current_path and st <= current_time + 1) then
+            current_idx = i
+        end
+    end
+    return chapters[current_idx], current_idx
+end
+
+--- Index of the current Storyteller SMIL content-document chapter (not audio part).
+function MediaSync:_currentOverlayChapterIndex()
+    local ch, idx = self:_resolveOverlayChapter()
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not ch then return nil, chapters end
+    return idx, chapters
+end
+
+--- Push the live chapter title into the player (full + mini bar).
+function MediaSync:_refreshPlaybackBarTitles()
+    if not self.playback_bar then return end
+    local ch = self:getCurrentChapter()
+    local label = ch and ch.title or nil
+    if (not label or label == "") and self.playlist_files and self.current_playlist_idx then
+        local f = self.playlist_files[self.current_playlist_idx]
+        label = f and f.name or nil
+    end
+    if not label or label == "" then return end
+    pcall(function()
+        -- Force mini refresh even when the chapter label is unchanged (e.g. first
+        -- paint used the book title before chapter_title was applied).
+        local bar = self.playback_bar
+        if bar.chapter_title == label and bar._mini_title then
+            bar:_updateMiniWidgets()
+        end
+        bar:updateChapterTitle(label)
+        if ch and bar.setCurrentChapter then
+            bar:setCurrentChapter(ch)
+        end
+        if not self.overlay_mode and bar.updateOutputName then
+            bar:updateOutputName(label)
+        end
+    end)
+end
+
 function MediaSync:nextChapter()
+    -- Storyteller read-along: ⏭ means next SMIL chapter, not next ~4 min audio part.
+    if self.overlay_mode then
+        local idx, chapters = self:_currentOverlayChapterIndex()
+        if chapters and idx and idx < #chapters then
+            self:seekToOverlayChapter(idx + 1)
+        end
+        return
+    end
     if self.playlist_files and #self.playlist_files > 0 then
         local idx = (self.current_playlist_idx or 1) + 1
         if idx <= #self.playlist_files then
@@ -996,6 +1090,13 @@ function MediaSync:nextChapter()
 end
 
 function MediaSync:prevChapter()
+    if self.overlay_mode then
+        local idx, chapters = self:_currentOverlayChapterIndex()
+        if chapters and idx and idx > 1 then
+            self:seekToOverlayChapter(idx - 1)
+        end
+        return
+    end
     if self.playlist_files and #self.playlist_files > 0 then
         local idx = (self.current_playlist_idx or 1) - 1
         if idx >= 1 then
@@ -1014,6 +1115,7 @@ function MediaSync:prevChapter()
 end
 
 --- Keepalive (+ optional BT Disconnect/Connect) before switching audio files.
+--- @param then_fn function  called after the bridge (or immediately off-Kindle)
 function MediaSync:_bridgeKindleA2dpForTrackChange(then_fn)
     local me = self.media_engine
     local cycle_bt = false
@@ -1036,6 +1138,7 @@ function MediaSync:switchToPlaylistFile(index)
     if not self.playlist_files or not self.playlist_files[index] then return end
     self.current_playlist_idx = index
     local file_path = self.playlist_files[index].path
+    -- Manual ⏭/⏮ and playlist picks: same BT reconnect as natural EOS advance.
     self:_bridgeKindleA2dpForTrackChange(function()
         if self.plugin and self.plugin._playAudioFile then
             self.plugin:_playAudioFile(file_path, self.playlist_files)
@@ -1181,17 +1284,15 @@ function MediaSync:_updateHighlightAtTime(pos)
         -- The SMIL fragment id resolves as a "#id" xpointer in crengine;
         -- turn the page before highlighting so the text-matching
         -- highlighter can find the sentence on the visible page.
-        -- This auto-follow is gated by the same setting as manual
-        -- page-turn seeking so users who disable page-follow stay in
-        -- control of the page.
+        -- Auto page-follow while the user stays with the narration.
+        -- Manual browsing away (_readaloud_browsing_away) must not yank the
+        -- page back or restart audio — only pause highlighting.
         local follow_page_turns = true
         if self.plugin and self.plugin.getSetting then
             follow_page_turns = self.plugin:getSetting("media_follow_page_turn", true)
         end
-        -- After a manual page turn the plugin seeks/restarts playback at the
-        -- new page. Suppress MediaSync's own auto-follow briefly so that seek
-        -- does not immediately trigger another page turn.
-        local suppress_auto_follow = false
+        local browsing_away = self.plugin and self.plugin._readaloud_browsing_away
+        local suppress_auto_follow = browsing_away and true or false
         if self.plugin and self.plugin._suppress_media_sync_auto_page_follow and time then
             if time.now() < self.plugin._suppress_media_sync_auto_page_follow then
                 suppress_auto_follow = true
@@ -1199,28 +1300,14 @@ function MediaSync:_updateHighlightAtTime(pos)
                 self.plugin._suppress_media_sync_auto_page_follow = nil
             end
         end
-        if sentence.fragment_id and follow_page_turns and not suppress_auto_follow then
-            local ui = self.plugin and self.plugin.ui
-            if ui and ui.rolling and ui.document then
-                pcall(function()
-                    self:_markPageFollowAuto()
-                    local ms = self
-                    local ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, false, sentence.text)
-                    if not ok then
-                        logger.dbg("MediaSync: page-follow failed for", sentence.fragment_id)
-                    end
-                    UIManager:scheduleIn(2.5, function()
-                        ms:_clearPageFollowAuto()
-                    end)
-                end)
-            end
-        end
-        if self.highlight_manager and sentence.text then
+        if self.highlight_manager and (sentence.text or sentence.fragment_id) then
             -- Build a synthetic sentence object for HighlightManager
             local sent_obj = {
-                text = sentence.text,
+                text = sentence.text or "",
                 start_pos = sentence.start_pos or 0,
-                end_pos = sentence.end_pos or #sentence.text,
+                end_pos = sentence.end_pos or #(sentence.text or ""),
+                fragment_id = sentence.fragment_id,
+                text_doc = sentence.text_doc,
             }
             local hl_ok = false
             pcall(function()
@@ -1229,37 +1316,84 @@ function MediaSync:_updateHighlightAtTime(pos)
             if hl_ok and sentence.fragment_id then
                 self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
             end
-            -- Read-along page advancement: narration flows forward, so when
-            -- the next sequential sentence is not on the visible page it is
-            -- on the following one -- turn and retry once.  Only for
-            -- sequential advancement (not seeks), so a failed text match
-            -- can never page away from where the user is reading.
-            if not hl_ok and self.overlay_mode
-                and sent_idx == (self._last_hl_idx or 0) + 1
+            -- Narration caught up to the page the user was browsing.
+            if hl_ok and browsing_away and self.plugin then
+                self.plugin._readaloud_browsing_away = false
+                browsing_away = false
+                if self.plugin._hideReturnToReadAloudButton then
+                    pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+                end
+            elseif browsing_away and not hl_ok then
+                -- Stay off-page: drop the failed highlight attempt immediately.
+                pcall(function() self.highlight_manager:clearHighlights() end)
+            end
+
+            -- If the sentence is not on the visible page, JUMP to its fragment
+            -- (spine/TOC/findText).  Never crawl with GotoViewRel on every
+            -- sentence — that freezes Kindle touch input for minutes.
+            -- Skip while the user has manually browsed away.
+            local jump_pending = false
+            if not hl_ok and self.overlay_mode and sentence.fragment_id
                 and follow_page_turns and not suppress_auto_follow then
                 local ui = self.plugin and self.plugin.ui
-                if ui then
+                if ui and ui.rolling and ui.document then
+                    jump_pending = true
                     pcall(function()
                         self:_markPageFollowAuto()
                         local ms = self
-                        ui:handleEvent(Event:new("GotoViewRel", 1))
-                        self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
-                        if sentence.fragment_id then
-                            self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+                        local target_idx = sent_idx
+                        -- allow_scan=true: direct DocFragment jump, not +1 page.
+                        local jumped = self:_gotoSmilFragment(
+                            sentence.text_doc, sentence.fragment_id, true, sentence.text)
+                        if not jumped then
+                            -- Last resort: a single relative page turn, and only
+                            -- when advancing exactly one sentence (not a seek).
+                            if sent_idx == (self._last_hl_idx or 0) + 1
+                                and self._last_page_advance_idx ~= sent_idx then
+                                self._last_page_advance_idx = sent_idx
+                                ui:handleEvent(Event:new("GotoViewRel", 1))
+                            end
                         end
-                        UIManager:scheduleIn(2.5, function()
-                            ms:_clearPageFollowAuto()
+                        if ms.highlight_manager then
+                            ms.highlight_manager._line_cache = nil
+                        end
+                        UIManager:scheduleIn(0.35, function()
+                            if ms.state ~= ms.STATE.PLAYING then
+                                ms:_clearPageFollowAuto()
+                                return
+                            end
+                            if ms._current_sentence_idx ~= target_idx then
+                                ms:_clearPageFollowAuto()
+                                return
+                            end
+                            local retry_ok = false
+                            pcall(function()
+                                retry_ok = ms.highlight_manager:highlightSentence(
+                                    sent_obj, {sentences = {sent_obj}})
+                            end)
+                            if retry_ok then
+                                ms._last_hl_idx = target_idx
+                                ms:_cacheResolvedXPointer(
+                                    sentence.text_doc, sentence.fragment_id)
+                            else
+                                pcall(function()
+                                    ms.highlight_manager:clearHighlights()
+                                end)
+                            end
+                            UIManager:scheduleIn(2.0, function()
+                                ms:_clearPageFollowAuto()
+                            end)
                         end)
                     end)
                 end
             end
-            -- If the sentence is genuinely not on the visible page and we
-            -- didn't auto-advance, clear the stale highlight so it isn't
-            -- mirrored at the wrong x,y on the current page.
-            if not hl_ok then
+
+            if not hl_ok and not jump_pending then
                 pcall(function() self.highlight_manager:clearHighlights() end)
             end
-            self._last_hl_idx = sent_idx
+            if hl_ok or not jump_pending then
+                self._last_hl_idx = sent_idx
+            end
         end
     end
 
@@ -1286,6 +1420,7 @@ end
 
 function MediaSync:_findSentenceAtTime(pos)
     local data = self.timing_data
+    if not data or #data == 0 then return nil end
     local lo, hi = 1, #data
     while lo <= hi do
         local mid = math.floor((lo + hi) / 2)
@@ -1305,6 +1440,14 @@ function MediaSync:_findSentenceAtTime(pos)
     -- If before the beginning, return first
     if pos < data[1].start_time then
         return 1
+    end
+    -- Gap between clips (Storyteller sometimes leaves tiny holes): keep the
+    -- last sentence that has already started so the highlight does not blink off.
+    if hi >= 1 and hi <= #data and data[hi].start_time <= pos then
+        return hi
+    end
+    if lo >= 1 and lo <= #data and data[lo].start_time <= pos then
+        return lo
     end
     return nil
 end
@@ -1404,13 +1547,10 @@ function MediaSync:_startPositionPoller(gen)
             pcall(function()
                 self.playback_bar:updateTimeDisplay(pos or 0, dur or 0)
             end)
-            -- Update chapter title and current chapter info
+            -- Update chapter title (overlay: SMIL chapter across audio parts)
             local ok_ch, ch, ch_idx = pcall(function() return self:getCurrentChapter() end)
-            if ok_ch and ch then
-                pcall(function()
-                    self.playback_bar:updateChapterTitle(ch.title or "")
-                    self.playback_bar:setCurrentChapter(ch)
-                end)
+            if ok_ch then
+                pcall(function() self:_refreshPlaybackBarTitles() end)
                 -- Update chapter menu highlight if it's open (chapter mode only;
                 -- playlist mode uses playlist index, not chapter index)
                 if self._chapter_menu and ch_idx and not self.playlist_files then
@@ -1446,6 +1586,8 @@ function MediaSync:_onPlaybackComplete(gen)
     if self.playlist_files and #self.playlist_files > 0 then
         local next_idx = (self.current_playlist_idx or 1) + 1
         local function advance(idx)
+            -- Freeze sync loops for the BT-cycle window (~5–10 s) so we do not
+            -- re-enter complete → double-advance.
             self._track_advance_pending = true
             self._chain_generation = self._chain_generation + 1
             if self._sync_timer then
@@ -1456,8 +1598,9 @@ function MediaSync:_onPlaybackComplete(gen)
                 UIManager:unschedule(self._position_timer)
                 self._position_timer = nil
             end
+            -- Natural EOS: keepalive + forced BT reconnect, then next file.
             logger.warn("MediaSync: auto-advancing to playlist track", idx,
-                "(A2DP bridge; BT cycle if setting enabled)")
+                "(A2DP bridge + BT cycle)")
             self:switchToPlaylistFile(idx)
         end
         if next_idx <= #self.playlist_files then
@@ -1495,23 +1638,50 @@ end
 
 function MediaSync:showPlaybackBar()
     if self.playback_bar and self.playback_bar:isVisible() then
+        -- Track transitions soft-stop and reuse the same player UI — refresh
+        -- the chapter label so we don't keep the first playlist entry forever.
+        self:_refreshPlaybackBarTitles()
         self:_reserveMiniBarSpace()
         return
     end
     -- For standalone audio (scrubber mode), use full-screen AudiobookPlayer overlay
     local AudiobookPlayer = dofile(PLUGIN_PATH .. "audiobookplayer.lua")
-    local title = self.timing_data and self.timing_data[1] and self.timing_data[1].text or _("Audiobook")
-    -- Derive output name: use original playlist filename when available
+    -- Top-bar title = book name (NOT the first SMIL sentence text — that looked
+    -- like random words next to the BT button).
+    local title = _("Audiobook")
+    local ui = self.plugin and self.plugin.ui
+    if ui and ui.document then
+        local ok_props, props = pcall(function() return ui.document:getProps() end)
+        if ok_props and props and props.title and props.title ~= "" then
+            title = props.title
+        end
+    end
+    if title == _("Audiobook") and self.plugin and self.plugin._smil_doc_path then
+        title = self.plugin._smil_doc_path:match("([^/]+)%.[^./]+$")
+            or self.plugin._smil_doc_path:match("([^/]+)$")
+            or title
+    end
+    -- Derive output name: book title in overlay mode (chapter goes in
+    -- chapter_title / mini bar). Standalone playlists keep the track name.
     local output_name = ""
-    if self.playlist_files and self.current_playlist_idx then
+    if self.overlay_mode then
+        output_name = title
+    elseif self.playlist_files and self.current_playlist_idx then
         output_name = self.playlist_files[self.current_playlist_idx].name
     elseif self.media_engine and self.media_engine.current_path then
         output_name = self.media_engine.current_path:match("([^/]+)$") or ""
     end
 
+    local initial_chapter = ""
+    if self.overlay_mode then
+        local ch = self:getCurrentChapter()
+        if ch and ch.title then initial_chapter = ch.title end
+    end
+
     local player = AudiobookPlayer:new{
         plugin = self.plugin,
         title = title,
+        chapter_title = initial_chapter,
         output_name = output_name,
         cover_image_path = self.cover_path,
         -- Read-along (EPUB overlay) mode: start minimized so the book page
@@ -1536,6 +1706,26 @@ function MediaSync:showPlaybackBar()
                 self:pause()
             elseif self.state == self.STATE.PAUSED then
                 self:resume()
+            elseif self.media_engine and self.media_engine.current_path then
+                -- After a hard stop / botched track advance the bar can stay
+                -- visible while state is STOPPED — play must restart audio.
+                logger.warn("MediaSync: play from STOPPED — restarting current file")
+                local gen = self._chain_generation + 1
+                self._chain_generation = gen
+                self.state = self.STATE.PLAYING
+                local ok = self.media_engine:play(
+                    function() self:_onPlaybackComplete(gen) end,
+                    function(err) self:_onPlaybackFail(gen, err) end
+                )
+                if ok then
+                    self:_startSyncLoop(gen)
+                    self:_startPositionPoller(gen)
+                    if self.playback_bar and self.playback_bar.setPlaying then
+                        pcall(function() self.playback_bar:setPlaying(true) end)
+                    end
+                else
+                    self.state = self.STATE.STOPPED
+                end
             end
         end,
         on_skip_back = function()
@@ -1596,9 +1786,16 @@ function MediaSync:showPlaybackBar()
             end
         end,
         on_refocus = self.overlay_mode and function()
+            if self.plugin then
+                self.plugin._readaloud_browsing_away = false
+            end
             self:refocusToCurrentSentence()
+            if self.plugin and self.plugin._hideReturnToReadAloudButton then
+                pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+            end
         end or nil,
-        -- BT reconnect lives in plugin settings (Reconnect BT on track change).
+        -- BT reconnect lives in plugin settings (Reconnect BT on track change)
+        -- and the Bluetooth menu — no overlay "BT" button.
         show_fix_audio = false,
         keep_reader_status_bars = self.plugin
             and self.plugin.getSetting
@@ -1613,53 +1810,87 @@ function MediaSync:showPlaybackBar()
         end)
     end
     self.playback_bar = player
+    self:_refreshPlaybackBarTitles()
     self:_reserveMiniBarSpace()
 end
 
-function MediaSync:navigateToSentenceAtTime(seconds)
-    if not self.overlay_mode then return end
-    if not self.timing_data then return end
+function MediaSync:navigateToSentenceEntry(entry)
+    -- Jump to a specific SMIL timing entry by fragment id (preferred for
+    -- "Play aligned from here", where looking up by start_time can hit the
+    -- wrong sentence when several share similar clip times).
+    if not self.overlay_mode or not self.timing_data or not entry then return false end
     local ui = self.plugin and self.plugin.ui
-    if not ui or not ui.rolling or not ui.document then return end
+    if not ui or not ui.rolling or not ui.document then return false end
 
-    local sent_idx = self:_findSentenceAtTime(seconds)
-    if not sent_idx then
-        logger.warn("MediaSync: navigateToSentenceAtTime found no sentence at", seconds)
-        return
+    local sent_idx = nil
+    if entry.fragment_id then
+        for i, e in ipairs(self.timing_data) do
+            if e.fragment_id == entry.fragment_id
+                and (not entry.text_doc or e.text_doc == entry.text_doc) then
+                sent_idx = i
+                break
+            end
+        end
     end
-    local sentence = self.timing_data[sent_idx]
+    if not sent_idx and entry.start_time then
+        sent_idx = self:_findSentenceAtTime(entry.start_time)
+    end
+    local sentence = sent_idx and self.timing_data[sent_idx]
     if not sentence or not sentence.fragment_id then
-        logger.warn("MediaSync: navigateToSentenceAtTime no fragment for sentence", sent_idx)
-        return
+        logger.warn("MediaSync: navigateToSentenceEntry: no matching sentence")
+        return false
     end
+
     self._current_sentence_idx = sent_idx
-    logger.warn("MediaSync: navigating to sentence", sent_idx, sentence.text_doc, sentence.fragment_id)
+    self._last_hl_idx = sent_idx
+    logger.warn("MediaSync: navigating to entry", sent_idx, sentence.text_doc, sentence.fragment_id)
+
+    if self.plugin and time then
+        self.plugin._suppress_media_sync_auto_page_follow = time.now() + time.s(3.0)
+    end
 
     self:_markPageFollowAuto()
     local ms = self
     local nav_ok = self:_gotoSmilFragment(sentence.text_doc, sentence.fragment_id, true, sentence.text)
     if not nav_ok then
-        logger.warn("MediaSync: navigateToSentenceAtTime failed for", sentence.text_doc, sentence.fragment_id)
+        logger.warn("MediaSync: navigateToSentenceEntry failed for", sentence.fragment_id)
         self:_clearPageFollowAuto()
-        return
+        return false
     end
     UIManager:scheduleIn(2.5, function()
         ms:_clearPageFollowAuto()
     end)
 
-    -- Re-highlight the sentence after the page settles.
-    if self.highlight_manager and sentence.text then
+    if self.highlight_manager and (sentence.text or sentence.fragment_id) then
         local sent_obj = {
-            text = sentence.text,
+            text = sentence.text or "",
             start_pos = sentence.start_pos or 0,
-            end_pos = sentence.end_pos or #sentence.text,
+            end_pos = sentence.end_pos or #(sentence.text or ""),
+            fragment_id = sentence.fragment_id,
+            text_doc = sentence.text_doc,
         }
+        self.highlight_manager._line_cache = nil
         UIManager:scheduleIn(0.3, function()
             pcall(function()
-                self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                local ok = ms.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+                if ok then
+                    ms:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+                end
             end)
         end)
     end
+    return true
+end
+
+function MediaSync:navigateToSentenceAtTime(seconds)
+    if not self.overlay_mode then return end
+    if not self.timing_data then return end
+    local sent_idx = self:_findSentenceAtTime(seconds)
+    if not sent_idx then
+        logger.warn("MediaSync: navigateToSentenceAtTime found no sentence at", seconds)
+        return
+    end
+    self:navigateToSentenceEntry(self.timing_data[sent_idx])
 end
 
 function MediaSync:refocusToCurrentSentence()
@@ -1708,11 +1939,13 @@ function MediaSync:refocusToCurrentSentence()
     end)
 
     -- Re-highlight the current sentence after the page settles.
-    if self.highlight_manager and sentence.text then
+    if self.highlight_manager and (sentence.text or sentence.fragment_id) then
         local sent_obj = {
-            text = sentence.text,
+            text = sentence.text or "",
             start_pos = sentence.start_pos or 0,
-            end_pos = sentence.end_pos or #sentence.text,
+            end_pos = sentence.end_pos or #(sentence.text or ""),
+            fragment_id = sentence.fragment_id,
+            text_doc = sentence.text_doc,
         }
         UIManager:scheduleIn(0.3, function()
             pcall(function()
@@ -1822,6 +2055,11 @@ function MediaSync:_showModalMenu(opts)
 end
 
 function MediaSync:showChapterList()
+    if self.overlay_mode and self.plugin and self.plugin._smil_overlay_chapters
+        and #self.plugin._smil_overlay_chapters > 0 then
+        self:showOverlayChapterList()
+        return
+    end
     if self.playlist_files and #self.playlist_files > 0 then
         self:showPlaylist()
         return
@@ -1847,6 +2085,64 @@ function MediaSync:showChapterList()
         })
     end
     self:_showModalMenu{ title = _("Chapters"), items = items, current = current_idx }
+end
+
+--- Storyteller read-along: list every SMIL content-document chapter, not just
+--- the four embedded MP4 audio segments shown in the playlist menu.
+function MediaSync:showOverlayChapterList()
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or #chapters == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No chapters available."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local current_idx = 1
+    local _, idx = self:_resolveOverlayChapter()
+    if idx then current_idx = idx end
+
+    local items = {}
+    for i, ch in ipairs(chapters) do
+        table.insert(items, {
+            text = (ch.title or _("Chapter") .. " " .. i)
+                .. "  (" .. self:_formatTime(ch.start_time) .. ")",
+            callback = function()
+                self:_closeModalMenu()
+                self:seekToOverlayChapter(i)
+            end,
+        })
+    end
+    self:_showModalMenu{ title = _("Chapters"), items = items, current = current_idx }
+end
+
+function MediaSync:seekToOverlayChapter(index)
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or not chapters[index] then return end
+    local ch = chapters[index]
+    local function after_audio_ready()
+        UIManager:scheduleIn(0.2, function()
+            self:seekToTime(ch.start_time)
+            if self.overlay_mode and ch.fragment_id then
+                UIManager:scheduleIn(0.3, function()
+                    self:navigateToSentenceAtTime(ch.start_time)
+                end)
+            end
+        end)
+    end
+    if ch.audio_path and self.media_engine
+        and self.media_engine.current_path ~= ch.audio_path then
+        -- Cross-file chapter jump: BT reconnect then load the new audio part.
+        self:_bridgeKindleA2dpForTrackChange(function()
+            if self.plugin and self.plugin._playAudioFile then
+                self.plugin:_playAudioFile(ch.audio_path, self.playlist_files)
+            end
+            after_audio_ready()
+        end)
+        return
+    end
+    after_audio_ready()
 end
 
 function MediaSync:showPlaylist()
@@ -1909,6 +2205,12 @@ end
 -- ---------------------------------------------------------------------------
 
 function MediaSync:getCurrentChapter()
+    -- Storyteller / Media Overlay: prefer the flat SMIL chapter list so the
+    -- title follows the content document across ~4 min audio-file boundaries.
+    if self.overlay_mode then
+        local ch, idx = self:_resolveOverlayChapter()
+        if ch then return ch, idx end
+    end
     if not self.chapters or #self.chapters == 0 then return nil end
     local pos = self.media_engine:getPosition()
     for i = #self.chapters, 1, -1 do

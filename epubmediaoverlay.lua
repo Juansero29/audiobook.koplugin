@@ -9,6 +9,10 @@ Caches extracted audio to persistent storage (not /tmp, to avoid RAM exhaustion)
 local logger = require("logger")
 local _ = require("gettext")
 
+-- Lua patterns: `.` does not match newlines. Storyteller (and many OPF
+-- producers) pretty-print SMIL/OPF with line breaks inside elements.
+local RE_ANY_LAZY = "([%z\1-\255]-)"
+
 local EpubMediaOverlay = {}
 
 function EpubMediaOverlay:new(o)
@@ -38,11 +42,77 @@ function EpubMediaOverlay:_runCommand(cmd)
     return out
 end
 
+--- Info-ZIP unzip treats [], ?, * as wildcards in archive member names.
+-- Storyteller titles often include bracketed series tags, e.g.
+-- "Author-[Series-1]Title(1955).html". Without escaping, unzip -p returns
+-- nothing even though unzip -l lists the SMIL files (which is why overlay
+-- detection passes but timing extraction yields zero entries).
+function EpubMediaOverlay:_escapeUnzipMember(path)
+    if not path then return path end
+    -- Info-ZIP: literal '[' is written as '[[]'. Do not escape ']' — doing so
+    -- corrupts the '[[]' token (']' inside it would become '[]]').
+    return path:gsub("%[", "[[]")
+end
+
+--- Pretty-printed XML puts newlines inside elements; collapse tag boundaries
+-- so legacy `(.-)` patterns still work if RE_ANY_LAZY ever fails on-device.
+function EpubMediaOverlay:_compactXml(xml)
+    if not xml or xml == "" then return xml end
+    return xml:gsub(">%s+<", "><")
+end
+
+--- Fingerprint an EPUB so we invalidate extracted audio when the file is
+-- replaced in-place (same path, new Storyteller export). Path-only cache
+-- keys reused stale MP3/MP4 against fresh SMIL timings — highlights then
+-- tracked the new alignment while the old audio played (Readest was fine
+-- because it streams from the EPUB directly).
+function EpubMediaOverlay:_epubFingerprint(epub_path)
+    if not epub_path then return nil end
+    -- LuaFileSystem may be unavailable; fall back to shell stat.
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok and lfs and lfs.attributes then
+        local attr = lfs.attributes(epub_path)
+        if attr and attr.size and attr.modification then
+            return string.format("%d:%d", attr.size, attr.modification)
+        end
+    end
+    local out = self:_runCommand(string.format(
+        'stat -c "%%s:%%Y" "%s" 2>/dev/null || stat -f "%%z:%%m" "%s" 2>/dev/null',
+        epub_path:gsub('"', '\\"'), epub_path:gsub('"', '\\"')))
+    if out then
+        local fp = out:match("(%d+:%d+)")
+        if fp then return fp end
+    end
+    return nil
+end
+
 function EpubMediaOverlay:_ensureCacheDir(plugin_dir, epub_path)
     -- Use a hash of the epub path to create a stable cache directory
     local hash = self:_simpleHash(epub_path)
     local cache = plugin_dir .. "/cache/overlays/" .. hash
     os.execute("mkdir -p '" .. cache:gsub("'", "'\\''") .. "'")
+
+    local fp = self:_epubFingerprint(epub_path)
+    local meta_path = cache .. "/.epub_fingerprint"
+    local cached_fp
+    local f = io.open(meta_path, "r")
+    if f then
+        cached_fp = (f:read("*l") or ""):gsub("%s+$", "")
+        f:close()
+    end
+    if fp and cached_fp and cached_fp ~= "" and cached_fp ~= fp then
+        logger.warn("EpubMediaOverlay: EPUB changed (", cached_fp, "->", fp,
+            ") — wiping stale overlay cache", cache)
+        os.execute("rm -rf '" .. cache:gsub("'", "'\\''") .. "'")
+        os.execute("mkdir -p '" .. cache:gsub("'", "'\\''") .. "'")
+    end
+    if fp then
+        local wf = io.open(meta_path, "w")
+        if wf then
+            wf:write(fp)
+            wf:close()
+        end
+    end
     return cache
 end
 
@@ -105,10 +175,11 @@ end
 
 function EpubMediaOverlay:_extractFromZip(epub_path, internal_path)
     -- Extract a single file from the EPUB using unzip
+    local zip_member = self:_escapeUnzipMember(internal_path)
     local cmd = string.format(
         'unzip -p "%s" "%s"',
         epub_path:gsub('"', '\\"'),
-        internal_path:gsub('"', '\\"')
+        zip_member:gsub('"', '\\"')
     )
     return self:_runCommand(cmd)
 end
@@ -136,13 +207,14 @@ function EpubMediaOverlay:_findOpfPath(epub_path)
 end
 
 function EpubMediaOverlay:_parseOpfManifest(opf_xml)
+    opf_xml = self:_compactXml(opf_xml)
     -- Extract manifest items from OPF.
     -- We need: items with media-overlay attributes, and the smil files they reference.
     local manifest = {}
     local manifest_items = {}
 
     -- Find the manifest section
-    local manifest_block = opf_xml:match("<manifest[^>]*>(.-)</manifest>")
+    local manifest_block = opf_xml:match("<manifest[^>]*>" .. RE_ANY_LAZY .. "</manifest>")
     if not manifest_block then
         logger.warn("EpubMediaOverlay: no manifest found in OPF")
         return nil
@@ -191,6 +263,7 @@ end
 -- ---------------------------------------------------------------------------
 
 function EpubMediaOverlay:_parseSmil(smil_xml, smil_base_path)
+    smil_xml = self:_compactXml(smil_xml)
     -- Parse a SMIL file and return timing_data entries.
     -- SMIL structure:
     --   <smil>
@@ -212,7 +285,7 @@ function EpubMediaOverlay:_parseSmil(smil_xml, smil_base_path)
     -- Find all <par> elements.  gmatch with two captures yields two loop
     -- values; the old single-variable loop bound only the attribute
     -- capture and threw away the body that holds <text>/<audio>.
-    for _par_attrs, par_block in smil_xml:gmatch("<par([^>]*)>(.-)</par>") do
+    for _par_attrs, par_block in smil_xml:gmatch("<par([^>]*)>" .. RE_ANY_LAZY .. "</par>") do
         -- Extract text src (match the <text> element specifically; a bare
         -- src= match would also hit <audio src=...>)
         local text_src = par_block:match('<text[^>]-src%s*=%s*"([^"]+)"')
@@ -221,7 +294,7 @@ function EpubMediaOverlay:_parseSmil(smil_xml, smil_base_path)
         -- src paths contain slashes)
         local audio_block = par_block:match("<audio([^>]-)/>")
         if not audio_block then
-            audio_block = par_block:match("<audio(.-)</audio>")
+            audio_block = par_block:match("<audio" .. RE_ANY_LAZY .. "</audio>")
         end
 
         if audio_block then
@@ -272,15 +345,49 @@ end
 function EpubMediaOverlay:_extractSentenceTexts(epub_path, html_zip_path)
     local html = self:_extractFromZip(epub_path, html_zip_path)
     if not html or html == "" then return nil end
+    -- Stack-based scan so nested <span> (Storyteller wraps text in
+    -- <span id=sN><i><span lang=FR>…</span></i></span>) does not truncate
+    -- at the first inner </span>.
     local map = {}
-    for id, body in html:gmatch('<span[^>]-id="([^"]+)"[^>]*>(.-)</span>') do
-        if not map[id] then
-            local txt = body:gsub("<[^>]->", "")
-                :gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
-                :gsub("&quot;", '"'):gsub("&#39;", "'"):gsub("&apos;", "'")
-                :gsub("&nbsp;", " ")
-                :gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-            if txt ~= "" then map[id] = txt end
+    local stack = {} -- { id=string|nil, parts={} }
+    local i = 1
+    local n = #html
+    while i <= n do
+        local s, e, attrs = html:find("<span([^>]*)>", i)
+        local cs, ce = html:find("</span>", i)
+        if s and (not cs or s < cs) then
+            if s > i and #stack > 0 then
+                table.insert(stack[#stack].parts, html:sub(i, s - 1))
+            end
+            local id = attrs and attrs:match('id%s*=%s*"([^"]+)"')
+            table.insert(stack, { id = id, parts = {} })
+            i = e + 1
+        elseif cs then
+            if cs > i and #stack > 0 then
+                table.insert(stack[#stack].parts, html:sub(i, cs - 1))
+            end
+            local finished = table.remove(stack)
+            i = ce + 1
+            if finished then
+                local body = table.concat(finished.parts)
+                -- Pass inner HTML up so parents keep nested text.
+                if #stack > 0 then
+                    table.insert(stack[#stack].parts, body)
+                end
+                if finished.id and not map[finished.id] then
+                    local txt = body:gsub("<[^>]->", "")
+                        :gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
+                        :gsub("&quot;", '"'):gsub("&#39;", "'"):gsub("&apos;", "'")
+                        :gsub("&nbsp;", " "):gsub("&#160;", " ")
+                        :gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+                    if txt ~= "" then map[finished.id] = txt end
+                end
+            end
+        else
+            if #stack > 0 and i <= n then
+                table.insert(stack[#stack].parts, html:sub(i))
+            end
+            break
         end
     end
     return map
@@ -301,8 +408,8 @@ function EpubMediaOverlay:_loadChapterTitles(epub_path, opf_xml, opf_base)
     local titles = {}
     -- Flat scan is fine for the common non-nested navMap; with nesting the
     -- first label per target document still wins, which is what we want.
-    for block in ncx:gmatch("<navPoint.-</navPoint>") do
-        local label = block:match("<text>(.-)</text>")
+    for block in ncx:gmatch("<navPoint[%z\1-\255]-</navPoint>") do
+        local label = block:match("<text>" .. RE_ANY_LAZY .. "</text>")
         local src = block:match('src="([^"#]+)')
         if label and src then
             local base = src:match("([^/]+)$")
@@ -336,10 +443,11 @@ function EpubMediaOverlay:_extractAudioFile(epub_path, internal_path, cache_dir)
     end
 
     -- Extract the file
+    local zip_member = self:_escapeUnzipMember(internal_path)
     local cmd = string.format(
         'unzip -o "%s" "%s" -d "%s" >/dev/null 2>&1',
         epub_path:gsub('"', '\\"'),
-        internal_path:gsub('"', '\\"'),
+        zip_member:gsub('"', '\\"'),
         cache_dir:gsub('"', '\\"')
     )
     os.execute(cmd)
@@ -364,9 +472,20 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
-function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
+function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
     if not epub_path or not plugin_dir then
         return nil, "missing path or plugin_dir"
+    end
+
+    local function report(phase, current, total, detail)
+        if progress_callback then
+            pcall(progress_callback, {
+                phase = phase,
+                current = current,
+                total = total,
+                detail = detail,
+            })
+        end
     end
 
     self._epub_path = epub_path
@@ -392,34 +511,56 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
 
     logger.dbg("EpubMediaOverlay: found", self:_tableCount(overlay_manifest), "overlay entries")
 
-    -- Step 3: Parse SMIL files in narrative order.  pairs() iteration is
-    -- unordered, which interleaved chapters randomly; SMIL hrefs sort into
-    -- document order for every producer we have seen.
-    local ordered_overlays = {}
-    for _, info in pairs(overlay_manifest) do
-        table.insert(ordered_overlays, info)
-    end
-    table.sort(ordered_overlays, function(a, b)
-        return (a.smil_href or "") < (b.smil_href or "")
-    end)
-
     local all_timing_data = {}
     local opf_base = opf_path:match("^(.*)/") or ""
     self._chapter_titles = self:_loadChapterTitles(epub_path, opf_xml, opf_base)
     -- Spine order: crengine numbers DocFragments in spine order, so this
     -- maps the reader's current position to a content document (used to
-    -- start narration from the page the user is on).
+    -- start narration from the page the user is on). Also drives SMIL
+    -- parse order — string-sorting SMIL hrefs breaks when filenames are
+    -- not zero-padded the same way as the spine.
     self._spine_hrefs = {}
-    local spine_block = opf_xml:match("<spine[^>]*>(.-)</spine>") or ""
+    local spine_block = opf_xml:match("<spine[^>]*>" .. RE_ANY_LAZY .. "</spine>") or ""
     for idref in spine_block:gmatch('<itemref[^>]-idref="([^"]+)"') do
         local it = manifest_items[idref]
         if it and it.href then
             table.insert(self._spine_hrefs, it.href:match("([^/]+)$") or it.href)
         end
     end
-    local html_text_cache = {}
 
-    for _, overlay_info in ipairs(ordered_overlays) do
+    -- Step 3: Parse SMIL files in spine order (fallback: SMIL href sort).
+    local by_content = {}
+    for content_href, info in pairs(overlay_manifest) do
+        local base = (info.content_href or content_href):match("([^/]+)$")
+            or info.content_href or content_href
+        by_content[base] = info
+    end
+    local ordered_overlays = {}
+    local seen = {}
+    for _, base in ipairs(self._spine_hrefs) do
+        local info = by_content[base]
+        if info and not seen[info] then
+            table.insert(ordered_overlays, info)
+            seen[info] = true
+        end
+    end
+    for _, info in pairs(overlay_manifest) do
+        if not seen[info] then
+            table.insert(ordered_overlays, info)
+        end
+    end
+    if #ordered_overlays > 1 and #self._spine_hrefs == 0 then
+        table.sort(ordered_overlays, function(a, b)
+            return (a.smil_href or "") < (b.smil_href or "")
+        end)
+    end
+
+    local html_text_cache = {}
+    local audio_path_cache = {}
+    local total_smils = #ordered_overlays
+
+    for smil_idx, overlay_info in ipairs(ordered_overlays) do
+        report("smil", smil_idx, total_smils, overlay_info.smil_href)
         local smil_href = overlay_info.smil_href
         if not smil_href then goto continue end
 
@@ -438,12 +579,19 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
         local smil_base = smil_path:match("^(.*)/") or ""
         local timing_data = self:_parseSmil(smil_xml, smil_base)
 
-        -- Extract audio files, resolve sentence texts, and collect entries
+        -- Resolve audio paths once per distinct audio_src (Storyteller books
+        -- reference the same MP4 from thousands of <par> entries).
         for _, entry in ipairs(timing_data) do
             if entry.audio_src then
-                local audio_path = self:_extractAudioFile(epub_path, entry.audio_src, self._cache_dir)
-                if audio_path then
-                    entry.audio_path = audio_path
+                local ap = audio_path_cache[entry.audio_src]
+                if not ap then
+                    ap = self:_extractAudioFile(epub_path, entry.audio_src, self._cache_dir)
+                    audio_path_cache[entry.audio_src] = ap or false
+                elseif ap == false then
+                    ap = nil
+                end
+                if ap then
+                    entry.audio_path = ap
                 end
             end
             -- "../text/part0007.html#id12-s0" -> content doc + fragment id,
@@ -486,7 +634,13 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir)
     -- interleaves chapters.  Order here is narrative (SMIL) order; the
     -- caller groups by audio file and each group is internally monotonic.
 
-    logger.warn("EpubMediaOverlay: loaded", #all_timing_data, "timing entries")
+    local unique_audio = 0
+    for _ in pairs(audio_path_cache) do unique_audio = unique_audio + 1 end
+    report("done", #all_timing_data, total_smils,
+        string.format("%d timing, %d audio", #all_timing_data, unique_audio))
+
+    logger.warn("EpubMediaOverlay: loaded", #all_timing_data, "timing entries,",
+        unique_audio, "audio files")
     return all_timing_data
 end
 
