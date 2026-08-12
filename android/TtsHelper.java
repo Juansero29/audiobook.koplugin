@@ -110,7 +110,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                                 if (!pipelineActive || !path.equals(pipelineFile)) {
                                     return;
                                 }
-                                int dur = startPlayback(path);
+                                int dur = startPlayback(path, speechAttributes());
                                 if (dur >= 0) {
                                     pipelineDurationMs = dur;
                                     pipelineStatus = 1;  // playing
@@ -282,16 +282,19 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     // --- Audio focus ---
 
-    /** Speech attributes for playback and focus: route read-along audio the
-     *  same way the platform TTS speak() path is routed, not as music.
-     *  USAGE_MEDIA lands clips on the deep-buffer/offload music path, which
-     *  some HALs (MTK e-ink, Bigme HiBreak, issue #44) tear down ~130 ms
-     *  into a sentence-length clip without ever delivering completion.
-     *  The speak() path works on those devices, so mirror it. */
+    /** Speech attributes for short TTS clips (synth-then-play pipeline). */
     private static AudioAttributes speechAttributes() {
         return new AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build();
+    }
+
+    /** Music/media attributes for pre-recorded audiobook chapters (EPUB overlay). */
+    private static AudioAttributes mediaAttributes() {
+        return new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .build();
     }
 
@@ -300,12 +303,12 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     private Object audioFocusRequest = null;
 
     @SuppressWarnings("deprecation")
-    private void requestAudioFocus() {
+    private void requestAudioFocus(AudioAttributes attrs) {
         if (audioManager == null) return;
         try {
             if (Build.VERSION.SDK_INT >= 26) {
                 AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                    .setAudioAttributes(speechAttributes())
+                    .setAudioAttributes(attrs != null ? attrs : speechAttributes())
                     .build();
                 audioFocusRequest = req;
                 audioManager.requestAudioFocus(req);
@@ -436,6 +439,18 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
      * thread via JNI) never blocks in media-server binder calls (issue #44).
      */
     public int playFile(final String path) {
+        return playFileWithAttributes(path, speechAttributes());
+    }
+
+    /**
+     * Play a pre-recorded audiobook file (mp3/m4b/…) through the media stream.
+     * Use this for EPUB Media Overlay chapters; short TTS clips use playFile().
+     */
+    public int playMediaFile(final String path) {
+        return playFileWithAttributes(path, mediaAttributes());
+    }
+
+    private int playFileWithAttributes(final String path, final AudioAttributes attrs) {
         if (pipelineActive) {
             pipelineActive = false;
             pipelineStatus = -1;
@@ -445,7 +460,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         worker.post(new Runnable() {
             @Override
             public void run() {
-                startPlayback(path);
+                startPlayback(path, attrs);
             }
         });
         return 0;
@@ -454,18 +469,16 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     /**
      * Internal: start MediaPlayer on a file.  Runs on the worker thread.
      */
-    private int startPlayback(String path) {
+    private int startPlayback(String path, AudioAttributes attrs) {
         stopPlaybackInternal();
         playbackDone = false;
         playbackActive = false;
-        requestAudioFocus();
+        if (attrs == null) attrs = speechAttributes();
+        requestAudioFocus(attrs);
         synchronized (mpLock) {
             try {
                 mediaPlayer = new MediaPlayer();
-                // Route as speech/assistance, not music: the deep-buffer
-                // music path kills sentence-length clips on some HALs
-                // (Bigme HiBreak, issue #44).
-                mediaPlayer.setAudioAttributes(speechAttributes());
+                mediaPlayer.setAudioAttributes(attrs);
                 mediaPlayer.setDataSource(path);
                 mediaPlayer.setOnCompletionListener(mp -> {
                     playbackDone = true;
@@ -591,6 +604,25 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                             playbackActive = true;
                         }
                     } catch (IllegalStateException ignored) {}
+                }
+            }
+        });
+    }
+
+    /**
+     * Seek the active MediaPlayer (JNI entry point: posted, never blocks).
+     * Used by EPUB Media Overlay read-aloud on Android (Boox, etc.).
+     */
+    public void seekToMs(final int msec) {
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (mpLock) {
+                    try {
+                        if (mediaPlayer != null) {
+                            mediaPlayer.seekTo(Math.max(0, msec));
+                        }
+                    } catch (Exception ignored) {}
                 }
             }
         });

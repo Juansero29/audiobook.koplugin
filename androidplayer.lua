@@ -1,0 +1,423 @@
+--[[--
+Android MediaPlayer for audiobook / EPUB Media Overlay playback.
+
+Creates android.media.MediaPlayer directly via JNI — no tts_helper.dex and
+no bundled ffmpeg.  The glibc ffmpeg shipped in the plugin SIGSEGVs on
+Android (Bionic), which was crashing KOReader on "Play aligned audiobook".
+
+@module androidplayer
+--]]
+
+local ffi = require("ffi")
+local logger = require("logger")
+local UIManager = require("ui/uimanager")
+local time = require("ui/time")
+
+local AndroidPlayer = {}
+
+local function checkException(env)
+    if env[0].ExceptionCheck(env) ~= 0 then
+        env[0].ExceptionDescribe(env)
+        env[0].ExceptionClear(env)
+        return true
+    end
+    return false
+end
+
+local function getMethod(env, clazz, name, sig)
+    local mid = env[0].GetMethodID(env, clazz, name, sig)
+    if checkException(env) or mid == nil then return nil end
+    local ok, nullish = pcall(function()
+        return tonumber(ffi.cast("intptr_t", mid)) == 0
+    end)
+    if ok and nullish then return nil end
+    return mid
+end
+
+local function getStaticMethod(env, clazz, name, sig)
+    local mid = env[0].GetStaticMethodID(env, clazz, name, sig)
+    if checkException(env) or mid == nil then return nil end
+    local ok, nullish = pcall(function()
+        return tonumber(ffi.cast("intptr_t", mid)) == 0
+    end)
+    if ok and nullish then return nil end
+    return mid
+end
+
+function AndroidPlayer:new(o)
+    o = o or {}
+    setmetatable(o, self)
+    self.__index = self
+    o._android = nil
+    o._mp_ref = nil
+    o._mp_class = nil
+    o._method = {}
+    o._initialized = false
+    o._duration_ms = 0
+    o._playing = false
+    o._paused = false
+    o._start_seek_ms = 0
+    o._wall_start = nil
+    o._pause_accum_ms = 0
+    o._pause_wall_start = nil
+    o._ever_confirmed_playing = false
+    o._last_mp_pos_ms = 0
+    return o
+end
+
+function AndroidPlayer:init()
+    if self._initialized then return true end
+
+    local Device = require("device")
+    if not (Device.isAndroid and Device:isAndroid()) then
+        return false
+    end
+
+    local ok, android = pcall(require, "android")
+    if not ok or not android then
+        logger.err("AndroidPlayer: cannot load android module")
+        return false
+    end
+    self._android = android
+
+    local load_ok = false
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local mp_class = env[0].FindClass(env, "android/media/MediaPlayer")
+        if checkException(env) or mp_class == nil then
+            logger.err("AndroidPlayer: MediaPlayer class not found")
+            return
+        end
+
+        self._method.init = getMethod(env, mp_class, "<init>", "()V")
+        self._method.setDataSource = getMethod(env, mp_class,
+            "setDataSource", "(Ljava/lang/String;)V")
+        self._method.prepare = getMethod(env, mp_class, "prepare", "()V")
+        self._method.start = getMethod(env, mp_class, "start", "()V")
+        self._method.pause = getMethod(env, mp_class, "pause", "()V")
+        self._method.stop = getMethod(env, mp_class, "stop", "()V")
+        self._method.reset = getMethod(env, mp_class, "reset", "()V")
+        self._method.release = getMethod(env, mp_class, "release", "()V")
+        self._method.seekTo = getMethod(env, mp_class, "seekTo", "(I)V")
+        self._method.isPlaying = getMethod(env, mp_class, "isPlaying", "()Z")
+        self._method.getCurrentPosition = getMethod(env, mp_class,
+            "getCurrentPosition", "()I")
+        self._method.getDuration = getMethod(env, mp_class, "getDuration", "()I")
+        self._method.setAudioAttributes = getMethod(env, mp_class,
+            "setAudioAttributes", "(Landroid/media/AudioAttributes;)V")
+
+        if not self._method.init
+            or not self._method.setDataSource
+            or not self._method.prepare
+            or not self._method.start
+            or not self._method.seekTo
+            or not self._method.getCurrentPosition then
+            logger.err("AndroidPlayer: required MediaPlayer methods missing")
+            env[0].DeleteLocalRef(env, mp_class)
+            return
+        end
+
+        -- Build AudioAttributes USAGE_MEDIA / CONTENT_TYPE_MUSIC once.
+        self._attrs_ref = nil
+        local aa_class = env[0].FindClass(env, "android/media/AudioAttributes")
+        local builder_class = env[0].FindClass(env,
+            "android/media/AudioAttributes$Builder")
+        if aa_class and builder_class and not checkException(env) then
+            local b_init = getMethod(env, builder_class, "<init>", "()V")
+            local set_usage = getMethod(env, builder_class,
+                "setUsage", "(I)Landroid/media/AudioAttributes$Builder;")
+            local set_ctype = getMethod(env, builder_class,
+                "setContentType", "(I)Landroid/media/AudioAttributes$Builder;")
+            local build = getMethod(env, builder_class,
+                "build", "()Landroid/media/AudioAttributes;")
+            -- USAGE_MEDIA=1, CONTENT_TYPE_MUSIC=2
+            if b_init and set_usage and set_ctype and build then
+                local builder = env[0].NewObject(env, builder_class, b_init)
+                if builder and not checkException(env) then
+                    local args = ffi.new("jvalue[1]")
+                    args[0].i = 1  -- USAGE_MEDIA
+                    builder = env[0].CallObjectMethodA(env, builder, set_usage, args)
+                    checkException(env)
+                    args[0].i = 2  -- CONTENT_TYPE_MUSIC
+                    builder = env[0].CallObjectMethodA(env, builder, set_ctype, args)
+                    checkException(env)
+                    local attrs = env[0].CallObjectMethod(env, builder, build)
+                    if attrs and not checkException(env) then
+                        self._attrs_ref = env[0].NewGlobalRef(env, attrs)
+                        env[0].DeleteLocalRef(env, attrs)
+                    end
+                    if builder then env[0].DeleteLocalRef(env, builder) end
+                end
+            end
+            env[0].DeleteLocalRef(env, aa_class)
+            env[0].DeleteLocalRef(env, builder_class)
+        else
+            checkException(env)
+        end
+
+        self._mp_class = env[0].NewGlobalRef(env, mp_class)
+        env[0].DeleteLocalRef(env, mp_class)
+        load_ok = true
+    end)
+
+    if not load_ok then return false end
+    self._initialized = true
+    logger.warn("AndroidPlayer: ready (direct MediaPlayer, no dex)")
+    return true
+end
+
+function AndroidPlayer:_releasePlayer()
+    if not self._mp_ref then return end
+    local android = self._android
+    local mp = self._mp_ref
+    self._mp_ref = nil
+    self._playing = false
+    self._paused = false
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        pcall(function()
+            if self._method.reset then
+                env[0].CallVoidMethod(env, mp, self._method.reset)
+                checkException(env)
+            end
+            if self._method.release then
+                env[0].CallVoidMethod(env, mp, self._method.release)
+                checkException(env)
+            end
+        end)
+        env[0].DeleteGlobalRef(env, mp)
+    end)
+end
+
+--- Play a local file.  Optional seek_ms applied after prepare.
+--- @return boolean success
+function AndroidPlayer:play(path, seek_ms)
+    if not self._initialized then return false end
+    seek_ms = math.floor(tonumber(seek_ms) or 0)
+    self:_releasePlayer()
+
+    local android = self._android
+    local ok = false
+    local duration_ms = 0
+
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local mp = env[0].NewObject(env, self._mp_class, self._method.init)
+        if checkException(env) or mp == nil then
+            logger.err("AndroidPlayer: MediaPlayer() failed")
+            return
+        end
+
+        if self._attrs_ref and self._method.setAudioAttributes then
+            env[0].CallVoidMethod(env, mp, self._method.setAudioAttributes,
+                self._attrs_ref)
+            checkException(env)
+        end
+
+        local j_path = env[0].NewStringUTF(env, path)
+        env[0].CallVoidMethod(env, mp, self._method.setDataSource, j_path)
+        env[0].DeleteLocalRef(env, j_path)
+        if checkException(env) then
+            logger.err("AndroidPlayer: setDataSource failed for", path)
+            env[0].CallVoidMethod(env, mp, self._method.release)
+            checkException(env)
+            env[0].DeleteLocalRef(env, mp)
+            return
+        end
+
+        env[0].CallVoidMethod(env, mp, self._method.prepare)
+        if checkException(env) then
+            logger.err("AndroidPlayer: prepare failed for", path)
+            env[0].CallVoidMethod(env, mp, self._method.release)
+            checkException(env)
+            env[0].DeleteLocalRef(env, mp)
+            return
+        end
+
+        if self._method.getDuration then
+            duration_ms = env[0].CallIntMethod(env, mp, self._method.getDuration)
+            checkException(env)
+        end
+
+        if seek_ms > 50 then
+            local sargs = ffi.new("jvalue[1]")
+            sargs[0].i = seek_ms
+            env[0].CallVoidMethodA(env, mp, self._method.seekTo, sargs)
+            checkException(env)
+        end
+
+        env[0].CallVoidMethod(env, mp, self._method.start)
+        if checkException(env) then
+            logger.err("AndroidPlayer: start failed")
+            env[0].CallVoidMethod(env, mp, self._method.release)
+            checkException(env)
+            env[0].DeleteLocalRef(env, mp)
+            return
+        end
+
+        self._mp_ref = env[0].NewGlobalRef(env, mp)
+        env[0].DeleteLocalRef(env, mp)
+        ok = true
+    end)
+
+    if ok then
+        self._duration_ms = duration_ms or 0
+        self._playing = true
+        self._paused = false
+        self._start_seek_ms = math.max(0, seek_ms)
+        -- UIManager time is real wall-clock; os.clock() is CPU time and barely
+        -- advances while KOReader is idle (the Boox timer/highlight bug).
+        self._wall_start = UIManager:getTime()
+        self._pause_accum_ms = 0
+        self._pause_wall_start = nil
+        self._ever_confirmed_playing = true
+        self._last_mp_pos_ms = self._start_seek_ms
+        logger.warn("AndroidPlayer: playing", path,
+            "seek_ms=", seek_ms, "duration_ms=", self._duration_ms)
+    end
+    return ok
+end
+
+function AndroidPlayer:_wallPositionMs()
+    if not self._wall_start then return self._start_seek_ms or 0 end
+    local elapsed
+    if self._paused and self._pause_wall_start then
+        elapsed = time.to_ms(self._pause_wall_start - self._wall_start)
+    else
+        elapsed = time.to_ms(UIManager:getTime() - self._wall_start)
+    end
+    elapsed = (elapsed or 0) - (self._pause_accum_ms or 0)
+    local pos = (self._start_seek_ms or 0) + math.max(0, elapsed)
+    if self._duration_ms and self._duration_ms > 0 then
+        pos = math.min(pos, self._duration_ms)
+    end
+    return math.floor(pos)
+end
+
+function AndroidPlayer:pause()
+    if not self._mp_ref or not self._playing or self._paused then return end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.pause)
+        checkException(jni.env)
+    end)
+    self._paused = true
+    self._pause_wall_start = UIManager:getTime()
+end
+
+function AndroidPlayer:resume()
+    if not self._mp_ref or not self._paused then return end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.start)
+        checkException(jni.env)
+    end)
+    if self._pause_wall_start then
+        self._pause_accum_ms = (self._pause_accum_ms or 0)
+            + time.to_ms(UIManager:getTime() - self._pause_wall_start)
+        self._pause_wall_start = nil
+    end
+    self._paused = false
+    self._playing = true
+end
+
+function AndroidPlayer:stop()
+    self:_releasePlayer()
+    self._wall_start = nil
+    self._ever_confirmed_playing = false
+end
+
+function AndroidPlayer:seekToMs(msec)
+    if not self._mp_ref then return end
+    msec = math.floor(tonumber(msec) or 0)
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local args = ffi.new("jvalue[1]")
+        args[0].i = msec
+        env[0].CallVoidMethodA(env, self._mp_ref, self._method.seekTo, args)
+        checkException(env)
+    end)
+    self._start_seek_ms = msec
+    self._wall_start = UIManager:getTime()
+    self._pause_accum_ms = 0
+    self._pause_wall_start = nil
+    self._last_mp_pos_ms = msec
+end
+
+--- Position for completion checks (wall-clock; JNI getCurrentPosition is flaky).
+function AndroidPlayer:getPositionMs()
+    return self:_wallPositionMs()
+end
+
+function AndroidPlayer:getDurationMs()
+    if self._duration_ms and self._duration_ms > 0 then
+        return self._duration_ms
+    end
+    if not self._mp_ref or not self._method.getDuration then return 0 end
+    local android = self._android
+    local dur = android.jni:context(android.app.activity.vm, function(jni)
+        local d = jni.env[0].CallIntMethod(jni.env,
+            self._mp_ref, self._method.getDuration)
+        if checkException(jni.env) then return 0 end
+        return tonumber(d) or 0
+    end) or 0
+    self._duration_ms = dur
+    return dur
+end
+
+function AndroidPlayer:isPlaying()
+    if not self._mp_ref then return false end
+    if self._paused then return false end
+    -- Trust our own state: MediaPlayer.isPlaying() is flaky across JNI and
+    -- would false-complete the sync loop while audio still plays.
+    return self._playing and true or false
+end
+
+function AndroidPlayer:isPlaybackDone()
+    if not self._mp_ref then return true end
+    if self._paused then return false end
+    if not self._playing then return true end
+
+    local pos = self:getPositionMs()
+    local dur = self:getDurationMs()
+    if dur and dur > 0 and pos >= (dur - 400) then
+        self._playing = false
+        return true
+    end
+
+    -- Secondary check: MediaPlayer reports stopped after we were confirmed playing.
+    if self._ever_confirmed_playing then
+        local android = self._android
+        local mp_playing = android.jni:context(android.app.activity.vm, function(jni)
+            local r = jni.env[0].CallBooleanMethod(jni.env,
+                self._mp_ref, self._method.isPlaying)
+            if checkException(jni.env) then return true end -- assume still playing on error
+            return r ~= 0
+        end)
+        if mp_playing == false and pos > (self._start_seek_ms or 0) + 2000 then
+            self._playing = false
+            return true
+        end
+    end
+    return false
+end
+
+function AndroidPlayer:shutdown()
+    self:stop()
+    if self._attrs_ref and self._android then
+        self._android.jni:context(self._android.app.activity.vm, function(jni)
+            jni.env[0].DeleteGlobalRef(jni.env, self._attrs_ref)
+        end)
+        self._attrs_ref = nil
+    end
+    if self._mp_class and self._android then
+        self._android.jni:context(self._android.app.activity.vm, function(jni)
+            jni.env[0].DeleteGlobalRef(jni.env, self._mp_class)
+        end)
+        self._mp_class = nil
+    end
+    self._initialized = false
+end
+
+return AndroidPlayer

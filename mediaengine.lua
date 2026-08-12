@@ -28,6 +28,7 @@ MediaEngine.BACKENDS = {
     WAV_PLAY = "wav-play",
     KINDLE_LIPC = "kindle-lipc",
     KINDLE_GST_PLAY = "kindle-gst-play",
+    ANDROID = "android",
 }
 
 function MediaEngine:new(o)
@@ -384,6 +385,11 @@ Windows zip extractors; rename .bin back to the original name if needed.
 @return string|nil  absolute path to ffmpeg binary, or nil
 --]]
 function MediaEngine:_findFfmpeg()
+    -- Bundled ffmpeg is a glibc Linux binary. Spawning it on Android (Bionic)
+    -- hard-crashes KOReader — never touch it on this platform.
+    if Device.isAndroid and Device:isAndroid() then
+        return nil
+    end
     if self._plugin_dir then
         local plugin_ffmpeg = self._plugin_dir .. "/bin/ffmpeg"
         -- Release zip ships ffmpeg as ffmpeg.bin; rename on first use.
@@ -419,7 +425,80 @@ function MediaEngine:_findFfmpeg()
 end
 
 function MediaEngine:_getTempDir()
+    if Device.isAndroid and Device:isAndroid() then
+        -- Prefer Android app cache. Never use /tmp on Android — often not
+        -- writable for the KOReader sandbox.
+        if self._android_cache_dir then
+            return self._android_cache_dir
+        end
+        local ok, android = pcall(require, "android")
+        if ok and android then
+            local cache = android.jni:context(android.app.activity.vm, function(jni)
+                local cache_file = jni:callObjectMethod(
+                    android.app.activity.clazz,
+                    "getCacheDir",
+                    "()Ljava/io/File;"
+                )
+                if cache_file == nil then return nil end
+                local abs_path = jni:callObjectMethod(
+                    cache_file, "getAbsolutePath", "()Ljava/lang/String;"
+                )
+                jni.env[0].DeleteLocalRef(jni.env, cache_file)
+                if abs_path == nil then return nil end
+                local result = jni:to_string(abs_path)
+                jni.env[0].DeleteLocalRef(jni.env, abs_path)
+                return result
+            end)
+            if cache then
+                self._android_cache_dir = cache .. "/audiobook"
+                os.execute('mkdir -p "' .. self._android_cache_dir .. '"')
+                return self._android_cache_dir
+            end
+        end
+    end
     return os.getenv("TMPDIR") or "/tmp"
+end
+
+--- Direct MediaPlayer via JNI (no dex, no ffmpeg). Preferred for EPUB overlays.
+function MediaEngine:_ensureAndroidPlayer()
+    if self._android_player then return self._android_player end
+    if not (Device.isAndroid and Device:isAndroid()) then return nil end
+    local ok, AndroidPlayer = pcall(dofile, self._plugin_dir .. "/androidplayer.lua")
+    if not ok or not AndroidPlayer then
+        logger.err("MediaEngine: androidplayer.lua failed:", AndroidPlayer)
+        return nil
+    end
+    local player = AndroidPlayer:new()
+    if player:init() then
+        self._android_player = player
+        return player
+    end
+    return nil
+end
+
+--- Reuse the plugin's AndroidTts bridge (shared with TTSEngine when available).
+--- Kept for TTS sentence playback only — audiobooks use AndroidPlayer.
+function MediaEngine:_ensureAndroidTts()
+    if self._android_tts then return self._android_tts end
+    local plugin = self.plugin
+    if plugin and plugin.tts_engine and plugin.tts_engine._android_tts then
+        self._android_tts = plugin.tts_engine._android_tts
+        return self._android_tts
+    end
+    local ok, AndroidTts = pcall(dofile, self._plugin_dir .. "/androidtts.lua")
+    if not ok or not AndroidTts then return nil end
+    local atts = AndroidTts:new{ plugin_dir = self._plugin_dir }
+    if atts:init() then
+        self._android_tts = atts
+        return atts
+    end
+    return nil
+end
+
+function MediaEngine:_fileExists(path)
+    local f = io.open(path, "r")
+    if f then f:close() return true end
+    return false
 end
 
 function MediaEngine:_nextGeneration()
@@ -467,7 +546,25 @@ function MediaEngine:detectBackend()
         return self.backend, self.backend_cmd
     end
 
-    -- 3) Kindle backends FIRST on Kindle hardware: there is no ALSA and no
+    -- 3) Android: direct MediaPlayer via JNI (Boox / KOReader Android).
+    -- Never fall through to ffmpeg-pipe: the bundled glibc ffmpeg SIGSEGVs
+    -- under Android Bionic, and aplay does not exist.
+    if Device.isAndroid and Device:isAndroid() then
+        local player = self:_ensureAndroidPlayer()
+        if player then
+            self.backend = self.BACKENDS.ANDROID
+            self.backend_cmd = "android-mediaplayer"
+            logger.warn("MediaEngine: selected Android MediaPlayer backend (direct JNI)")
+            return self.backend, self.backend_cmd
+        end
+        self.backend_error = _(
+            "Android audio playback is unavailable.\n\n" ..
+            "Could not initialize the system MediaPlayer. Restart KOReader and try again.")
+        logger.err("MediaEngine: Android MediaPlayer unavailable; refusing CLI fallbacks")
+        return nil, nil
+    end
+
+    -- 4) Kindle backends FIRST on Kindle hardware: there is no ALSA and no
     -- aplay, so the ffmpeg-pipe backend (which pipes WAV to aplay) can
     -- never produce sound here; audio must go through Amazon's
     -- mixersink → audiomgrd → BT pipeline.  The kindle-gst-play backend
@@ -740,6 +837,9 @@ end
 -- ---------------------------------------------------------------------------
 
 function MediaEngine:_findFfprobe()
+    if Device.isAndroid and Device:isAndroid() then
+        return nil
+    end
     -- Check bundled binary first (release zip may ship it as ffprobe.bin).
     if self._plugin_dir then
         local plugin_ffprobe = self._plugin_dir .. "/bin/ffprobe"
@@ -1062,41 +1162,59 @@ function MediaEngine:play(on_complete, on_fail)
     local gen = self:_nextGeneration()
     self._on_complete = on_complete
     self._on_fail = on_fail
-    self.is_playing = true
+    self.is_playing = false
     self.is_paused = false
-    -- Reset elapsed-time tracking
-    self._play_start_time = UIManager:getTime()
-    self._pause_start_time = nil
-    self._total_pause_ms = 0
+    self._android_playback_confirmed = false
 
     if self._use_persistent_pipeline then
         local ok = self:_playPersistentPipeline(gen)
-        if ok then return true end
+        if ok then
+            self.is_playing = true
+            self._play_start_time = UIManager:getTime()
+            self._pause_start_time = nil
+            self._total_pause_ms = 0
+            return true
+        end
         logger.warn("MediaEngine: persistent pipeline play failed, falling back to standard backend")
         self._use_persistent_pipeline = false
     end
 
+    local ok = false
     if self.backend == self.BACKENDS.MPV then
-        return self:_playMpv(gen)
+        ok = self:_playMpv(gen)
     elseif self.backend == self.BACKENDS.MPLAYER then
-        return self:_playMplayer(gen)
+        ok = self:_playMplayer(gen)
     elseif self.backend == self.BACKENDS.FFMPEG_PIPE then
-        return self:_playFfmpegPipe(gen)
+        ok = self:_playFfmpegPipe(gen)
     elseif self.backend == self.BACKENDS.GST_PLAY then
-        return self:_playGstPlay(gen)
+        ok = self:_playGstPlay(gen)
     elseif self.backend == self.BACKENDS.GST_PIPELINE then
-        return self:_playGstPipeline(gen)
+        ok = self:_playGstPipeline(gen)
     elseif self.backend == self.BACKENDS.APLAY or self.backend == self.BACKENDS.WAV_PLAY then
-        return self:_playAplay(gen)
+        ok = self:_playAplay(gen)
     elseif self.backend == self.BACKENDS.KINDLE_GST_PLAY then
-        return self:_playKindleGstPlay(gen)
+        ok = self:_playKindleGstPlay(gen)
     elseif self.backend == self.BACKENDS.KINDLE_LIPC then
-        return self:_playKindleLipc(gen)
+        ok = self:_playKindleLipc(gen)
+    elseif self.backend == self.BACKENDS.ANDROID then
+        ok = self:_playAndroid(gen)
+    else
+        logger.err("MediaEngine: unknown backend", self.backend)
+        if on_fail then on_fail("unknown backend") end
+        return false
     end
 
-    logger.err("MediaEngine: unknown backend", self.backend)
-    if on_fail then on_fail("unknown backend") end
-    return false
+    if ok then
+        self.is_playing = true
+        self.is_paused = false
+        self._play_start_time = UIManager:getTime()
+        self._pause_start_time = nil
+        self._total_pause_ms = 0
+    else
+        self.is_playing = false
+        self.is_paused = false
+    end
+    return ok
 end
 
 --[[--
@@ -1183,6 +1301,101 @@ function MediaEngine:_spawnTracked(cmd, gen, opts)
     end)
 
     return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Android MediaPlayer playback (Boox, KOReader Android)
+-- ---------------------------------------------------------------------------
+
+function MediaEngine:_playAndroid(gen)
+    local player = self:_ensureAndroidPlayer()
+    if not player then
+        logger.err("MediaEngine: Android MediaPlayer unavailable")
+        if self._on_fail then self._on_fail("android mediaplayer unavailable") end
+        return false
+    end
+
+    pcall(function() player:stop() end)
+
+    local offset = self._seek_offset or 0
+    local seek_ms = math.floor(offset * 1000)
+    local ok = player:play(self.current_path, seek_ms)
+    if not ok then
+        logger.err("MediaEngine: Android play failed for", self.current_path)
+        if self._on_fail then self._on_fail("android playback failed") end
+        return false
+    end
+
+    local dur_ms = player:getDurationMs()
+    if dur_ms and dur_ms > 0 then
+        self.current_duration = dur_ms / 1000
+    end
+
+    self._android_playback_confirmed = true
+    logger.warn("MediaEngine: Android play", self.current_path,
+        "offset=", offset, "duration=", self.current_duration)
+
+    self:_startAndroidCompletionWatcher(gen)
+    return true
+end
+
+function MediaEngine:_startAndroidCompletionWatcher(gen)
+    local player = self._android_player
+    if not player then return end
+    local poll_count = 0
+    local max_polls = math.max(600,
+        math.floor((self.current_duration or 300) * 10))
+    local function poll()
+        if self.play_generation ~= gen then return end
+        if not self.is_playing then return end
+        if self.is_paused then
+            UIManager:scheduleIn(0.25, poll)
+            return
+        end
+        poll_count = poll_count + 1
+        if poll_count == 15 and not self._android_playback_confirmed then
+            -- Only fail if MediaPlayer never produced a progressing position.
+            local pos_ms = player:getPositionMs() or 0
+            local start_ms = math.floor((self._seek_offset or 0) * 1000)
+            if pos_ms <= start_ms + 100 then
+                logger.err("MediaEngine: Android playback failed to start")
+                self.is_playing = false
+                if self._on_fail then
+                    local cb = self._on_fail
+                    self._on_fail = nil
+                    cb("android playback failed to start")
+                end
+                return
+            end
+            self._android_playback_confirmed = true
+        end
+        if player:isPlaying() then
+            self._android_playback_confirmed = true
+        end
+        if player:isPlaybackDone() then
+            self.is_playing = false
+            self.is_paused = false
+            if self._on_complete then
+                local cb = self._on_complete
+                self._on_complete = nil
+                cb()
+            end
+            return
+        end
+        if poll_count >= max_polls then
+            logger.warn("MediaEngine: Android playback timed out")
+            pcall(function() player:stop() end)
+            self.is_playing = false
+            if self._on_fail then
+                local cb = self._on_fail
+                self._on_fail = nil
+                cb("android playback timeout")
+            end
+            return
+        end
+        UIManager:scheduleIn(0.2, poll)
+    end
+    UIManager:scheduleIn(0.4, poll)
 end
 
 function MediaEngine:_playMpv(gen)
@@ -2415,7 +2628,7 @@ function MediaEngine:_startCompletionWatcher(gen)
         -- wrapper shell lives until gst-launch finishes actual playout).
         if (self.backend == self.BACKENDS.APLAY or self.backend == self.BACKENDS.WAV_PLAY
             or self.backend == self.BACKENDS.GST_PLAY or self.backend == self.BACKENDS.GST_PIPELINE
-            or self.backend == self.BACKENDS.KINDLE_GST_PLAY)
+            or self.backend == self.BACKENDS.KINDLE_GST_PLAY or self.backend == self.BACKENDS.ANDROID)
             and not self._use_progress_position
             and self._play_start_time and self.current_duration then
             local pos = self:getPosition()
@@ -2455,6 +2668,11 @@ function MediaEngine:pause()
         local pf = io.open(self._media_ctrl_dir .. "/pause", "w")
         if pf then pf:write("1"); pf:close() end
         logger.warn("MediaEngine: paused persistent pipeline (ffmpeg feeder), wrapper=", self._pipeline_wrapper_pid)
+        return
+    end
+
+    if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        self._android_player:pause()
         return
     end
 
@@ -2525,6 +2743,16 @@ function MediaEngine:resume()
             f:close()
         end
         logger.warn("MediaEngine: resumed persistent pipeline at", resume_pos, "wrapper=", self._pipeline_wrapper_pid)
+        return
+    end
+
+    if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        self.is_paused = false
+        if self._pause_start_time then
+            self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
+            self._pause_start_time = nil
+        end
+        self._android_player:resume()
         return
     end
 
@@ -2606,6 +2834,10 @@ function MediaEngine:stop()
     if self._position_timer then
         UIManager:unschedule(self._position_timer)
         self._position_timer = nil
+    end
+
+    if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        pcall(function() self._android_player:stop() end)
     end
 
     if self._persistent_pipeline_active then
@@ -2722,6 +2954,27 @@ function MediaEngine:seek(seconds, mode)
     -- paused after a seek.  is_playing stays true when paused; is_paused is
     -- the real indicator.
     local was_playing = self.is_playing and not self.is_paused
+
+    if self.backend == self.BACKENDS.ANDROID then
+        local target = seconds
+        if mode == "relative" then
+            target = self:getPosition() + seconds
+        end
+        target = math.max(0, target)
+        self._seek_offset = target
+        if self.is_paused then
+            self._paused_position = target
+            return true
+        end
+        local player = self._android_player
+        if player then
+            player:seekToMs(math.floor(target * 1000))
+            self._play_start_time = UIManager:getTime()
+            self._total_pause_ms = 0
+            return true
+        end
+        return false
+    end
 
     if self.backend == self.BACKENDS.MPV then
         local mode_str = mode == "relative" and "relative" or "absolute"
@@ -2989,7 +3242,11 @@ function MediaEngine:getPosition()
         -- else: fall through to wall-clock below
     end
 
-    -- For backends without IPC (gst-play, aplay, ffmpeg-pipe), estimate from elapsed time.
+    -- Android: use the same wall-clock path as other non-IPC backends.
+    -- Do NOT trust MediaPlayer.getCurrentPosition() alone via JNI (often
+    -- stuck at 0 on Boox).  MediaEngine._play_start_time is real wall time.
+
+    -- For backends without IPC (gst-play, aplay, ffmpeg-pipe, android), estimate from elapsed time.
     -- Scale elapsed real time by playback speed so the reported position tracks the
     -- actual audio position when atempo / speed filters are in use.
     if self._play_start_time then

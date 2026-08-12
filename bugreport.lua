@@ -194,6 +194,8 @@ local function collectPluginInfo(plugin)
         -- so the bundled-binary fields alone make a working setup look
         -- broken (issue #44).  Report the JNI bridge explicitly.
         if Device:isAndroid() then
+            local dex_path = (engine.plugin_dir or _utils_dir:sub(1, -2)) .. "/android/tts_helper.dex"
+            info.has_tts_helper_dex = fileExists(dex_path) and "yes" or "no"
             info.android_tts_bridge = engine._android_tts and "loaded" or "not loaded"
             if engine._android_tts then
                 local ok_st, st = pcall(function() return engine._android_tts:getInitStatus() end)
@@ -225,6 +227,19 @@ local function collectPluginInfo(plugin)
             if info.bt_hci0_address == "" then info.bt_hci0_address = "empty" end
         else
             info.bt_hci0_address = "missing"
+        end
+    end
+
+    -- MediaEngine backend (EPUB overlay / audiobook file playback)
+    local meng = plugin and plugin.media_engine
+    if meng then
+        info.media_backend = meng.backend or "nil (none detected)"
+        info.media_backend_cmd = meng.backend_cmd and sanitizePath(meng.backend_cmd) or "nil"
+        info.media_backend_error = meng.backend_error or "none"
+        if Device:isAndroid() then
+            info.media_android_bridge = (meng._android_player and "player-jni")
+                or (meng._android_tts and "tts-dex")
+                or "not loaded"
         end
     end
 
