@@ -3,7 +3,9 @@ package org.koreader.plugin.audiobook;
 import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioTrack;
 import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Bundle;
@@ -13,6 +15,9 @@ import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -77,6 +82,16 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
      *  thread because getDefaultEngine() is a binder call. */
     private volatile String defaultEnginePackage = null;
 
+    /** When true, pipeline playback uses the persistent PCM streamer instead
+     *  of a per-sentence MediaPlayer (workaround for HALs that tear down
+     *  short MediaPlayer clips mid-sentence, issue #44 Bigme HiBreak/MTK).
+     *  Flipped by Lua: menu setting or session-only stall auto-degrade. */
+    private volatile boolean pcmMode = false;
+    /** Lazily created on the worker thread by startPcmPlayback().  Read on
+     *  the JNI calling thread only through volatile getters inside the
+     *  streamer; all AudioTrack work happens on the streamer's own thread. */
+    private volatile PcmStreamer pcm = null;
+
     public TtsHelper(Context context) {
         workerThread = new HandlerThread("audiobook-tts");
         workerThread.start();
@@ -110,7 +125,8 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                                 if (!pipelineActive || !path.equals(pipelineFile)) {
                                     return;
                                 }
-                                int dur = startPlayback(path);
+                                int dur = pcmMode ? startPcmPlayback(path)
+                                                  : startPlayback(path);
                                 if (dur >= 0) {
                                     pipelineDurationMs = dur;
                                     pipelineStatus = 1;  // playing
@@ -269,6 +285,10 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         worker.post(new Runnable() {
             @Override
             public void run() {
+                if (pcm != null) {
+                    pcm.shutdown();
+                    pcm = null;
+                }
                 if (tts != null) {
                     try { tts.stop(); } catch (Exception ignored) {}
                     try { tts.shutdown(); } catch (Exception ignored) {}
@@ -278,6 +298,27 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 workerThread.quitSafely();
             }
         });
+    }
+
+    /**
+     * Switch pipeline playback between per-sentence MediaPlayer (default)
+     * and the persistent PCM streamer.  JNI entry point: updates volatile
+     * state only; the streamer is created lazily on the worker thread.
+     * Turning the mode off tears the streamer down.
+     */
+    public void setPcmMode(final boolean enabled) {
+        pcmMode = enabled;
+        if (!enabled) {
+            worker.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (pcm != null) {
+                        pcm.shutdown();
+                        pcm = null;
+                    }
+                }
+            });
+        }
     }
 
     // --- Audio focus ---
@@ -515,11 +556,19 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
      * freeze the whole app when the media server wedges (issue #44).
      */
     public boolean isPlaying() {
+        if (pcmMode) {
+            PcmStreamer s = pcm;
+            return s != null && s.isSentencePlaying();
+        }
         return playbackActive;
     }
 
     /** Check if playback finished (completed or error). */
     public boolean isPlaybackDone() {
+        if (pcmMode) {
+            PcmStreamer s = pcm;
+            return s == null || s.isSentenceDone();
+        }
         return playbackDone;
     }
 
@@ -539,6 +588,12 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     /** Stop and release the MediaPlayer.  Runs on the worker thread. */
     private void stopPlaybackInternal() {
+        PcmStreamer s = pcm;
+        if (s != null) {
+            // Cancel the in-flight sentence; the streamer keeps bridging a
+            // few seconds of silence so the mixer never idles mid-session.
+            s.stopSentence();
+        }
         synchronized (mpLock) {
             if (mediaPlayer != null) {
                 // Clear listeners BEFORE release to prevent callbacks from
@@ -567,6 +622,11 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         worker.post(new Runnable() {
             @Override
             public void run() {
+                PcmStreamer s = pcm;
+                if (pcmMode && s != null) {
+                    s.pause();
+                    return;
+                }
                 synchronized (mpLock) {
                     try {
                         if (mediaPlayer != null && playbackActive) {
@@ -584,6 +644,11 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         worker.post(new Runnable() {
             @Override
             public void run() {
+                PcmStreamer s = pcm;
+                if (pcmMode && s != null) {
+                    s.resume();
+                    return;
+                }
                 synchronized (mpLock) {
                     try {
                         if (mediaPlayer != null && !playbackActive) {
@@ -594,5 +659,530 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 }
             }
         });
+    }
+
+    // --- PCM streamer playback (issue #44 workaround) ---
+
+    /** Streamer events reach the helper here.  They run on the streamer's
+     *  writer thread, so they only set volatile fields and post focus work
+     *  to the worker; never any binder or AudioTrack calls inline. */
+    private final PcmStreamer.Listener pcmListener = new PcmStreamer.Listener() {
+        @Override
+        public void onPcmSentenceDone() {
+            playbackDone = true;
+            if (pipelineActive) {
+                pipelineStatus = 2;
+                pipelineActive = false;
+            }
+        }
+
+        @Override
+        public void onPcmSentenceError() {
+            playbackDone = true;
+            if (pipelineActive) {
+                pipelineStatus = 3;
+                pipelineActive = false;
+            }
+        }
+
+        @Override
+        public void onPcmStreamIdle() {
+            // The streamer released its track after the post-sentence
+            // silence bridge lapsed: the session is quiet, drop focus.
+            worker.post(new Runnable() {
+                @Override
+                public void run() {
+                    abandonAudioFocus();
+                }
+            });
+        }
+    };
+
+    /**
+     * Play a WAV file through the persistent PCM streamer.
+     * Runs on the worker thread.  Mirrors startPlayback()'s contract:
+     * returns the clip duration in ms, or -1 on error.
+     */
+    private int startPcmPlayback(String path) {
+        try {
+            PcmStreamer s = pcm;
+            if (s == null) {
+                s = new PcmStreamer(pcmListener, speechAttributes());
+                pcm = s;
+            }
+            s.stopSentence();  // cancel previous (mirrors startPlayback's top)
+            WavData w = parseWav(path);
+            if (w == null) {
+                playbackDone = true;
+                return -1;
+            }
+            requestAudioFocus();
+            playbackDone = false;
+            s.startSentence(w);
+            return w.durationMs;
+        } catch (Exception e) {
+            playbackDone = true;
+            return -1;
+        }
+    }
+
+    /** Parsed PCM payload of a 16-bit RIFF/WAVE file. */
+    private static class WavData {
+        int rate;
+        int channels;
+        int frameBytes;
+        byte[] pcm;
+        int durationMs;
+    }
+
+    private static int le16(byte[] b, int off) {
+        return (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8);
+    }
+
+    private static int le32(byte[] b, int off) {
+        return (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8)
+            | ((b[off + 2] & 0xff) << 16) | ((b[off + 3] & 0xff) << 24);
+    }
+
+    private static boolean tagEq(byte[] b, int off, String tag) {
+        return b[off] == tag.charAt(0) && b[off + 1] == tag.charAt(1)
+            && b[off + 2] == tag.charAt(2) && b[off + 3] == tag.charAt(3);
+    }
+
+    /**
+     * Parse a RIFF/WAVE file into interleaved 16-bit PCM.
+     * Returns null for anything but uncompressed PCM, mono/stereo,
+     * 8-48 kHz: TTS engines emit plain PCM WAVs, and refusing the exotic
+     * cases loudly beats playing garbage.
+     */
+    private static WavData parseWav(String path) {
+        byte[] b;
+        try {
+            File f = new File(path);
+            b = new byte[(int) f.length()];
+            FileInputStream in = new FileInputStream(f);
+            int off = 0;
+            while (off < b.length) {
+                int r = in.read(b, off, b.length - off);
+                if (r < 0) break;
+                off += r;
+            }
+            in.close();
+            if (off < b.length) return null;  // short read
+        } catch (Exception e) {
+            return null;
+        }
+        if (b.length < 44 || !tagEq(b, 0, "RIFF") || !tagEq(b, 8, "WAVE")) {
+            return null;
+        }
+        int fmt = 0, channels = 0, rate = 0, bits = 0;
+        int dataOff = -1, dataLen = 0;
+        int pos = 12;
+        while (pos + 8 <= b.length) {
+            int size = le32(b, pos + 4);
+            if (size < 0) return null;  // corrupt chunk length
+            if (tagEq(b, pos, "fmt ") && size >= 16) {
+                fmt = le16(b, pos + 8);
+                channels = le16(b, pos + 10);
+                rate = le32(b, pos + 12);
+                bits = le16(b, pos + 22);
+            } else if (tagEq(b, pos, "data")) {
+                dataOff = pos + 8;
+                dataLen = Math.min(size, b.length - dataOff);
+                break;
+            }
+            pos += 8 + size + (size & 1);  // chunks are 2-byte aligned
+        }
+        if (fmt != 1 || bits != 16 || (channels != 1 && channels != 2)
+                || rate < 8000 || rate > 48000 || dataOff < 0 || dataLen <= 0) {
+            return null;
+        }
+        WavData w = new WavData();
+        w.rate = rate;
+        w.channels = channels;
+        w.frameBytes = channels * 2;
+        w.pcm = Arrays.copyOfRange(b, dataOff, dataOff + dataLen);
+        w.durationMs = (int) ((long) dataLen * 1000 / ((long) rate * w.frameBytes));
+        return w;
+    }
+
+    /**
+     * Persistent PCM player for the synth-then-play pipeline.
+     *
+     * Why this exists: on some HALs (MTK e-ink, Bigme HiBreak, issue #44)
+     * a per-sentence MediaPlayer clip is torn down ~130-550 ms in, with no
+     * completion and no error: the mixer decides the track is idle and
+     * sleeps, taking the track with it.  The platform speak() path works
+     * on those devices because the engine streams PCM continuously into
+     * one long-lived AudioTrack.  This class mirrors that: one app-owned
+     * AudioTrack, fed by a dedicated writer thread with either sentence
+     * PCM or silence, so the mixer never sees an idle moment mid-session.
+     *
+     * Threading: EVERY AudioTrack call happens on the writer thread.
+     * Other threads (TtsHelper worker, JNI callers) only hand over queue
+     * items under a lock and read volatile state.  All queue item types
+     * are processed strictly in order by the single writer, which keeps
+     * format changes, sentence boundaries, and teardown race-free.
+     *
+     * Track lifecycle: the track exists only while feeding.  After a
+     * sentence ends (played out or cancelled), the writer keeps feeding
+     * silence for LAPSE_MS so inter-sentence gaps (synthesis time, page
+     * turns) never idle the mixer; past that it releases the track and
+     * parks until the next sentence.  Pause releases the track too: a
+     * paused track on these HALs is exactly what gets killed, and the
+     * queue survives the release, so resume simply recreates and
+     * continues where the PCM left off (up to ~0.5 s of already-buffered
+     * tail is skipped on pause, accepted for a workaround mode).
+     */
+    private static class PcmStreamer {
+
+        interface Listener {
+            /** Sentence PCM fully played out (or completed early on
+             *  pause/teardown with only the buffered tail lost). */
+            void onPcmSentenceDone();
+            /** The HAL killed the track mid-sentence; the sentence was
+             *  abandoned so the pipeline can advance to the next one. */
+            void onPcmSentenceError();
+            /** Silence bridge lapsed and the track was released. */
+            void onPcmStreamIdle();
+        }
+
+        /** Silence keep-alive after the last sentence before going idle. */
+        private static final long LAPSE_MS = 8000;
+
+        private final Listener listener;
+        private final AudioAttributes attrs;
+        private final Object lock = new Object();
+        private final ArrayDeque<Object> queue = new ArrayDeque<>();
+        private final Thread thread;
+
+        private volatile boolean running = true;
+        private volatile boolean userPaused = false;
+        /** Set/cleared by the writer thread; read cross-thread via getters. */
+        private volatile boolean sentenceActive = false;
+        private volatile boolean sentenceDone = true;
+        private volatile long sentenceEndFrames = 0;
+
+        // Writer-thread state (single-threaded, no sync needed).
+        private AudioTrack track = null;
+        private int fmtRate = 0, fmtChannels = 0, fmtFrameBytes = 0;
+        private long framesWritten = 0;
+        private long headBase = 0, prevRawHead = 0, headTotal = 0;
+        private long lapseAtMs = 0;
+        private byte[] silence = null;
+        /** Deferred listener event captured inside the lock, fired outside. */
+        private Runnable pendingEvent = null;
+
+        // Queue item types.
+        private static class FmtTag {
+            final int rate, channels, frameBytes;
+            FmtTag(int rate, int channels, int frameBytes) {
+                this.rate = rate;
+                this.channels = channels;
+                this.frameBytes = frameBytes;
+            }
+        }
+        private static class PcmData {
+            final byte[] bytes;
+            PcmData(byte[] bytes) { this.bytes = bytes; }
+        }
+        private static class EndTag {}
+
+        PcmStreamer(Listener listener, AudioAttributes attrs) {
+            this.listener = listener;
+            this.attrs = attrs;
+            thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    writerLoop();
+                }
+            }, "audiobook-pcm");
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        /** Queue one sentence for playback (worker thread). */
+        void startSentence(WavData w) {
+            synchronized (lock) {
+                queue.add(new FmtTag(w.rate, w.channels, w.frameBytes));
+                queue.add(new PcmData(w.pcm));
+                queue.add(new EndTag());
+                sentenceDone = false;
+                lock.notify();
+            }
+        }
+
+        /** Cancel the in-flight sentence; keep bridging silence briefly so
+         *  the mixer stays awake until the next sentence arrives. */
+        void stopSentence() {
+            synchronized (lock) {
+                queue.clear();
+                sentenceActive = false;
+                lapseAtMs = System.currentTimeMillis() + LAPSE_MS;
+                lock.notify();
+            }
+        }
+
+        void pause() {
+            synchronized (lock) {
+                userPaused = true;
+                lock.notify();
+            }
+        }
+
+        void resume() {
+            synchronized (lock) {
+                userPaused = false;
+                lock.notify();
+            }
+        }
+
+        void shutdown() {
+            synchronized (lock) {
+                running = false;
+                userPaused = false;
+                lock.notify();
+            }
+            try { thread.join(800); } catch (InterruptedException ignored) {}
+        }
+
+        boolean isSentencePlaying() {
+            return sentenceActive && !userPaused;
+        }
+
+        boolean isSentenceDone() {
+            return sentenceDone;
+        }
+
+        // --- Writer thread internals (only ever touched by `thread`) ---
+
+        private void writerLoop() {
+            while (true) {
+                Object item;
+                Runnable evt;
+                synchronized (lock) {
+                    while (running && (userPaused || !hasWorkLocked())) {
+                        releaseTrackLocked();  // park releases the track
+                        try { lock.wait(500); } catch (InterruptedException ignored) {}
+                    }
+                    if (!running) {
+                        releaseTrackLocked();
+                        evt = pendingEvent;
+                        pendingEvent = null;
+                        if (evt != null) evt.run();
+                        return;
+                    }
+                    item = queue.poll();
+                    evt = pendingEvent;
+                    pendingEvent = null;
+                }
+                if (evt != null) evt.run();
+                processItem(item);
+                checkSentenceDone();
+            }
+        }
+
+        /** Work exists when a queue item is pending, or the track is alive
+         *  and still inside a sentence or the silence bridge window. */
+        private boolean hasWorkLocked() {
+            if (!queue.isEmpty()) return true;
+            if (track == null) return false;
+            return sentenceActive || System.currentTimeMillis() < lapseAtMs;
+        }
+
+        private void processItem(Object item) {
+            if (item == null) {
+                // Silence feed: only when the track is alive and bridging.
+                if (track != null && silence != null) {
+                    writeFully(silence);
+                }
+                return;
+            }
+            if (item instanceof FmtTag) {
+                FmtTag f = (FmtTag) item;
+                if (f.rate != fmtRate || f.channels != fmtChannels) {
+                    releaseTrack();  // format change: recreate below
+                    fmtRate = f.rate;
+                    fmtChannels = f.channels;
+                    fmtFrameBytes = f.frameBytes;
+                }
+                return;
+            }
+            if (item instanceof PcmData) {
+                if (track == null && fmtRate > 0) {
+                    if (!createTrack()) {
+                        failSentence();
+                        return;
+                    }
+                }
+                writeFully(((PcmData) item).bytes);
+                return;
+            }
+            if (item instanceof EndTag) {
+                // All sentence PCM is written by queue order; the sentence
+                // is done once the head passes what we have written.
+                sentenceEndFrames = framesWritten;
+                sentenceActive = true;
+            }
+        }
+
+        private void writeFully(byte[] buf) {
+            int off = 0;
+            while (off < buf.length && running) {
+                int w;
+                try {
+                    w = track.write(buf, off, buf.length - off);
+                } catch (Exception e) {
+                    w = -1;
+                }
+                if (w < 0) {
+                    // DEAD_OBJECT etc: the HAL killed our track out from
+                    // under us (the failure mode this class works around
+                    // for MediaPlayer can still hit a raw track).
+                    releaseTrack();
+                    if (sentenceActive) {
+                        failSentence();
+                    } else if (fmtRate > 0) {
+                        createTrack();  // silence feed: recreate and carry on
+                    }
+                    return;
+                }
+                off += w;
+                framesWritten += w / fmtFrameBytes;
+            }
+        }
+
+        private void checkSentenceDone() {
+            if (track == null) return;
+            long r;
+            try {
+                r = track.getPlaybackHeadPosition() & 0xffffffffL;
+            } catch (Exception e) {
+                return;
+            }
+            if (r < prevRawHead) headBase += 1L << 32;  // 32-bit head wrap
+            prevRawHead = r;
+            headTotal = headBase + r;
+            if (sentenceActive && headTotal >= sentenceEndFrames) {
+                sentenceActive = false;
+                sentenceDone = true;
+                lapseAtMs = System.currentTimeMillis() + LAPSE_MS;
+                listener.onPcmSentenceDone();
+            }
+        }
+
+        /** Abandon the in-flight sentence after a track failure so the
+         *  pipeline advances instead of stalling. */
+        private void failSentence() {
+            synchronized (lock) {
+                queue.clear();
+            }
+            sentenceActive = false;
+            sentenceDone = true;
+            listener.onPcmSentenceError();
+        }
+
+        private boolean createTrack() {
+            int cfg = (fmtChannels == 2)
+                ? AudioFormat.CHANNEL_OUT_STEREO : AudioFormat.CHANNEL_OUT_MONO;
+            int minBuf = AudioTrack.getMinBufferSize(
+                fmtRate, cfg, AudioFormat.ENCODING_PCM_16BIT);
+            if (minBuf <= 0) return false;
+            // ~0.5 s: enough slack to ride out e-ink refresh stalls, small
+            // enough that the pause-time tail skip stays short.
+            int bufSize = Math.max(minBuf, fmtRate * fmtFrameBytes / 2);
+            try {
+                if (Build.VERSION.SDK_INT >= 23) {
+                    track = new AudioTrack.Builder()
+                        .setAudioAttributes(attrs)
+                        .setAudioFormat(new AudioFormat.Builder()
+                            .setSampleRate(fmtRate)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(cfg)
+                            .build())
+                        .setBufferSizeInBytes(bufSize)
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build();
+                } else {
+                    track = new AudioTrack(AudioManager.STREAM_ACCESSIBILITY,
+                        fmtRate, cfg, AudioFormat.ENCODING_PCM_16BIT,
+                        bufSize, AudioTrack.MODE_STREAM);
+                }
+                if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+                    releaseTrack();
+                    return false;
+                }
+                framesWritten = 0;
+                headBase = 0;
+                prevRawHead = 0;
+                headTotal = 0;
+                int silenceBytes = Math.max(fmtRate * fmtFrameBytes / 10,
+                    fmtFrameBytes * 64);
+                silence = new byte[silenceBytes];  // zero-filled
+                track.play();
+                return true;
+            } catch (Exception e) {
+                releaseTrack();
+                return false;
+            }
+        }
+
+        private void releaseTrack() {
+            synchronized (lock) {
+                releaseTrackLocked();
+            }
+            Runnable evt;
+            synchronized (lock) {
+                evt = pendingEvent;
+                pendingEvent = null;
+            }
+            if (evt != null) evt.run();
+        }
+
+        /** Lock-held teardown.  If a sentence was mid-flight its target is
+         *  now meaningless; complete it early so the pipeline advances
+         *  (only the buffered tail is lost, e.g. on pause).  The event is
+         *  deferred: listeners must not run inside the lock. */
+        private void releaseTrackLocked() {
+            if (track != null) {
+                try { track.pause(); } catch (Exception ignored) {}
+                try { track.flush(); } catch (Exception ignored) {}
+                try { track.stop(); } catch (Exception ignored) {}
+                try { track.release(); } catch (Exception ignored) {}
+                track = null;
+                silence = null;
+                if (sentenceActive) {
+                    sentenceActive = false;
+                    sentenceDone = true;
+                    pendingEvent = new Runnable() {
+                        @Override
+                        public void run() {
+                            listener.onPcmSentenceDone();
+                        }
+                    };
+                }
+                // Going fully quiet (lapse or park) ends the focus session.
+                if (System.currentTimeMillis() >= lapseAtMs) {
+                    pendingEvent = chain(pendingEvent, new Runnable() {
+                        @Override
+                        public void run() {
+                            listener.onPcmStreamIdle();
+                        }
+                    });
+                }
+            }
+        }
+
+        private Runnable chain(Runnable a, Runnable b) {
+            if (a == null) return b;
+            final Runnable first = a, second = b;
+            return new Runnable() {
+                @Override
+                public void run() {
+                    first.run();
+                    second.run();
+                }
+            };
+        }
     }
 }
