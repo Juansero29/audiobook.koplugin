@@ -673,6 +673,10 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     if not self.media_engine:load(audio_path) then
         logger.err("MediaSync: failed to load audio", audio_path)
         self.state = self.STATE.STOPPED
+        local err = self.media_engine and self.media_engine.backend_error
+        if err then
+            UIManager:show(InfoMessage:new{ text = err, timeout = 8 })
+        end
         return false
     end
 
@@ -1530,8 +1534,15 @@ function MediaSync:_startPositionPoller(gen)
         end
 
         -- Update progress bar
-        if dur and dur > 0 and pos then
-            local pct = math.floor((pos / dur) * 100)
+        local bar_pos, bar_dur = pos, dur
+        if self.overlay_mode then
+            local ch_pos, ch_dur = self:_overlayChapterProgress(pos)
+            if ch_pos and ch_dur and ch_dur > 0 then
+                bar_pos, bar_dur = ch_pos, ch_dur
+            end
+        end
+        if bar_dur and bar_dur > 0 and bar_pos then
+            local pct = math.floor((bar_pos / bar_dur) * 100)
             if pct ~= self._last_progress_pct then
                 self._last_progress_pct = pct
                 if self.playback_bar then
@@ -1544,8 +1555,9 @@ function MediaSync:_startPositionPoller(gen)
 
         -- Update time display
         if self.playback_bar then
+            local display_pos, display_dur = bar_pos or 0, bar_dur or 0
             pcall(function()
-                self.playback_bar:updateTimeDisplay(pos or 0, dur or 0)
+                self.playback_bar:updateTimeDisplay(display_pos, display_dur)
             end)
             -- Update chapter title (overlay: SMIL chapter across audio parts)
             local ok_ch, ch, ch_idx = pcall(function() return self:getCurrentChapter() end)
@@ -2220,6 +2232,94 @@ function MediaSync:getCurrentChapter()
         end
     end
     return self.chapters[1], 1
+end
+
+--- Position/duration within the current SMIL chapter (seconds).
+--- A Storyteller chapter (content document) can span several ~5 min audio
+--- parts; sum those segments so the scrubber shows the full chapter.
+function MediaSync:_overlayChapterProgress(pos)
+    pos = tonumber(pos) or 0
+    local ch, idx = self:_resolveOverlayChapter()
+    if not ch then return nil, nil end
+
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or #chapters == 0 then return nil, nil end
+
+    local key = ch.text_doc or ch.title
+    if not key then return nil, nil end
+
+    -- Collect every overlay-chapter row that belongs to this content chapter,
+    -- in playlist/audio order.
+    local segments = {}
+    for i, c in ipairs(chapters) do
+        local ckey = c.text_doc or c.title
+        if ckey == key then
+            local start_t = tonumber(c.start_time) or 0
+            local end_t = nil
+            -- End = next chapter boundary on the same audio file…
+            for j = i + 1, #chapters do
+                if chapters[j].audio_path == c.audio_path then
+                    end_t = tonumber(chapters[j].start_time)
+                    break
+                end
+            end
+            -- …or last timing entry for this doc on that file.
+            if not end_t then
+                local by_file = self.plugin and self.plugin._smil_by_file
+                local slot = by_file and c.audio_path and by_file[c.audio_path]
+                local timing = (slot and slot.timing) or self.timing_data
+                if timing then
+                    for k = #timing, 1, -1 do
+                        local e = timing[k]
+                        if (not c.text_doc or e.text_doc == c.text_doc)
+                            and (not e.audio_path or e.audio_path == c.audio_path) then
+                            end_t = tonumber(e.end_time) or tonumber(e.start_time)
+                            break
+                        end
+                    end
+                end
+            end
+            if not end_t then
+                end_t = start_t + 1
+            end
+            table.insert(segments, {
+                audio_path = c.audio_path,
+                start_time = start_t,
+                end_time = end_t,
+                dur = math.max(0.1, end_t - start_t),
+                idx = i,
+            })
+        end
+    end
+    if #segments == 0 then return nil, nil end
+
+    local total = 0
+    for _, s in ipairs(segments) do total = total + s.dur end
+
+    local current_path = self.media_engine and self.media_engine.current_path
+    local path_order = {}
+    if self.playlist_files then
+        for pi, f in ipairs(self.playlist_files) do
+            path_order[f.path] = pi
+        end
+    end
+    local cur_order = (current_path and path_order[current_path]) or 0
+
+    local ch_pos = 0
+    for _, s in ipairs(segments) do
+        local seg_order = (s.audio_path and path_order[s.audio_path]) or 0
+        if s.audio_path == current_path then
+            ch_pos = ch_pos + math.max(0, math.min(pos - s.start_time, s.dur))
+            break
+        elseif seg_order > 0 and cur_order > 0 and seg_order < cur_order then
+            ch_pos = ch_pos + s.dur
+        elseif cur_order == 0 and s.idx < (idx or 1) then
+            ch_pos = ch_pos + s.dur
+        end
+    end
+
+    ch_pos = math.max(0, math.min(ch_pos, total))
+    return ch_pos, total
 end
 
 return MediaSync

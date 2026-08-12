@@ -54,6 +54,31 @@ function EpubMediaOverlay:_escapeUnzipMember(path)
     return path:gsub("%[", "[[]")
 end
 
+--- Quote an argument for POSIX sh: single quotes make the whole string
+-- literal, with the standard '\'' escape for embedded quotes. Never build
+-- a shell command with double-quote-and-escape: $(), backticks and friends
+-- stay live inside double quotes, and archive member paths come straight
+-- from book content.
+function EpubMediaOverlay:_quoteShell(arg)
+    return "'" .. tostring(arg or ""):gsub("'", "'\\''") .. "'"
+end
+
+--- Archive member paths reach shell commands (unzip -p/-o) as arguments.
+-- A malicious EPUB could otherwise smuggle shell metacharacters or ".."
+-- traversal into the SMIL audio/text src values, and on Kindle KOReader
+-- runs as root. Reject anything that is not a plain relative path.
+function EpubMediaOverlay:_validateZipMember(path)
+    if not path or path == "" then return false end
+    if path:sub(1, 1) == "/" then return false end
+    -- No control characters at all (covers newlines, $() separators, etc.)
+    if path:find("%c") then return false end
+    -- No "." or ".." path segments
+    for segment in path:gmatch("[^/]+") do
+        if segment == "." or segment == ".." then return false end
+    end
+    return true
+end
+
 --- Pretty-printed XML puts newlines inside elements; collapse tag boundaries
 -- so legacy `(.-)` patterns still work if RE_ANY_LAZY ever fails on-device.
 function EpubMediaOverlay:_compactXml(xml)
@@ -77,8 +102,8 @@ function EpubMediaOverlay:_epubFingerprint(epub_path)
         end
     end
     local out = self:_runCommand(string.format(
-        'stat -c "%%s:%%Y" "%s" 2>/dev/null || stat -f "%%z:%%m" "%s" 2>/dev/null',
-        epub_path:gsub('"', '\\"'), epub_path:gsub('"', '\\"')))
+        'stat -c "%%s:%%Y" %s 2>/dev/null || stat -f "%%z:%%m" %s 2>/dev/null',
+        self:_quoteShell(epub_path), self:_quoteShell(epub_path)))
     if out then
         local fp = out:match("(%d+:%d+)")
         if fp then return fp end
@@ -175,11 +200,16 @@ end
 
 function EpubMediaOverlay:_extractFromZip(epub_path, internal_path)
     -- Extract a single file from the EPUB using unzip
+    if not self:_validateZipMember(internal_path) then
+        logger.warn("EpubMediaOverlay: refusing unsafe archive member path",
+            tostring(internal_path))
+        return nil
+    end
     local zip_member = self:_escapeUnzipMember(internal_path)
     local cmd = string.format(
-        'unzip -p "%s" "%s"',
-        epub_path:gsub('"', '\\"'),
-        zip_member:gsub('"', '\\"')
+        'unzip -p %s %s',
+        self:_quoteShell(epub_path),
+        self:_quoteShell(zip_member)
     )
     return self:_runCommand(cmd)
 end
@@ -432,6 +462,11 @@ function EpubMediaOverlay:_extractAudioFile(epub_path, internal_path, cache_dir)
     -- handful of distinct audio files), and the old check against only the
     -- flattened name made every single entry re-extract its multi-MB audio
     -- file from the zip.
+    if not self:_validateZipMember(internal_path) then
+        logger.warn("EpubMediaOverlay: refusing unsafe audio path",
+            tostring(internal_path))
+        return nil
+    end
     local extracted = cache_dir .. "/" .. internal_path
     if self:_fileExists(extracted) then
         return extracted
@@ -445,10 +480,10 @@ function EpubMediaOverlay:_extractAudioFile(epub_path, internal_path, cache_dir)
     -- Extract the file
     local zip_member = self:_escapeUnzipMember(internal_path)
     local cmd = string.format(
-        'unzip -o "%s" "%s" -d "%s" >/dev/null 2>&1',
-        epub_path:gsub('"', '\\"'),
-        zip_member:gsub('"', '\\"'),
-        cache_dir:gsub('"', '\\"')
+        'unzip -o %s %s -d %s >/dev/null 2>&1',
+        self:_quoteShell(epub_path),
+        self:_quoteShell(zip_member),
+        self:_quoteShell(cache_dir)
     )
     os.execute(cmd)
 
@@ -649,12 +684,12 @@ function EpubMediaOverlay:getCacheDir()
 end
 
 function EpubMediaOverlay:cleanupOldCaches(plugin_dir, max_age_days)
-    max_age_days = max_age_days or 7
+    max_age_days = tonumber(max_age_days) or 7
     local cache_root = plugin_dir .. "/cache/overlays"
     -- Find directories older than max_age_days and remove them
     local cmd = string.format(
-        'find "%s" -maxdepth 1 -type d -mtime +%d -exec rm -rf {} + 2>/dev/null',
-        cache_root:gsub('"', '\\"'),
+        'find %s -maxdepth 1 -type d -mtime +%d -exec rm -rf {} + 2>/dev/null',
+        self:_quoteShell(cache_root),
         max_age_days
     )
     os.execute(cmd)

@@ -16,6 +16,19 @@ local logger = require("logger")
 
 local AndroidTts = {}
 
+--- io.open can fail on Android for plugin paths; fall back to lfs.attributes.
+--- Never shell out: a path with shell metacharacters must not reach sh.
+local function fileExists(path)
+    if not path or path == "" then return false end
+    local f = io.open(path, "r")
+    if f then f:close() return true end
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok and lfs then
+        return lfs.attributes(path, "mode") ~= nil
+    end
+    return false
+end
+
 function AndroidTts:new(o)
     o = o or {}
     setmetatable(o, self)
@@ -47,6 +60,22 @@ local function checkException(env)
     return false
 end
 
+--- LuaJIT treats a NULL cdata pointer as truthy.  Convert failed GetMethodID
+--- results to real nil so callers never Call*Method with a null jmethodID
+--- (that hard-crashes the Android process).
+local function getMethod(env, clazz, name, sig)
+    local mid = env[0].GetMethodID(env, clazz, name, sig)
+    if checkException(env) or mid == nil then
+        return nil
+    end
+    -- Explicit NULL-pointer check for LuaJIT FFI jmethodID
+    local ok, nullish = pcall(function()
+        return tonumber(ffi.cast("intptr_t", mid)) == 0
+    end)
+    if ok and nullish then return nil end
+    return mid
+end
+
 --[[--
 Initialize the Android TTS engine.
 Loads the helper .dex via DexClassLoader and creates a TtsHelper instance.
@@ -68,22 +97,33 @@ function AndroidTts:init()
     end
     self._android = android
 
-    -- Check that the .dex helper file exists (with fallback to this file's dir)
-    local dex_path = self.plugin_dir .. "/android/tts_helper.dex"
-    local f = io.open(dex_path, "r")
-    if not f then
-        local fallback_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "."
+    -- Locate tts_helper.dex (plugin dir, then this file's dir).
+    local dex_path = nil
+    local plugin_dir = (self.plugin_dir or "."):gsub("//+", "/"):gsub("/+$", "")
+    local candidates = {
+        plugin_dir .. "/android/tts_helper.dex",
+    }
+    local fallback_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$")
+    if fallback_dir then
         fallback_dir = fallback_dir:gsub("//+", "/"):gsub("/+$", "")
-        dex_path = fallback_dir .. "/android/tts_helper.dex"
-        f = io.open(dex_path, "r")
-        if not f then
-            logger.err("AndroidTts: tts_helper.dex not found. Checked plugin_dir:", self.plugin_dir, "and fallback:", fallback_dir)
-            return false
-        end
-        -- Update plugin_dir so subsequent path lookups also work
-        self.plugin_dir = fallback_dir
+        table.insert(candidates, fallback_dir .. "/android/tts_helper.dex")
     end
-    f:close()
+    for _, candidate in ipairs(candidates) do
+        if fileExists(candidate) then
+            dex_path = candidate
+            if candidate:find(plugin_dir, 1, true) == 1 then
+                self.plugin_dir = plugin_dir
+            elseif fallback_dir then
+                self.plugin_dir = fallback_dir
+            end
+            break
+        end
+    end
+    if not dex_path then
+        logger.err("AndroidTts: tts_helper.dex not found. Checked:",
+            table.concat(candidates, ", "))
+        return false
+    end
 
     -- Resolve the cache directory for DexClassLoader's optimized dex output
     -- and for WAV file storage.
@@ -93,8 +133,16 @@ function AndroidTts:init()
         return false
     end
     self._cache_dir = cache_dir
-    -- Ensure the audiobook cache subdirectory exists
-    os.execute('mkdir -p "' .. cache_dir .. '/audiobook"')
+    -- Ensure the audiobook cache subdirectory exists (lfs.mkdir, no shell:
+    -- the path comes from the Android runtime and must not be interpolated).
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok_lfs and lfs then
+        lfs.mkdir(cache_dir .. "/audiobook")
+    end
+
+    -- Load the .dex from the plugin folder (proven path on Boox).  cache_dir
+    -- is only passed to DexClassLoader as the optimized-dex output dir.
+    -- Do NOT io.open(..., "rb") here — KOReader Lua on Android can hard-crash.
 
     -- Load the helper via DexClassLoader inside a JNI context
     local load_ok = false
@@ -187,49 +235,58 @@ function AndroidTts:init()
             return
         end
 
-        -- 5. Cache method IDs (valid as long as the class is loaded)
-        self._method.getInitStatus = env[0].GetMethodID(env, helper_class,
+        -- 5. Cache method IDs (valid as long as the class is loaded).
+        -- Use getMethod() so missing methods become Lua nil (not NULL cdata).
+        self._method.getInitStatus = getMethod(env, helper_class,
             "getInitStatus", "()I")
-        self._method.synthesizeToFile = env[0].GetMethodID(env, helper_class,
+        self._method.synthesizeToFile = getMethod(env, helper_class,
             "synthesizeToFile", "(Ljava/lang/String;Ljava/lang/String;)I")
-        self._method.getSynthStatus = env[0].GetMethodID(env, helper_class,
+        self._method.getSynthStatus = getMethod(env, helper_class,
             "getSynthStatus", "()I")
-        self._method.setRate = env[0].GetMethodID(env, helper_class,
+        self._method.setRate = getMethod(env, helper_class,
             "setRate", "(F)V")
-        self._method.setPitch = env[0].GetMethodID(env, helper_class,
+        self._method.setPitch = getMethod(env, helper_class,
             "setPitch", "(F)V")
-        self._method.setLanguage = env[0].GetMethodID(env, helper_class,
+        self._method.setLanguage = getMethod(env, helper_class,
             "setLanguage", "(Ljava/lang/String;)I")
-        self._method.shutdown = env[0].GetMethodID(env, helper_class,
+        self._method.shutdown = getMethod(env, helper_class,
             "shutdown", "()V")
-        self._method.playFile = env[0].GetMethodID(env, helper_class,
+        self._method.playFile = getMethod(env, helper_class,
             "playFile", "(Ljava/lang/String;)I")
-        self._method.isPlaying = env[0].GetMethodID(env, helper_class,
+        self._method.isPlaying = getMethod(env, helper_class,
             "isPlaying", "()Z")
-        self._method.isPlaybackDone = env[0].GetMethodID(env, helper_class,
+        self._method.isPlaybackDone = getMethod(env, helper_class,
             "isPlaybackDone", "()Z")
-        self._method.stopPlayback = env[0].GetMethodID(env, helper_class,
+        self._method.stopPlayback = getMethod(env, helper_class,
             "stopPlayback", "()V")
-        self._method.pausePlayback = env[0].GetMethodID(env, helper_class,
+        self._method.pausePlayback = getMethod(env, helper_class,
             "pausePlayback", "()V")
-        self._method.resumePlayback = env[0].GetMethodID(env, helper_class,
+        self._method.resumePlayback = getMethod(env, helper_class,
             "resumePlayback", "()V")
         -- Pipeline methods (synth-then-play with audio focus)
-        self._method.synthesizeAndPlay = env[0].GetMethodID(env, helper_class,
+        self._method.synthesizeAndPlay = getMethod(env, helper_class,
             "synthesizeAndPlay", "(Ljava/lang/String;Ljava/lang/String;)I")
-        self._method.getPipelineStatus = env[0].GetMethodID(env, helper_class,
+        self._method.getPipelineStatus = getMethod(env, helper_class,
             "getPipelineStatus", "()I")
-        self._method.getPipelineDurationMs = env[0].GetMethodID(env, helper_class,
+        self._method.getPipelineDurationMs = getMethod(env, helper_class,
             "getPipelineDurationMs", "()I")
-        self._method.stopPipeline = env[0].GetMethodID(env, helper_class,
+        self._method.stopPipeline = getMethod(env, helper_class,
             "stopPipeline", "()V")
-        self._method.getDefaultEngine = env[0].GetMethodID(env, helper_class,
+        self._method.getDefaultEngine = getMethod(env, helper_class,
             "getDefaultEngine", "()Ljava/lang/String;")
-        self._method.setPcmMode = env[0].GetMethodID(env, helper_class,
+        -- Optional methods (newer tts_helper.dex).  Nil when absent — never
+        -- leave a NULL jmethodID in the table (LuaJIT NULL is truthy).
+        self._method.seekToMs = getMethod(env, helper_class,
+            "seekToMs", "(I)V")
+        self._method.playMediaFile = getMethod(env, helper_class,
+            "playMediaFile", "(Ljava/lang/String;)I")
+        self._method.setPcmMode = getMethod(env, helper_class,
             "setPcmMode", "(Z)V")
 
-        if checkException(env) then
-            logger.err("AndroidTts: Failed to resolve one or more method IDs")
+        if not self._method.getInitStatus
+            or not self._method.playFile
+            or not self._method.isPlaying then
+            logger.err("AndroidTts: Failed to resolve required method IDs")
             env[0].DeleteLocalRef(env, helper_obj)
             env[0].DeleteLocalRef(env, helper_class)
             return
@@ -422,6 +479,16 @@ function AndroidTts:setLanguage(lang)
     end)
 end
 
+--- True when the loaded dex exposes playMediaFile (newer builds).
+function AndroidTts:hasPlayMediaFile()
+    return self._method.playMediaFile ~= nil
+end
+
+--- True when the loaded dex exposes seekToMs (newer builds).
+function AndroidTts:hasSeekToMs()
+    return self._method.seekToMs ~= nil
+end
+
 --[[--
 Play a WAV file through Android's MediaPlayer.
 @param path string  WAV file path
@@ -438,6 +505,27 @@ function AndroidTts:playFile(path)
         env[0].DeleteLocalRef(env, j_path)
         if checkException(env) then
             logger.err("AndroidTts: playFile threw exception")
+            return -1
+        end
+        return result
+    end)
+end
+
+--- Play a pre-recorded audiobook file (mp3/m4b) via the media audio stream.
+function AndroidTts:playMediaFile(path)
+    if not self._initialized or not self._helper_ref then return -1 end
+    if not self._method.playMediaFile then
+        return self:playFile(path)
+    end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local j_path = env[0].NewStringUTF(env, path)
+        local result = env[0].CallIntMethod(env,
+            self._helper_ref, self._method.playMediaFile, j_path)
+        env[0].DeleteLocalRef(env, j_path)
+        if checkException(env) then
+            logger.err("AndroidTts: playMediaFile threw exception")
             return -1
         end
         return result
@@ -508,6 +596,21 @@ function AndroidTts:resumePlayback()
     android.jni:context(android.app.activity.vm, function(jni)
         jni.env[0].CallVoidMethod(jni.env,
             self._helper_ref, self._method.resumePlayback)
+    end)
+end
+
+--- Seek active MediaPlayer playback (ms). Requires tts_helper.dex with seekToMs.
+function AndroidTts:seekToMs(msec)
+    if not self._initialized or not self._helper_ref then return end
+    if not self._method.seekToMs then return end
+    msec = math.floor(tonumber(msec) or 0)
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local args = ffi.new("jvalue[1]")
+        args[0].i = msec
+        env[0].CallVoidMethodA(env,
+            self._helper_ref, self._method.seekToMs, args)
     end)
 end
 
@@ -612,6 +715,9 @@ that tear down short MediaPlayer clips mid-sentence with no completion
 --]]
 function AndroidTts:setPcmMode(enabled)
     if not self._initialized or not self._helper_ref then return end
+    -- Optional method: absent on older tts_helper.dex builds. Calling a
+    -- NULL jmethodID (truthy in LuaJIT) hard-crashes the process.
+    if not self._method.setPcmMode then return end
     local android = self._android
     android.jni:context(android.app.activity.vm, function(jni)
         local env = jni.env
