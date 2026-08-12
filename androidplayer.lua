@@ -62,6 +62,9 @@ function AndroidPlayer:new(o)
     o._pause_wall_start = nil
     o._ever_confirmed_playing = false
     o._last_mp_pos_ms = 0
+    o._audio_started = false
+    o._mp_baseline_ms = nil
+    o._mp_stuck_reads = 0
     return o
 end
 
@@ -173,6 +176,9 @@ function AndroidPlayer:_releasePlayer()
     self._mp_ref = nil
     self._playing = false
     self._paused = false
+    self._audio_started = false
+    self._mp_baseline_ms = nil
+    self._mp_stuck_reads = 0
     android.jni:context(android.app.activity.vm, function(jni)
         local env = jni.env
         pcall(function()
@@ -270,12 +276,80 @@ function AndroidPlayer:play(path, seek_ms)
         self._wall_start = UIManager:getTime()
         self._pause_accum_ms = 0
         self._pause_wall_start = nil
-        self._ever_confirmed_playing = true
+        self._ever_confirmed_playing = false
         self._last_mp_pos_ms = self._start_seek_ms
+        self._audio_started = false
+        self._mp_baseline_ms = nil
+        self._mp_stuck_reads = 0
         logger.warn("AndroidPlayer: playing", path,
             "seek_ms=", seek_ms, "duration_ms=", self._duration_ms)
     end
     return ok
+end
+
+function AndroidPlayer:_queryMpPositionMs()
+    if not self._mp_ref or not self._method.getCurrentPosition then return nil end
+    local android = self._android
+    local pos = android.jni:context(android.app.activity.vm, function(jni)
+        local p = jni.env[0].CallIntMethod(jni.env,
+            self._mp_ref, self._method.getCurrentPosition)
+        if checkException(jni.env) then return nil end
+        return tonumber(p)
+    end)
+    if pos == nil then return nil end
+    return math.max(0, math.floor(pos))
+end
+
+function AndroidPlayer:_reanchorWallToMs(pos_ms)
+    pos_ms = math.floor(tonumber(pos_ms) or 0)
+    self._wall_start = UIManager:getTime()
+    self._start_seek_ms = pos_ms
+    self._pause_accum_ms = 0
+    self._pause_wall_start = nil
+    self._last_mp_pos_ms = pos_ms
+end
+
+--- True once MediaPlayer position has moved past startup buffering.
+function AndroidPlayer:_confirmAudioStarted(mp)
+    if self._audio_started then return true end
+    if mp == nil then return false end
+
+    if self._mp_baseline_ms == nil then
+        self._mp_baseline_ms = mp
+    end
+
+    local seek = self._start_seek_ms or 0
+    local advanced = mp > (self._mp_baseline_ms or 0) + 40
+        or mp > seek + 40
+
+    if advanced then
+        self._audio_started = true
+        self._ever_confirmed_playing = true
+        self:_reanchorWallToMs(mp)
+        return true
+    end
+
+    -- MP reports the seek point but never ticks (common JNI quirk on some devices).
+    if self._wall_start and mp ~= nil and mp >= seek - 80 then
+        local wait_ms = time.to_ms(UIManager:getTime() - self._wall_start)
+        if wait_ms > 600 then
+            self._audio_started = true
+            self._ever_confirmed_playing = true
+            self:_reanchorWallToMs(seek)
+            return true
+        end
+    end
+
+    -- Fallback: wall clock ran far ahead while MP never ticked (flaky JNI).
+    if self._wall_start then
+        local wait_ms = time.to_ms(UIManager:getTime() - self._wall_start)
+        if wait_ms > 2500 then
+            self._audio_started = true
+            self._ever_confirmed_playing = true
+            return true
+        end
+    end
+    return false
 end
 
 function AndroidPlayer:_wallPositionMs()
@@ -319,12 +393,18 @@ function AndroidPlayer:resume()
     end
     self._paused = false
     self._playing = true
+    self._audio_started = false
+    self._mp_baseline_ms = nil
+    self._mp_stuck_reads = 0
 end
 
 function AndroidPlayer:stop()
     self:_releasePlayer()
     self._wall_start = nil
     self._ever_confirmed_playing = false
+    self._audio_started = false
+    self._mp_baseline_ms = nil
+    self._mp_stuck_reads = 0
 end
 
 function AndroidPlayer:seekToMs(msec)
@@ -343,11 +423,55 @@ function AndroidPlayer:seekToMs(msec)
     self._pause_accum_ms = 0
     self._pause_wall_start = nil
     self._last_mp_pos_ms = msec
+    self._audio_started = false
+    self._mp_baseline_ms = nil
+    self._mp_stuck_reads = 0
 end
 
---- Position for completion checks (wall-clock; JNI getCurrentPosition is flaky).
+--- Position for sync and completion.  Prefer MediaPlayer.getCurrentPosition()
+--- once playback has actually started; hold at the seek point during startup
+--- buffering so highlights do not race ahead of audible audio.
 function AndroidPlayer:getPositionMs()
-    return self:_wallPositionMs()
+    if self._paused then
+        return self:_wallPositionMs()
+    end
+
+    local seek = self._start_seek_ms or 0
+    local mp = self:_queryMpPositionMs()
+
+    if not self:_confirmAudioStarted(mp) then
+        return seek
+    end
+
+    if mp ~= nil then
+        if mp >= (self._last_mp_pos_ms or 0) - 120 then
+            if mp == self._last_mp_pos_ms then
+                self._mp_stuck_reads = (self._mp_stuck_reads or 0) + 1
+            else
+                self._mp_stuck_reads = 0
+            end
+            self._last_mp_pos_ms = mp
+
+            local wall = self:_wallPositionMs()
+            if wall > mp + 250 then
+                self:_reanchorWallToMs(mp)
+            end
+            return mp
+        end
+
+        -- MP jumped backward (seek/race): trust it and re-anchor.
+        if mp + 120 < (self._last_mp_pos_ms or 0) then
+            self:_reanchorWallToMs(mp)
+            return mp
+        end
+    end
+
+    -- MP unreadable or stuck for many polls: fall back to wall clock.
+    if (self._mp_stuck_reads or 0) > 8 then
+        return self:_wallPositionMs()
+    end
+
+    return self._last_mp_pos_ms or seek
 end
 
 function AndroidPlayer:getDurationMs()

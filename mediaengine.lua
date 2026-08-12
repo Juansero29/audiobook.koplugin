@@ -1331,7 +1331,10 @@ function MediaEngine:_playAndroid(gen)
         self.current_duration = dur_ms / 1000
     end
 
-    self._android_playback_confirmed = true
+    self._android_playback_confirmed = false
+    -- Small BT/output chain lag; sync loop subtracts this from position.
+    self.position_latency_s = 0.15
+
     logger.warn("MediaEngine: Android play", self.current_path,
         "offset=", offset, "duration=", self.current_duration)
 
@@ -1354,22 +1357,26 @@ function MediaEngine:_startAndroidCompletionWatcher(gen)
         end
         poll_count = poll_count + 1
         if poll_count == 15 and not self._android_playback_confirmed then
-            -- Only fail if MediaPlayer never produced a progressing position.
-            local pos_ms = player:getPositionMs() or 0
-            local start_ms = math.floor((self._seek_offset or 0) * 1000)
-            if pos_ms <= start_ms + 100 then
-                logger.err("MediaEngine: Android playback failed to start")
-                self.is_playing = false
-                if self._on_fail then
-                    local cb = self._on_fail
-                    self._on_fail = nil
-                    cb("android playback failed to start")
+            if player._ever_confirmed_playing or player._audio_started then
+                self._android_playback_confirmed = true
+            else
+                -- Only fail if MediaPlayer never produced a progressing position.
+                local pos_ms = player:getPositionMs() or 0
+                local start_ms = math.floor((self._seek_offset or 0) * 1000)
+                if pos_ms <= start_ms + 100 then
+                    logger.err("MediaEngine: Android playback failed to start")
+                    self.is_playing = false
+                    if self._on_fail then
+                        local cb = self._on_fail
+                        self._on_fail = nil
+                        cb("android playback failed to start")
+                    end
+                    return
                 end
-                return
+                self._android_playback_confirmed = true
             end
-            self._android_playback_confirmed = true
         end
-        if player:isPlaying() then
+        if player:isPlaying() or player._ever_confirmed_playing then
             self._android_playback_confirmed = true
         end
         if player:isPlaybackDone() then
@@ -3216,6 +3223,14 @@ function MediaEngine:getPosition()
     -- Kindle A2DP pause-halt: pipeline is gone; hold the saved pause position.
     if self.is_paused and self._paused_position ~= nil then
         return self._paused_position
+    end
+
+    -- Android: MediaPlayer position (startup hold + MP re-anchor in AndroidPlayer).
+    if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        local pos_ms = self._android_player:getPositionMs()
+        if pos_ms then
+            return pos_ms / 1000
+        end
     end
 
     -- ffmpeg -progress backed position (EPUB read-along path): anchored to the
