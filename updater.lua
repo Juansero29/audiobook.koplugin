@@ -58,7 +58,9 @@ local REPO = "stradichenko/audiobook.koplugin"
 local API_URL = "https://api.github.com/repos/" .. REPO .. "/releases/latest"
 
 -- Resolve the plugin directory from this file's location.
-local _dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+-- Collapse repeated slashes: if the loader path already ended with one,
+-- the chunk path contains "//" and a naive parent-directory match fails.
+local _dir = (debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"):gsub("//+", "/")
 
 --- Read the currently installed version from _meta.lua.
 -- @treturn string version string (e.g. "0.1.5.55")
@@ -389,7 +391,7 @@ function Updater._performUpdate(plugin, release)
     -- downloads live on the internal SD card and cross-filesystem moves
     -- are avoided (issue #23).
     if Device:isKobo() then
-        local parent = _dir:gsub("/$", ""):match("^(.+)/[^/]+$")
+        local parent = _dir:gsub("/+$", ""):match("^(.+)/[^/]+$")
         if parent then
             tmp_dir = parent
         end
@@ -398,7 +400,7 @@ function Updater._performUpdate(plugin, release)
     -- release zips that include ffmpeg/Piper binaries (issue #38 update
     -- failure). Put temp files on user storage next to the plugin dir.
     if Device:isKindle() then
-        local parent = _dir:gsub("/$", ""):match("^(.+)/[^/]+$")
+        local parent = _dir:gsub("/+$", ""):match("^(.+)/[^/]+$")
         if parent then
             tmp_dir = parent
         end
@@ -406,7 +408,7 @@ function Updater._performUpdate(plugin, release)
     -- Android has no /tmp in the app sandbox; writing there fails with
     -- "No such file or directory". Use user storage next to the plugin dir.
     if Device:isAndroid() then
-        local parent = _dir:gsub("/$", ""):match("^(.+)/[^/]+$")
+        local parent = _dir:gsub("/+$", ""):match("^(.+)/[^/]+$")
         if parent then
             tmp_dir = parent
         end
@@ -415,13 +417,14 @@ function Updater._performUpdate(plugin, release)
     local test_file = tmp_dir .. "/.audiobook_update_test"
     local test_fh = io.open(test_file, "w")
     if not test_fh then
-        tmp_dir = _dir:gsub("/$", "")
+        tmp_dir = _dir:gsub("/+$", "")
         logger.warn("Updater: temp dir not writable, falling back to", tmp_dir)
     else
         test_fh:close()
         os.remove(test_file)
     end
     local zip_path = tmp_dir .. "/audiobook-koplugin-update.zip"
+    logger.info("Updater: using temp dir", tmp_dir)
 
     -- Pre-flight space check (issue #46): the update needs the zip, a
     -- backup copy of the plugin, and the extracted files side by side.
@@ -487,7 +490,7 @@ function Updater._performUpdate(plugin, release)
     end
 
     -- Determine install target: the directory containing this plugin
-    local plugin_dir = _dir:gsub("/$", "")  -- e.g. ".../plugins/audiobook.koplugin"
+    local plugin_dir = _dir:gsub("/+$", "")  -- e.g. ".../plugins/audiobook.koplugin"
 
     logger.warn("Updater: extracting", zip_path, "to", plugin_dir)
 

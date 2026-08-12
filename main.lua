@@ -1028,7 +1028,10 @@ function Audiobook:addToMainMenu(menu_items)
                 text = _("Check for updates"),
                 callback = function()
                     if not Updater then
-                        local ok, mod = pcall(dofile, PLUGIN_PATH .. "/updater.lua")
+                        -- PLUGIN_PATH already ends with a slash; adding
+                        -- another one gives updater.lua a "//" chunk path,
+                        -- which breaks its parent-directory derivation.
+                        local ok, mod = pcall(dofile, PLUGIN_PATH .. "updater.lua")
                         if not ok then
                             local UIManager = require("ui/uimanager")
                             local InfoMessage = require("ui/widget/infomessage")
