@@ -332,25 +332,17 @@ function TTSEngine:detectBackend()
     end
     -- Log what we searched for
     logger.warn("TTSEngine: No TTS backend found. Searched for: espeak-ng, espeak, pico2wave, flite, festival")
-    -- On Android, try the native TextToSpeech API via JNI
+    -- On Android, select the system TTS backend but DO NOT load the helper
+    -- .dex / TextToSpeech engine here.  DexClassLoader + TTS binder init at
+    -- document-open time hard-crashes KOReader on some Boox devices (Go 10.3).
+    -- Real init happens lazily in _ensureAndroidTts() on first speak().
+    -- EPUB Media Overlay playback uses AndroidPlayer and never needs this.
     if is_android then
-        local atts = AndroidTts:new{
-            plugin_dir = self.plugin_dir or ".",
-        }
-        if atts:init() then
-            -- Wait up to 3 seconds for the TTS engine to initialize
-            if atts:waitForInit(3000) then
-                self._android_tts = atts
-                self.backend = self.BACKENDS.ANDROID
-                logger.dbg("TTSEngine: Using Android TTS backend")
-                return
-            else
-                atts:shutdown()
-                logger.warn("TTSEngine: Android TTS init timed out or failed")
-            end
-        else
-            logger.warn("TTSEngine: Android TTS helper .dex not available at", Utils.normalizeDirPath(self.plugin_dir or "."))
-        end
+        self.backend = self.BACKENDS.ANDROID
+        self._android_tts = nil
+        self._android_tts_deferred = true
+        logger.warn("TTSEngine: Android TTS selected (deferred init until first speak)")
+        return
     end
     -- Platform-native TTS: user-supplied helper that drives a device-native,
     -- licensed engine (e.g. PocketBook ReadSpeaker).  This is a last-resort
@@ -1381,8 +1373,39 @@ function TTSEngine:_androidPcmActive()
     return self.plugin and self.plugin:getSetting("android_pcm_stream", false) or false
 end
 
+--- Lazy-load AndroidTts (dex + TextToSpeech). Safe to call repeatedly.
+--- @return table|nil AndroidTts instance, or nil on failure
+function TTSEngine:_ensureAndroidTts()
+    if self._android_tts then return self._android_tts end
+    if self._android_tts_failed then return nil end
+
+    local atts = AndroidTts:new{
+        plugin_dir = self.plugin_dir or ".",
+    }
+    local ok, err = pcall(function()
+        if not atts:init() then
+            error("AndroidTts:init returned false")
+        end
+        if not atts:waitForInit(3000) then
+            atts:shutdown()
+            error("AndroidTts:waitForInit failed")
+        end
+    end)
+    if not ok then
+        self._android_tts_failed = true
+        self._android_tts_deferred = false
+        logger.err("TTSEngine: Android TTS deferred init failed:", err)
+        return nil
+    end
+
+    self._android_tts = atts
+    self._android_tts_deferred = false
+    logger.warn("TTSEngine: Android TTS helper ready (lazy init)")
+    return atts
+end
+
 function TTSEngine:synthesizeAndroid(text, audio_file, callback)
-    local atts = self._android_tts
+    local atts = self:_ensureAndroidTts()
     if not atts then
         logger.err("TTSEngine: Android TTS not initialized")
         if callback then callback(false, nil) end
