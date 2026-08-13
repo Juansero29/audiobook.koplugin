@@ -685,11 +685,15 @@ function BtMediaControl.sendPlaybackStatus(status)
             end
             if status == "stopped" then
                 pcall(function() session:stopSession() end)
+                BtMediaControl._android_session_started = false
             else
-                pcall(function()
-                    session:startSession("Audiobook", "")
-                    session:setPlaying(playing, pos_ms)
-                end)
+                -- startSession once; repeated start() re-requested audio focus
+                -- and contributed to AirPods resume dying after ~0.5s.
+                if not BtMediaControl._android_session_started then
+                    pcall(function() session:startSession("Audiobook", "") end)
+                    BtMediaControl._android_session_started = true
+                end
+                pcall(function() session:setPlaying(playing, pos_ms) end)
             end
         end
         return

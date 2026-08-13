@@ -368,9 +368,15 @@ end
 
 function AndroidPlayer:pause()
     if not self._mp_ref then return end
-    -- Always capture wall position first so resume can seek-restart reliably
-    -- even if MediaPlayer.pause() fails or state flags were inconsistent.
+    -- Prefer wall clock (stable on Boox); fall back to MediaPlayer if wall
+    -- has not locked yet.  Then re-anchor so pause/resume stay on the SMIL
+    -- timeline instead of drifting back to the original play-from-here mark.
     local pos = self:_wallPositionMs()
+    if not self._audio_started then
+        local mp = self:_queryMpPositionMs()
+        if mp and mp > (pos or 0) then pos = mp end
+    end
+    pos = math.max(0, math.floor(tonumber(pos) or 0))
     if not self._paused then
         local android = self._android
         android.jni:context(android.app.activity.vm, function(jni)
@@ -378,37 +384,44 @@ function AndroidPlayer:pause()
             checkException(jni.env)
         end)
         self._paused = true
-        self._pause_wall_start = UIManager:getTime()
     end
+    -- Clean re-anchor at the pause point (clears pause_accum drift).
+    self:_reanchorWallToMs(pos)
+    self._paused = true
+    self._pause_wall_start = UIManager:getTime()
+    self._audio_started = true
+    self._ever_confirmed_playing = true
     self._last_mp_pos_ms = pos
+    logger.warn("AndroidPlayer: paused at pos_ms=", pos)
     return pos
 end
 
 function AndroidPlayer:resume()
     if not self._mp_ref then return false end
-    if not self._paused then
-        -- Already "playing" according to flags; still poke start() in case the
-        -- HAL stopped us while Lua thought we were running.
-        local android = self._android
-        android.jni:context(android.app.activity.vm, function(jni)
-            jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.start)
-            checkException(jni.env)
-        end)
-        self._playing = true
-        return true
-    end
+    local resume_ms = self._last_mp_pos_ms or self:_wallPositionMs() or 0
+    resume_ms = math.max(0, math.floor(tonumber(resume_ms) or 0))
+
+    -- Explicit seek + start so MediaPlayer and the SMIL wall clock agree.
+    -- Some Boox/HAL paths resume from an earlier buffered position after pause.
     local android = self._android
     android.jni:context(android.app.activity.vm, function(jni)
-        jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.start)
-        checkException(jni.env)
+        local env = jni.env
+        if resume_ms > 50 and self._method.seekTo then
+            local args = ffi.new("jvalue[1]")
+            args[0].i = resume_ms
+            env[0].CallVoidMethodA(env, self._mp_ref, self._method.seekTo, args)
+            checkException(env)
+        end
+        env[0].CallVoidMethod(env, self._mp_ref, self._method.start)
+        checkException(env)
     end)
-    if self._pause_wall_start then
-        self._pause_accum_ms = (self._pause_accum_ms or 0)
-            + time.to_ms(UIManager:getTime() - self._pause_wall_start)
-        self._pause_wall_start = nil
-    end
+
+    self:_reanchorWallToMs(resume_ms)
     self._paused = false
     self._playing = true
+    self._audio_started = true
+    self._ever_confirmed_playing = true
+    logger.warn("AndroidPlayer: resumed at pos_ms=", resume_ms)
     return true
 end
 

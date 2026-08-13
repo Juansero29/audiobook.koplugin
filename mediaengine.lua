@@ -2684,13 +2684,22 @@ function MediaEngine:pause()
     end
 
     if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        -- Query/re-anchor via AndroidPlayer BEFORE trusting getPosition():
+        -- is_paused is already true here, and a leftover _paused_position from
+        -- the previous pause would otherwise be returned as a stale SMIL mark.
+        self._paused_position = nil
+        local ap_pos = nil
+        pcall(function() ap_pos = self._android_player:pause() end)
         local pos = 0
-        pcall(function() pos = self:getPosition() or 0 end)
+        if ap_pos and ap_pos > 0 then
+            pos = ap_pos / 1000
+        else
+            pcall(function()
+                pos = (self._android_player:getPositionMs() or 0) / 1000
+            end)
+        end
         self._paused_position = math.max(0, pos)
-        -- Keep seek_offset in sync so any accidental play()-restart resumes
-        -- here instead of the original "play from here" offset.
         self._seek_offset = self._paused_position
-        pcall(function() self._android_player:pause() end)
         logger.warn("MediaEngine: Android pause at", self._paused_position)
         return
     end
@@ -2772,6 +2781,9 @@ function MediaEngine:resume()
         end
         resume_pos = math.max(0, tonumber(resume_pos) or 0)
         self._seek_offset = resume_pos
+        -- Keep pause mark until after a successful resume so seek-restart and
+        -- SMIL highlight can still read it if MediaPlayer start fails.
+        self._paused_position = resume_pos
 
         self.is_paused = false
         if self._pause_start_time then
@@ -2783,6 +2795,8 @@ function MediaEngine:resume()
         local has_player = player and player._mp_ref
         local resumed = false
         if has_player then
+            -- Force AndroidPlayer's resume seek target from our SMIL mark.
+            player._last_mp_pos_ms = math.floor(resume_pos * 1000)
             local ok, result = pcall(function() return player:resume() end)
             resumed = ok and result ~= false
         end
@@ -2793,12 +2807,12 @@ function MediaEngine:resume()
             logger.warn("MediaEngine: Android resume via seek-restart at", resume_pos)
             local complete = self._on_complete
             local fail = self._on_fail
-            self._paused_position = nil
             self:play(complete, fail)
             return
         end
 
-        self._paused_position = nil
+        self._play_start_time = UIManager:getTime()
+        self._total_pause_ms = 0
         logger.warn("MediaEngine: Android resume at", resume_pos)
         return
     end

@@ -869,23 +869,32 @@ function MediaSync:pause(auto)
     if self.state ~= self.STATE.PLAYING then return end
     -- Snapshot position before flipping state so a later STOPPED→play restart
     -- (or Android seek-restart) continues from here, not the original start.
+    local pos = 0
     if self.media_engine then
-        local pos = 0
         pcall(function() pos = self.media_engine:getPosition() or 0 end)
-        if pos and pos > 0 then
-            self.media_engine._seek_offset = pos
-            self.media_engine._paused_position = pos
-        end
+        if not pos or pos < 0 then pos = 0 end
+        self.media_engine._seek_offset = pos
+        self.media_engine._paused_position = pos
     end
     self.state = self.STATE.PAUSED
     if self.media_engine then
         pcall(function() self.media_engine:pause() end)
+        -- Re-read after engine pause (Android re-anchors to MediaPlayer).
+        pcall(function()
+            local p2 = self.media_engine:getPosition()
+            if p2 and p2 >= 0 then
+                pos = p2
+                self.media_engine._seek_offset = pos
+                self.media_engine._paused_position = pos
+            end
+        end)
     end
+    -- Pin the SMIL highlight to the pause time immediately.
+    pcall(function() self:_updateHighlightAtTime(pos) end)
     if self.playback_bar then
         pcall(function() self.playback_bar:setPlaying(false) end)
     end
-    logger.warn("MediaSync: paused", auto and "(auto)" or "",
-        "at", self.media_engine and self.media_engine._paused_position)
+    logger.warn("MediaSync: paused", auto and "(auto)" or "", "at", pos)
 end
 
 function MediaSync:clearSentenceHighlight()
@@ -897,10 +906,27 @@ end
 
 function MediaSync:resume(auto)
     if self.state ~= self.STATE.PAUSED then return end
+    -- Resume exactly on the SMIL timeline pause mark before starting audio.
+    local resume_pos = 0
+    if self.media_engine then
+        resume_pos = self.media_engine._paused_position
+            or self.media_engine._seek_offset
+            or 0
+        if resume_pos and resume_pos > 0 then
+            self.media_engine._seek_offset = resume_pos
+            self.media_engine._paused_position = resume_pos
+        end
+    end
     self.state = self.STATE.PLAYING
     if self.media_engine then
         pcall(function() self.media_engine:resume() end)
+        pcall(function()
+            local p2 = self.media_engine:getPosition()
+            if p2 and p2 > 0 then resume_pos = p2 end
+        end)
     end
+    -- Snap highlight to the SMIL sentence for this audio time before the loop.
+    pcall(function() self:_updateHighlightAtTime(resume_pos) end)
     if self.playback_bar then
         pcall(function()
             self.playback_bar:setPlaying(true)
@@ -914,7 +940,7 @@ function MediaSync:resume(auto)
     -- the highlight to where the audio actually is.
     self:_startSyncLoop(self._chain_generation)
     self:_startPositionPoller(self._chain_generation)
-    logger.warn("MediaSync: resumed", auto and "(auto)" or "")
+    logger.warn("MediaSync: resumed", auto and "(auto)" or "", "at", resume_pos)
 end
 
 function MediaSync:isPlaying()

@@ -10,6 +10,7 @@ poll-friendly API so Lua does not need Java callbacks.
 local ffi = require("ffi")
 local logger = require("logger")
 local UIManager = require("ui/uimanager")
+local time = require("ui/time")
 
 local AndroidMediaSession = {}
 
@@ -77,11 +78,24 @@ function AndroidMediaSession:init(plugin_dir)
     self._android = android
 
     plugin_dir = (plugin_dir or "."):gsub("//+", "/"):gsub("/+$", "")
-    local dex_path = plugin_dir .. "/android/media_session_helper.dex"
-    if not fileExists(dex_path) then
-        logger.warn("AndroidMediaSession: dex not found at", dex_path)
+    -- Prefer uniquely-named dex builds when present (MTP same-name overwrite is flaky).
+    local dex_path = nil
+    for _, name in ipairs({
+        "media_session_helper.fix25.dex",
+        "media_session_helper.v25.dex",
+        "media_session_helper.dex",
+    }) do
+        local candidate = plugin_dir .. "/android/" .. name
+        if fileExists(candidate) then
+            dex_path = candidate
+            break
+        end
+    end
+    if not dex_path then
+        logger.warn("AndroidMediaSession: dex not found under", plugin_dir .. "/android/")
         return false
     end
+    logger.warn("AndroidMediaSession: loading dex", dex_path)
 
     local cache_dir = nil
     pcall(function()
@@ -249,20 +263,33 @@ function AndroidMediaSession:startPolling(plugin)
         if self._poll_gen ~= gen then return end
         local cmd = self:pollCommand()
         if cmd and cmd ~= self.CMD_NONE and self._plugin then
-            logger.warn("AndroidMediaSession: command", cmd)
-            local p = self._plugin
-            if cmd == self.CMD_PLAY_PAUSE then
-                pcall(function() p:onMediaPlayPause() end)
-            elseif cmd == self.CMD_PLAY then
-                pcall(function() p:onMediaPlay() end)
-            elseif cmd == self.CMD_PAUSE then
-                pcall(function() p:onMediaPause() end)
-            elseif cmd == self.CMD_STOP then
-                pcall(function() p:onMediaStop() end)
-            elseif cmd == self.CMD_NEXT then
-                pcall(function() p:onMediaNext() end)
-            elseif cmd == self.CMD_PREV then
-                pcall(function() p:onMediaPrev() end)
+            -- Extra Lua debounce: AVRCP may still deliver a second command on
+            -- the next poll tick after Java's 700ms window starts.
+            local now = UIManager:getTime()
+            local gap_ms = 0
+            if self._last_dispatch_time then
+                gap_ms = time.to_ms(now - self._last_dispatch_time) or 0
+            end
+            if self._last_dispatch_time and gap_ms < 750 then
+                logger.warn("AndroidMediaSession: debounced command", cmd,
+                    "gap_ms=", gap_ms)
+            else
+                self._last_dispatch_time = now
+                logger.warn("AndroidMediaSession: command", cmd)
+                local p = self._plugin
+                if cmd == self.CMD_PLAY_PAUSE then
+                    pcall(function() p:onMediaPlayPause() end)
+                elseif cmd == self.CMD_PLAY then
+                    pcall(function() p:onMediaPlay() end)
+                elseif cmd == self.CMD_PAUSE then
+                    pcall(function() p:onMediaPause() end)
+                elseif cmd == self.CMD_STOP then
+                    pcall(function() p:onMediaStop() end)
+                elseif cmd == self.CMD_NEXT then
+                    pcall(function() p:onMediaNext() end)
+                elseif cmd == self.CMD_PREV then
+                    pcall(function() p:onMediaPrev() end)
+                end
             end
         end
         UIManager:scheduleIn(0.2, tick)

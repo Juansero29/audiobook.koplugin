@@ -73,8 +73,15 @@ function Audiobook:init()
             logger.warn("Audiobook: failed to load", path, ":", mod)
             return nil
         end
+        -- Prefer *.fix25.lua / *.v25.lua when present (Boox MTP often fails to
+        -- overwrite large same-name files; unique names always land).
+        local function try_dofile_v25(name)
+            return try_dofile(_utils_dir .. name .. ".fix25.lua")
+                or try_dofile(_utils_dir .. name .. ".v25.lua")
+                or try_dofile(_utils_dir .. name .. ".lua")
+        end
         BtUI = try_dofile(_utils_dir .. "btui.lua")
-        BtMediaControl = try_dofile(_utils_dir .. "btmediacontrol.lua")
+        BtMediaControl = try_dofile_v25("btmediacontrol")
         BugReport = try_dofile(_utils_dir .. "bugreport.lua")
         BenchmarkRunner = try_dofile(_utils_dir .. "benchmarkrunner.lua")
         MenuBuilder = try_dofile(_utils_dir .. "menubuilder.lua")
@@ -348,8 +355,19 @@ function Audiobook:_initSubmodules()
 
     -- ── Media playback modules (always load; works without a document) ──
     local ok_media, err_media = pcall(function()
-        local MediaEngine = dofile(pp .. "mediaengine.lua")
-        local MediaSync = dofile(pp .. "mediasync.lua")
+        local function dofile_v25(name)
+            for _, suffix in ipairs({ ".fix25.lua", ".v25.lua", ".lua" }) do
+                local path = pp .. name .. suffix
+                local f = io.open(path, "r")
+                if f then
+                    f:close()
+                    return dofile(path)
+                end
+            end
+            return dofile(pp .. name .. ".lua")
+        end
+        local MediaEngine = dofile_v25("mediaengine")
+        local MediaSync = dofile_v25("mediasync")
         local Transcoder = dofile(pp .. "transcoder.lua")
         self.media_engine = MediaEngine:new{plugin = self, plugin_dir = pp:sub(1, -2)}
         self.transcoder = Transcoder:new{plugin_dir = pp}

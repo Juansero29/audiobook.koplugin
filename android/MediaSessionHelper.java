@@ -12,7 +12,6 @@ import android.media.session.PlaybackState;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.view.KeyEvent;
 
 /**
  * Active MediaSession so Bluetooth headsets (AirPods stem, AVRCP) deliver
@@ -38,6 +37,8 @@ public class MediaSessionHelper {
     private Object audioFocusRequest; // AudioFocusRequest on API 26+
     private volatile int pendingCommand = CMD_NONE;
     private volatile boolean active;
+    private volatile boolean hasAudioFocus;
+    private volatile long suppressCommandUntilMs;
     private volatile int playbackState = PlaybackState.STATE_NONE;
     private volatile long positionMs;
     private volatile String title = "Audiobook";
@@ -59,7 +60,10 @@ public class MediaSessionHelper {
             @Override
             public void run() {
                 ensureSessionLocked();
-                requestFocus();
+                // Only request focus once.  Re-requesting on every
+                // pause→play status update can briefly lose focus and was
+                // auto-pausing AirPods resume after ~0.5s.
+                if (!hasAudioFocus) requestFocus();
                 setStateInternal(PlaybackState.STATE_PLAYING, positionMs);
                 active = true;
             }
@@ -127,8 +131,17 @@ public class MediaSessionHelper {
     }
 
     private void enqueue(int cmd) {
+        long now = System.currentTimeMillis();
         synchronized (lock) {
+            // AirPods / AVRCP often deliver both Callback.onPlay/onPause AND a
+            // media-button event for one stem press.  Keep the first command
+            // and suppress duplicates for a short window so resume is not
+            // immediately toggled back to pause (~0.5s play bug).
+            if (now < suppressCommandUntilMs) {
+                return;
+            }
             pendingCommand = cmd;
+            suppressCommandUntilMs = now + 700;
         }
     }
 
@@ -155,34 +168,10 @@ public class MediaSessionHelper {
 
             @Override
             public boolean onMediaButtonEvent(Intent intent) {
-                if (intent == null) return super.onMediaButtonEvent(intent);
-                KeyEvent ke = intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
-                if (ke == null || ke.getAction() != KeyEvent.ACTION_DOWN) {
-                    return super.onMediaButtonEvent(intent);
-                }
-                switch (ke.getKeyCode()) {
-                    case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
-                    case KeyEvent.KEYCODE_HEADSETHOOK:
-                        enqueue(CMD_PLAY_PAUSE);
-                        return true;
-                    case KeyEvent.KEYCODE_MEDIA_PLAY:
-                        enqueue(CMD_PLAY);
-                        return true;
-                    case KeyEvent.KEYCODE_MEDIA_PAUSE:
-                        enqueue(CMD_PAUSE);
-                        return true;
-                    case KeyEvent.KEYCODE_MEDIA_STOP:
-                        enqueue(CMD_STOP);
-                        return true;
-                    case KeyEvent.KEYCODE_MEDIA_NEXT:
-                        enqueue(CMD_NEXT);
-                        return true;
-                    case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
-                        enqueue(CMD_PREV);
-                        return true;
-                    default:
-                        return super.onMediaButtonEvent(intent);
-                }
+                // Let the default implementation map keys → onPlay/onPause
+                // once based on PlaybackState.  Handling keys ourselves AND
+                // receiving transport callbacks caused duplicate commands.
+                return super.onMediaButtonEvent(intent);
             }
         }, worker);
 
@@ -241,6 +230,22 @@ public class MediaSessionHelper {
     private void requestFocus() {
         if (audioManager == null) return;
         try {
+            // Do NOT auto-enqueue PAUSE on focus loss.  BT A2DP renegotiation
+            // on AirPods resume often delivers a brief LOSS_TRANSIENT that
+            // was stopping playback after half a second.  Permanent focus
+            // loss from another app is rare during KOReader read-along; the
+            // user can pause manually if needed.
+            AudioManager.OnAudioFocusChangeListener listener =
+                new AudioManager.OnAudioFocusChangeListener() {
+                    @Override
+                    public void onAudioFocusChange(int focusChange) {
+                        if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+                            hasAudioFocus = true;
+                        } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+                            hasAudioFocus = false;
+                        }
+                    }
+                };
             if (Build.VERSION.SDK_INT >= 26) {
                 AudioAttributes attrs = new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -248,31 +253,17 @@ public class MediaSessionHelper {
                     .build();
                 AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                     .setAudioAttributes(attrs)
-                    .setOnAudioFocusChangeListener(new AudioManager.OnAudioFocusChangeListener() {
-                        @Override
-                        public void onAudioFocusChange(int focusChange) {
-                            if (focusChange == AudioManager.AUDIOFOCUS_LOSS
-                                    || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-                                enqueue(CMD_PAUSE);
-                            }
-                        }
-                    })
+                    .setOnAudioFocusChangeListener(listener, worker)
                     .build();
                 audioFocusRequest = req;
-                audioManager.requestAudioFocus(req);
+                int r = audioManager.requestAudioFocus(req);
+                hasAudioFocus = (r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
             } else {
-                audioManager.requestAudioFocus(
-                    new AudioManager.OnAudioFocusChangeListener() {
-                        @Override
-                        public void onAudioFocusChange(int focusChange) {
-                            if (focusChange == AudioManager.AUDIOFOCUS_LOSS
-                                    || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-                                enqueue(CMD_PAUSE);
-                            }
-                        }
-                    },
+                int r = audioManager.requestAudioFocus(
+                    listener,
                     AudioManager.STREAM_MUSIC,
                     AudioManager.AUDIOFOCUS_GAIN);
+                hasAudioFocus = (r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
             }
         } catch (Exception ignored) {}
     }
@@ -284,6 +275,7 @@ public class MediaSessionHelper {
                 audioManager.abandonAudioFocusRequest((AudioFocusRequest) audioFocusRequest);
                 audioFocusRequest = null;
             }
+            hasAudioFocus = false;
         } catch (Exception ignored) {}
     }
 }
