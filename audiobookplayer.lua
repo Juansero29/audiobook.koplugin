@@ -675,6 +675,26 @@ function AudiobookPlayer:setupUI()
         }
     end
 
+    -- Chapter list on the mini bar (overlay): avoids expanding the fullscreen
+    -- player just to tap ☰, which was crashing on Boox.
+    local chapter_group = {}
+    if self.on_chapter_list then
+        self._mini_chapters = Button:new{
+            text = "☰",
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 16,
+            callback = function() self:onChapterList() end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        center_max_width = center_max_width - mini_btn_size - spacing
+        chapter_group = {
+            self._mini_chapters,
+            HorizontalSpan:new{ width = spacing },
+        }
+    end
+
     -- Create the centered title/time stack now that side buttons have reserved
     -- their full width, so the text cannot overlap the volume/sync buttons.
     self._mini_title = TextWidget:new{
@@ -700,6 +720,8 @@ function AudiobookPlayer:setupUI()
         HorizontalSpan:new{ width = spacing },
         self._mini_play_pause,
         HorizontalSpan:new{ width = spacing },
+        chapter_group[1] or HorizontalSpan:new{ width = 0 },
+        chapter_group[2] or HorizontalSpan:new{ width = 0 },
         vol_group[1] or HorizontalSpan:new{ width = 0 },
         vol_group[2] or HorizontalSpan:new{ width = 0 },
         vol_group[3] or HorizontalSpan:new{ width = 0 },
@@ -824,7 +846,24 @@ function AudiobookPlayer:_restore()
 end
 
 function AudiobookPlayer:onChapterList()
-    if self.on_chapter_list then self.on_chapter_list() end
+    if not self.on_chapter_list then return end
+    local cb = self.on_chapter_list
+    -- Boox crashes when a second top-level dialog is stacked on the fullscreen
+    -- player (covers_fullscreen + OpenGL).  Collapse to the mini bar first,
+    -- then open the chapter picker on the next tick.
+    if not self._minimized then
+        pcall(function() self:onMinimize() end)
+    end
+    UIManager:scheduleIn(0.2, function()
+        local ok, err = pcall(cb)
+        if not ok then
+            logger.err("AudiobookPlayer: chapter list failed:", err)
+            UIManager:show(require("ui/widget/infomessage"):new{
+                text = _("Could not open chapter list."),
+                timeout = 3,
+            })
+        end
+    end)
 end
 
 function AudiobookPlayer:onShuffle()
@@ -1512,10 +1551,18 @@ function AudiobookPlayer:handleEvent(event)
                 local mini_y = self:_miniBarY()
                 local on_bar = ges.pos.y >= mini_y
                     and ges.pos.y < mini_y + self._mini_height
-                if on_bar and ges.ges == "tap" then
+                    if on_bar and ges.ges == "tap" then
                     -- Tap on play/pause button?
                     if self:_isTapOnWidget(ges.pos, self._mini_play_pause) then
                         self:onPlayPause()
+                        return true
+                    end
+                    -- Tap on chapter list (mini ☰)?
+                    if self._mini_chapters
+                        and self:_isTapOnWidget(ges.pos, self._mini_chapters) then
+                        if self._mini_chapters.callback then
+                            self._mini_chapters.callback()
+                        end
                         return true
                     end
                     -- Tap on close button?

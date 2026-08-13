@@ -2131,37 +2131,12 @@ function MediaSync:_showModalMenu(opts)
     return menu
 end
 
+--- Android-safe chapter/playlist picker.
+--- Avoid Menu and ButtonDialogTitle (both have crashed KOReader on Boox when
+--- opened from the audiobook player).  Tiny paginated FrameContainer instead.
 function MediaSync:_showModalMenuButtonDialog(opts)
-    local ButtonDialogTitle
-    local ok_bdt, mod = pcall(require, "ui/widget/buttondialogtitle")
-    if ok_bdt and mod then
-        ButtonDialogTitle = mod
-    else
-        ButtonDialogTitle = require("ui/widget/buttondialog")
-    end
     local items = opts.items or {}
-    local buttons = {}
-    local current = opts.current or 0
-    for i, item in ipairs(items) do
-        local label = item.text or (_("Item") .. " " .. i)
-        if i == current then
-            label = "▶ " .. label
-        end
-        -- Capture by value for the closure.
-        local cb = item.callback
-        table.insert(buttons, {{
-            text = label,
-            callback = function()
-                -- Close first, then run the item action (which may also
-                -- call _closeModalMenu — idempotent).
-                self:_closeModalMenu()
-                if cb then
-                    pcall(cb)
-                end
-            end,
-        }})
-    end
-    if #buttons == 0 then
+    if #items == 0 then
         UIManager:show(InfoMessage:new{
             text = _("No chapters available."),
             timeout = 2,
@@ -2169,25 +2144,163 @@ function MediaSync:_showModalMenuButtonDialog(opts)
         return
     end
 
-    local dialog = ButtonDialogTitle:new{
-        title = opts.title or _("Chapters"),
-        title_align = "center",
-        buttons = buttons,
-    }
-    self._chapter_menu = nil
-    self._chapter_menu_window = dialog
-    -- Leave the ☰ button tap handler before showing another top-level widget.
-    UIManager:scheduleIn(0.05, function()
-        if self._chapter_menu_window == dialog then
-            local ok, err = pcall(function() UIManager:show(dialog) end)
-            if not ok then
-                logger.err("MediaSync: chapter dialog failed:", err)
-                self._chapter_menu_window = nil
-                UIManager:show(InfoMessage:new{
-                    text = _("Could not open chapter list."),
-                    timeout = 3,
-                })
+    local Font = require("ui/font")
+    local Blitbuffer = require("ffi/blitbuffer")
+    local Size = require("ui/size")
+    local Button = require("ui/widget/button")
+    local TextWidget = require("ui/widget/textwidget")
+    local FrameContainer = require("ui/widget/container/framecontainer")
+    local CenterContainer = require("ui/widget/container/centercontainer")
+    local VerticalGroup = require("ui/widget/verticalgroup")
+    local HorizontalGroup = require("ui/widget/horizontalgroup")
+    local HorizontalSpan = require("ui/widget/horizontalspan")
+    local VerticalSpan = require("ui/widget/verticalspan")
+    local InputContainer = require("ui/widget/container/inputcontainer")
+
+    local PAGE_SIZE = 8
+    local page = 1
+    local current = opts.current or 1
+    if current < 1 then current = 1 end
+    if current > #items then current = #items end
+    page = math.floor((current - 1) / PAGE_SIZE) + 1
+
+    local screen_w = Screen:getWidth()
+    local panel_w = math.floor(screen_w * 0.88)
+    local btn_w = panel_w - Screen:scaleBySize(24)
+    local btn_h = Screen:scaleBySize(40)
+
+    local ms = self
+
+    local function close_picker()
+        ms:_closeModalMenu()
+    end
+
+    local function rebuild()
+        local total_pages = math.max(1, math.ceil(#items / PAGE_SIZE))
+        if page < 1 then page = 1 end
+        if page > total_pages then page = total_pages end
+        local first = (page - 1) * PAGE_SIZE + 1
+        local last = math.min(#items, page * PAGE_SIZE)
+
+        local rows = {
+            TextWidget:new{
+                text = (opts.title or _("Chapters"))
+                    .. string.format("  (%d/%d)", page, total_pages),
+                face = Font:getFace("cfont", 18),
+                max_width = btn_w,
+            },
+            VerticalSpan:new{ width = Size.padding.small },
+        }
+
+        for i = first, last do
+            local item = items[i]
+            local label = item.text or (_("Item") .. " " .. i)
+            -- Keep labels short to avoid huge TextWidget layouts on e-ink.
+            if #label > 72 then
+                label = label:sub(1, 69) .. "…"
             end
+            if i == current then
+                label = "▶ " .. label
+            end
+            local cb = item.callback
+            table.insert(rows, Button:new{
+                text = label,
+                width = btn_w,
+                height = btn_h,
+                text_font_size = 15,
+                bordersize = Size.border.thin,
+                margin = 0,
+                padding = Size.padding.small,
+                callback = function()
+                    close_picker()
+                    -- Defer the seek so we finish closing the picker first.
+                    UIManager:scheduleIn(0.1, function()
+                        if cb then pcall(cb) end
+                    end)
+                end,
+            })
+            table.insert(rows, VerticalSpan:new{ width = Size.padding.tiny })
+        end
+
+        local nav = HorizontalGroup:new{
+            align = "center",
+            Button:new{
+                text = _("Prev"),
+                width = math.floor(btn_w / 3) - Size.padding.small,
+                height = btn_h,
+                enabled = page > 1,
+                callback = function()
+                    page = page - 1
+                    rebuild()
+                end,
+            },
+            HorizontalSpan:new{ width = Size.padding.small },
+            Button:new{
+                text = _("Close"),
+                width = math.floor(btn_w / 3) - Size.padding.small,
+                height = btn_h,
+                callback = close_picker,
+            },
+            HorizontalSpan:new{ width = Size.padding.small },
+            Button:new{
+                text = _("Next"),
+                width = math.floor(btn_w / 3) - Size.padding.small,
+                height = btn_h,
+                enabled = page < total_pages,
+                callback = function()
+                    page = page + 1
+                    rebuild()
+                end,
+            },
+        }
+        table.insert(rows, VerticalSpan:new{ width = Size.padding.small })
+        table.insert(rows, nav)
+
+        local body = VerticalGroup:new{ align = "center" }
+        for _, w in ipairs(rows) do
+            table.insert(body, w)
+        end
+
+        local panel = FrameContainer:new{
+            background = Blitbuffer.COLOR_WHITE,
+            bordersize = Size.border.window,
+            padding = Size.padding.default,
+            margin = 0,
+            body,
+        }
+
+        local new_window = InputContainer:new{
+            dimen = Screen:getSize(),
+            covers_fullscreen = false,
+            CenterContainer:new{
+                dimen = Screen:getSize(),
+                panel,
+            },
+        }
+        function new_window:onAnyKeyPressed()
+            close_picker()
+            return true
+        end
+
+        local old = ms._chapter_menu_window
+        ms._chapter_menu_window = new_window
+        ms._chapter_menu = nil
+        if old then
+            pcall(function() UIManager:close(old) end)
+        end
+        UIManager:show(new_window)
+    end
+
+    -- Open after the current tap/gesture fully unwinds.
+    UIManager:scheduleIn(0.15, function()
+        local ok, err = pcall(rebuild)
+        if not ok then
+            logger.err("MediaSync: chapter picker failed:", err)
+            ms._chapter_menu_window = nil
+            UIManager:show(InfoMessage:new{
+                text = _("Could not open chapter list."),
+                timeout = 3,
+            })
         end
     end)
 end
