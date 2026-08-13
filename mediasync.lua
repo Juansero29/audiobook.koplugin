@@ -867,6 +867,16 @@ end
 
 function MediaSync:pause(auto)
     if self.state ~= self.STATE.PLAYING then return end
+    -- Snapshot position before flipping state so a later STOPPED→play restart
+    -- (or Android seek-restart) continues from here, not the original start.
+    if self.media_engine then
+        local pos = 0
+        pcall(function() pos = self.media_engine:getPosition() or 0 end)
+        if pos and pos > 0 then
+            self.media_engine._seek_offset = pos
+            self.media_engine._paused_position = pos
+        end
+    end
     self.state = self.STATE.PAUSED
     if self.media_engine then
         pcall(function() self.media_engine:pause() end)
@@ -874,7 +884,8 @@ function MediaSync:pause(auto)
     if self.playback_bar then
         pcall(function() self.playback_bar:setPlaying(false) end)
     end
-    logger.dbg("MediaSync: paused", auto and "(auto)" or "")
+    logger.warn("MediaSync: paused", auto and "(auto)" or "",
+        "at", self.media_engine and self.media_engine._paused_position)
 end
 
 function MediaSync:clearSentenceHighlight()
@@ -891,7 +902,9 @@ function MediaSync:resume(auto)
         pcall(function() self.media_engine:resume() end)
     end
     if self.playback_bar then
-        pcall(function() self.playback_bar:setPlaying(true) end)
+        pcall(function()
+            self.playback_bar:setPlaying(true)
+        end)
     end
     -- The sync loop self-terminates while paused: its tick bails out without
     -- rescheduling once state != PLAYING.  Restart it (and the position
@@ -901,7 +914,7 @@ function MediaSync:resume(auto)
     -- the highlight to where the audio actually is.
     self:_startSyncLoop(self._chain_generation)
     self:_startPositionPoller(self._chain_generation)
-    logger.dbg("MediaSync: resumed", auto and "(auto)" or "")
+    logger.warn("MediaSync: resumed", auto and "(auto)" or "")
 end
 
 function MediaSync:isPlaying()
@@ -1721,7 +1734,16 @@ function MediaSync:showPlaybackBar()
             elseif self.media_engine and self.media_engine.current_path then
                 -- After a hard stop / botched track advance the bar can stay
                 -- visible while state is STOPPED — play must restart audio.
-                logger.warn("MediaSync: play from STOPPED — restarting current file")
+                -- Use the latest seek/pause mark so we do not jump back to the
+                -- original "Play aligned from here" offset.
+                local restart_pos = self.media_engine._paused_position
+                    or self.media_engine._seek_offset
+                    or 0
+                if restart_pos and restart_pos > 0 then
+                    self.media_engine._seek_offset = restart_pos
+                end
+                logger.warn("MediaSync: play from STOPPED — restarting at",
+                    self.media_engine._seek_offset or 0)
                 local gen = self._chain_generation + 1
                 self._chain_generation = gen
                 self.state = self.STATE.PLAYING

@@ -849,20 +849,25 @@ end
 
 -- UI update helpers
 function AudiobookPlayer:setPlaying(is_playing)
-    if is_playing ~= self.is_playing then
-        self.is_playing = is_playing
-        local txt = is_playing and "⏸" or "▶"
+    -- Always push the icon/text even when the boolean is unchanged: on Boox
+    -- the mini-bar dirty region sometimes misses the first toggle.
+    self.is_playing = is_playing and true or false
+    local txt = self.is_playing and "⏸" or "▶"
+    if self.play_pause_button then
         self.play_pause_button:setText(txt, self.play_pause_button.width)
-        self._mini_play_pause:setText(txt, self._mini_play_pause.width)
-        UIManager:setDirty(self, function()
-            -- When minimized only the mini bar is on screen; its area is
-            -- exactly self.dimen (shrunk by onMinimize).
-            if self._minimized then
-                return "ui", self.dimen
-            end
-            return "ui", self.play_pause_button.dimen
-        end)
     end
+    if self._mini_play_pause then
+        self._mini_play_pause:setText(txt, self._mini_play_pause.width)
+    end
+    UIManager:setDirty(self, function()
+        if self._minimized then
+            return "ui", self.dimen
+        end
+        if self.play_pause_button and self.play_pause_button.dimen then
+            return "ui", self.play_pause_button.dimen
+        end
+        return "ui"
+    end)
 end
 
 function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec)

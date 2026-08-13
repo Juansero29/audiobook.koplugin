@@ -2684,7 +2684,14 @@ function MediaEngine:pause()
     end
 
     if self.backend == self.BACKENDS.ANDROID and self._android_player then
-        self._android_player:pause()
+        local pos = 0
+        pcall(function() pos = self:getPosition() or 0 end)
+        self._paused_position = math.max(0, pos)
+        -- Keep seek_offset in sync so any accidental play()-restart resumes
+        -- here instead of the original "play from here" offset.
+        self._seek_offset = self._paused_position
+        pcall(function() self._android_player:pause() end)
+        logger.warn("MediaEngine: Android pause at", self._paused_position)
         return
     end
 
@@ -2759,12 +2766,40 @@ function MediaEngine:resume()
     end
 
     if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        local resume_pos = self._paused_position
+        if resume_pos == nil then
+            pcall(function() resume_pos = self:getPosition() or 0 end)
+        end
+        resume_pos = math.max(0, tonumber(resume_pos) or 0)
+        self._seek_offset = resume_pos
+
         self.is_paused = false
         if self._pause_start_time then
             self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
             self._pause_start_time = nil
         end
-        self._android_player:resume()
+
+        local player = self._android_player
+        local has_player = player and player._mp_ref
+        local resumed = false
+        if has_player then
+            local ok, result = pcall(function() return player:resume() end)
+            resumed = ok and result ~= false
+        end
+
+        if not resumed then
+            -- MediaPlayer was released / HAL dropped the session: seek-restart
+            -- at the saved pause position instead of the original start offset.
+            logger.warn("MediaEngine: Android resume via seek-restart at", resume_pos)
+            local complete = self._on_complete
+            local fail = self._on_fail
+            self._paused_position = nil
+            self:play(complete, fail)
+            return
+        end
+
+        self._paused_position = nil
+        logger.warn("MediaEngine: Android resume at", resume_pos)
         return
     end
 
@@ -3230,11 +3265,19 @@ function MediaEngine:getPosition()
         return self._paused_position
     end
 
-    -- Android: MediaPlayer position (startup hold + MP re-anchor in AndroidPlayer).
+    -- Android: MediaPlayer position; while paused prefer the saved pause mark.
     if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        if self.is_paused and self._paused_position ~= nil then
+            return self._paused_position
+        end
         local pos_ms = self._android_player:getPositionMs()
         if pos_ms then
-            return pos_ms / 1000
+            local pos = pos_ms / 1000
+            -- Keep seek_offset fresh so STOPPED→play restarts from here.
+            if not self.is_paused then
+                self._seek_offset = pos
+            end
+            return pos
         end
     end
 

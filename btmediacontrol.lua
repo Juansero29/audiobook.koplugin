@@ -77,6 +77,11 @@ Tries evdev first, falls back to D-Bus polling.
 function BtMediaControl.start(plugin)
     BtMediaControl._plugin = plugin
 
+    -- Android (Boox): AVRCP arrives via MediaSession, not BlueZ evdev.
+    if Device.isAndroid and Device:isAndroid() then
+        return BtMediaControl._startAndroidMediaSession(plugin)
+    end
+
     -- Try evdev approach first
     local found = BtMediaControl._tryEvdevApproach()
     if found then
@@ -98,6 +103,40 @@ function BtMediaControl.start(plugin)
     return true
 end
 
+--- Android MediaSession path (AirPods stem / BT headset buttons on Boox).
+function BtMediaControl._startAndroidMediaSession(plugin)
+    if BtMediaControl._android_session then
+        BtMediaControl._android_session:startPolling(plugin)
+        return true
+    end
+    local plugin_dir = (plugin and plugin.path) or "."
+    local ok, AndroidMediaSession = pcall(dofile,
+        plugin_dir:gsub("/+$", "") .. "/androidmediasession.lua")
+    if not ok or not AndroidMediaSession then
+        -- Fallback: same folder as this module.
+        local here = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+        ok, AndroidMediaSession = pcall(dofile, here .. "androidmediasession.lua")
+    end
+    if not ok or not AndroidMediaSession then
+        logger.warn("BtMediaControl: AndroidMediaSession load failed:", AndroidMediaSession)
+        return false
+    end
+    local session = AndroidMediaSession:new()
+    if not session:init(plugin_dir) then
+        logger.warn("BtMediaControl: Android MediaSession helper unavailable")
+        return false
+    end
+    BtMediaControl._android_session = session
+    session:startSession("Audiobook", "")
+    session:startPolling(plugin)
+    logger.warn("BtMediaControl: Android MediaSession AVRCP active")
+    return true
+end
+
+function BtMediaControl.getAndroidSession()
+    return BtMediaControl._android_session
+end
+
 --[[--
 Stop listening for BT media button events.
 --]]
@@ -105,6 +144,12 @@ function BtMediaControl.stop()
     BtMediaControl._stopEvdev()
     BtMediaControl._stopDbusPolling()
     BtMediaControl._stopKindleAvrcpSupport()
+    if BtMediaControl._android_session then
+        pcall(function()
+            BtMediaControl._android_session:stopPolling()
+            BtMediaControl._android_session:stopSession()
+        end)
+    end
     BtMediaControl._plugin = nil
 end
 
@@ -626,6 +671,29 @@ an AVRCP target (required for stem play/pause to generate events).
 function BtMediaControl.sendPlaybackStatus(status)
     if BtMediaControl._last_sent_status == status then return end
     BtMediaControl._last_sent_status = status
+
+    if Device.isAndroid and Device:isAndroid() then
+        local session = BtMediaControl._android_session
+        if session then
+            local playing = (status == "playing")
+            local pos_ms = 0
+            local plugin = BtMediaControl._plugin
+            if plugin and plugin.media_sync and plugin.media_sync.media_engine then
+                pcall(function()
+                    pos_ms = math.floor((plugin.media_sync.media_engine:getPosition() or 0) * 1000)
+                end)
+            end
+            if status == "stopped" then
+                pcall(function() session:stopSession() end)
+            else
+                pcall(function()
+                    session:startSession("Audiobook", "")
+                    session:setPlaying(playing, pos_ms)
+                end)
+            end
+        end
+        return
+    end
 
     if Device.isKindle and Device:isKindle() then
         BtMediaControl._kindleAdvertisePlaybackState(status)

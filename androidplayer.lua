@@ -367,18 +367,36 @@ function AndroidPlayer:_wallPositionMs()
 end
 
 function AndroidPlayer:pause()
-    if not self._mp_ref or not self._playing or self._paused then return end
-    local android = self._android
-    android.jni:context(android.app.activity.vm, function(jni)
-        jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.pause)
-        checkException(jni.env)
-    end)
-    self._paused = true
-    self._pause_wall_start = UIManager:getTime()
+    if not self._mp_ref then return end
+    -- Always capture wall position first so resume can seek-restart reliably
+    -- even if MediaPlayer.pause() fails or state flags were inconsistent.
+    local pos = self:_wallPositionMs()
+    if not self._paused then
+        local android = self._android
+        android.jni:context(android.app.activity.vm, function(jni)
+            jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.pause)
+            checkException(jni.env)
+        end)
+        self._paused = true
+        self._pause_wall_start = UIManager:getTime()
+    end
+    self._last_mp_pos_ms = pos
+    return pos
 end
 
 function AndroidPlayer:resume()
-    if not self._mp_ref or not self._paused then return end
+    if not self._mp_ref then return false end
+    if not self._paused then
+        -- Already "playing" according to flags; still poke start() in case the
+        -- HAL stopped us while Lua thought we were running.
+        local android = self._android
+        android.jni:context(android.app.activity.vm, function(jni)
+            jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.start)
+            checkException(jni.env)
+        end)
+        self._playing = true
+        return true
+    end
     local android = self._android
     android.jni:context(android.app.activity.vm, function(jni)
         jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.start)
@@ -391,8 +409,7 @@ function AndroidPlayer:resume()
     end
     self._paused = false
     self._playing = true
-    -- Keep wall clock continuous across pause/resume — do NOT re-enter the
-    -- startup lock dance (that caused highlight thrashing on stop/restart).
+    return true
 end
 
 function AndroidPlayer:stop()
@@ -469,26 +486,14 @@ function AndroidPlayer:isPlaybackDone()
     if self._paused then return false end
     if not self._playing then return true end
 
+    -- Duration-only completion.  Do NOT ask MediaPlayer.isPlaying() — on Boox
+    -- it flaps false mid-play / on pause and was causing false EOS → restart
+    -- from the original "play from here" seek offset.
     local pos = self:getPositionMs()
     local dur = self:getDurationMs()
     if dur and dur > 0 and pos >= (dur - 400) then
         self._playing = false
         return true
-    end
-
-    -- Secondary check: MediaPlayer reports stopped after we were confirmed playing.
-    if self._ever_confirmed_playing then
-        local android = self._android
-        local mp_playing = android.jni:context(android.app.activity.vm, function(jni)
-            local r = jni.env[0].CallBooleanMethod(jni.env,
-                self._mp_ref, self._method.isPlaying)
-            if checkException(jni.env) then return true end -- assume still playing on error
-            return r ~= 0
-        end)
-        if mp_playing == false and pos > (self._start_seek_ms or 0) + 2000 then
-            self._playing = false
-            return true
-        end
     end
     return false
 end
