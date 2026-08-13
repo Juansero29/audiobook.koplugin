@@ -2043,6 +2043,19 @@ by showChapterList() and showPlaylist().
   self:_closeModalMenu()) -- chapters close on select, the playlist stays open.
 --]]
 function MediaSync:_showModalMenu(opts)
+    -- Always drop a previous chapter sheet first.
+    self:_closeModalMenu()
+
+    -- Android/Boox: opening KOReader's Menu widget synchronously from a
+    -- transport-bar button callback has been crashing the activity (blank
+    -- crash screen / ActivityThread top-resumed noise).  Use ButtonDialogTitle
+    -- and defer the show by a tick so we leave the gesture handler first.
+    local is_android = Device.isAndroid and Device:isAndroid()
+    if is_android then
+        self:_showModalMenuButtonDialog(opts)
+        return
+    end
+
     local Menu = require("ui/widget/menu")
     local CenterContainer = require("ui/widget/container/centercontainer")
     local InputContainer = require("ui/widget/container/inputcontainer")
@@ -2110,8 +2123,73 @@ function MediaSync:_showModalMenu(opts)
 
     menu.close_callback = function() ms:_closeModalMenu() end
 
-    UIManager:show(window)
+    UIManager:scheduleIn(0.05, function()
+        if self._chapter_menu_window == window then
+            UIManager:show(window)
+        end
+    end)
     return menu
+end
+
+function MediaSync:_showModalMenuButtonDialog(opts)
+    local ButtonDialogTitle
+    local ok_bdt, mod = pcall(require, "ui/widget/buttondialogtitle")
+    if ok_bdt and mod then
+        ButtonDialogTitle = mod
+    else
+        ButtonDialogTitle = require("ui/widget/buttondialog")
+    end
+    local items = opts.items or {}
+    local buttons = {}
+    local current = opts.current or 0
+    for i, item in ipairs(items) do
+        local label = item.text or (_("Item") .. " " .. i)
+        if i == current then
+            label = "▶ " .. label
+        end
+        -- Capture by value for the closure.
+        local cb = item.callback
+        table.insert(buttons, {{
+            text = label,
+            callback = function()
+                -- Close first, then run the item action (which may also
+                -- call _closeModalMenu — idempotent).
+                self:_closeModalMenu()
+                if cb then
+                    pcall(cb)
+                end
+            end,
+        }})
+    end
+    if #buttons == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No chapters available."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local dialog = ButtonDialogTitle:new{
+        title = opts.title or _("Chapters"),
+        title_align = "center",
+        buttons = buttons,
+    }
+    self._chapter_menu = nil
+    self._chapter_menu_window = dialog
+    -- Leave the ☰ button tap handler before showing another top-level widget.
+    UIManager:scheduleIn(0.05, function()
+        if self._chapter_menu_window == dialog then
+            local ok, err = pcall(function() UIManager:show(dialog) end)
+            if not ok then
+                logger.err("MediaSync: chapter dialog failed:", err)
+                self._chapter_menu_window = nil
+                UIManager:show(InfoMessage:new{
+                    text = _("Could not open chapter list."),
+                    timeout = 3,
+                })
+            end
+        end
+    end)
 end
 
 function MediaSync:showChapterList()

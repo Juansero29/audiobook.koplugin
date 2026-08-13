@@ -65,6 +65,7 @@ function AndroidPlayer:new(o)
     o._audio_started = false
     o._mp_baseline_ms = nil
     o._mp_stuck_reads = 0
+    o._volume = 1.0
     return o
 end
 
@@ -108,6 +109,8 @@ function AndroidPlayer:init()
         self._method.getDuration = getMethod(env, mp_class, "getDuration", "()I")
         self._method.setAudioAttributes = getMethod(env, mp_class,
             "setAudioAttributes", "(Landroid/media/AudioAttributes;)V")
+        self._method.setVolume = getMethod(env, mp_class,
+            "setVolume", "(FF)V")
 
         if not self._method.init
             or not self._method.setDataSource
@@ -120,7 +123,8 @@ function AndroidPlayer:init()
             return
         end
 
-        -- Build AudioAttributes USAGE_MEDIA / CONTENT_TYPE_MUSIC once.
+        -- USAGE_MEDIA + CONTENT_TYPE_SPEECH: narration mixes more cleanly with
+        -- background music (Spotify) than CONTENT_TYPE_MUSIC on many devices.
         self._attrs_ref = nil
         local aa_class = env[0].FindClass(env, "android/media/AudioAttributes")
         local builder_class = env[0].FindClass(env,
@@ -133,7 +137,7 @@ function AndroidPlayer:init()
                 "setContentType", "(I)Landroid/media/AudioAttributes$Builder;")
             local build = getMethod(env, builder_class,
                 "build", "()Landroid/media/AudioAttributes;")
-            -- USAGE_MEDIA=1, CONTENT_TYPE_MUSIC=2
+            -- USAGE_MEDIA=1, CONTENT_TYPE_SPEECH=1
             if b_init and set_usage and set_ctype and build then
                 local builder = env[0].NewObject(env, builder_class, b_init)
                 if builder and not checkException(env) then
@@ -141,7 +145,7 @@ function AndroidPlayer:init()
                     args[0].i = 1  -- USAGE_MEDIA
                     builder = env[0].CallObjectMethodA(env, builder, set_usage, args)
                     checkException(env)
-                    args[0].i = 2  -- CONTENT_TYPE_MUSIC
+                    args[0].i = 1  -- CONTENT_TYPE_SPEECH
                     builder = env[0].CallObjectMethodA(env, builder, set_ctype, args)
                     checkException(env)
                     local attrs = env[0].CallObjectMethod(env, builder, build)
@@ -281,10 +285,32 @@ function AndroidPlayer:play(path, seek_ms)
         self._audio_started = false
         self._mp_baseline_ms = nil
         self._mp_stuck_reads = 0
+        -- Per-player gain (independent of Android system/stream volume).
+        self:setVolume(self._volume or 1.0)
         logger.warn("AndroidPlayer: playing", path,
-            "seek_ms=", seek_ms, "duration_ms=", self._duration_ms)
+            "seek_ms=", seek_ms, "duration_ms=", self._duration_ms,
+            "volume=", self._volume)
     end
     return ok
+end
+
+--- Per-stream volume 0..1 (MediaPlayer.setVolume).  Does NOT change the
+--- Android system/AirPods volume — only this audiobook's gain relative to it.
+function AndroidPlayer:setVolume(vol)
+    vol = tonumber(vol) or 1.0
+    if vol < 0 then vol = 0 end
+    if vol > 1 then vol = 1 end
+    self._volume = vol
+    if not self._mp_ref or not self._method.setVolume then return end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local args = ffi.new("jvalue[2]")
+        args[0].f = vol
+        args[1].f = vol
+        env[0].CallVoidMethodA(env, self._mp_ref, self._method.setVolume, args)
+        checkException(env)
+    end)
 end
 
 function AndroidPlayer:_queryMpPositionMs()

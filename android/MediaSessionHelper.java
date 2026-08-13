@@ -249,10 +249,14 @@ public class MediaSessionHelper {
             if (Build.VERSION.SDK_INT >= 26) {
                 AudioAttributes attrs = new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
-                AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                // MAY_DUCK: let Spotify/YouTube Music keep playing (usually
+                // quieter) while the audiobook uses its own MediaPlayer gain.
+                AudioFocusRequest req = new AudioFocusRequest.Builder(
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                     .setAudioAttributes(attrs)
+                    .setWillPauseWhenDucked(false)
                     .setOnAudioFocusChangeListener(listener, worker)
                     .build();
                 audioFocusRequest = req;
@@ -262,7 +266,7 @@ public class MediaSessionHelper {
                 int r = audioManager.requestAudioFocus(
                     listener,
                     AudioManager.STREAM_MUSIC,
-                    AudioManager.AUDIOFOCUS_GAIN);
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
                 hasAudioFocus = (r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
             }
         } catch (Exception ignored) {}

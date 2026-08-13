@@ -1344,6 +1344,11 @@ function MediaEngine:_playAndroid(gen)
     logger.warn("MediaEngine: Android play", self.current_path,
         "offset=", offset, "duration=", self.current_duration)
 
+    -- Apply saved media volume (♪ buttons) as MediaPlayer gain.
+    pcall(function()
+        player:setVolume(self._volume or 1.0)
+    end)
+
     self:_startAndroidCompletionWatcher(gen)
     return true
 end
@@ -3464,6 +3469,15 @@ function MediaEngine:setVolume(pct)
     local v = pct / 100
     if math.abs(v - (self._volume or 1.0)) < 0.001 then return end
     self._volume = v
+
+    -- Android: MediaPlayer.setVolume is a live per-stream gain (0..1) on top
+    -- of the system/AirPods volume — no seek-restart, and independent of
+    -- Spotify/YouTube Music's own level.
+    if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        pcall(function() self._android_player:setVolume(v) end)
+        logger.warn("MediaEngine: Android volume=", pct)
+        return
+    end
 
     if not self.is_playing then return end
 

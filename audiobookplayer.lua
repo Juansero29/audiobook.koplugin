@@ -1258,8 +1258,8 @@ function AudiobookPlayer:_volumeText()
 end
 
 --- Nudge the volume by delta percent.  The on-screen value updates instantly;
---- the actual apply (which restarts the decode pipeline) is debounced so a
---- burst of taps coalesces into a single restart.
+--- non-Android backends debounce the apply (pipeline restart).  Android uses
+--- MediaPlayer.setVolume live, so apply immediately for responsive ♪ buttons.
 function AudiobookPlayer:_applyVolume(delta)
     local pct = (self.volume_pct or 100) + delta
     if pct < 0 then pct = 0 end
@@ -1278,6 +1278,17 @@ function AudiobookPlayer:_applyVolume(delta)
         if self._minimized then return "ui", self.dimen end
         return "ui", self.volume_widget and self.volume_widget.dimen or nil
     end)
+
+    local Device = require("device")
+    local live = Device.isAndroid and Device:isAndroid()
+    if live then
+        if self._vol_apply_timer then
+            UIManager:unschedule(self._vol_apply_timer)
+            self._vol_apply_timer = nil
+        end
+        if self.on_volume then self.on_volume(self.volume_pct) end
+        return
+    end
 
     if self._vol_apply_timer then
         UIManager:unschedule(self._vol_apply_timer)

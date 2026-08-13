@@ -81,6 +81,7 @@ function AndroidMediaSession:init(plugin_dir)
     -- Prefer uniquely-named dex builds when present (MTP same-name overwrite is flaky).
     local dex_path = nil
     for _, name in ipairs({
+        "media_session_helper.fix27.dex",
         "media_session_helper.fix25.dex",
         "media_session_helper.v25.dex",
         "media_session_helper.dex",
