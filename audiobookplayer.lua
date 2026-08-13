@@ -854,13 +854,13 @@ function AudiobookPlayer:onChapterList()
     if not self._minimized then
         pcall(function() self:onMinimize() end)
     end
-    UIManager:scheduleIn(0.2, function()
+    UIManager:scheduleIn(0.25, function()
         local ok, err = pcall(cb)
         if not ok then
             logger.err("AudiobookPlayer: chapter list failed:", err)
             UIManager:show(require("ui/widget/infomessage"):new{
-                text = _("Could not open chapter list."),
-                timeout = 3,
+                text = _("Could not open chapter list.") .. "\n" .. tostring(err),
+                timeout = 6,
             })
         end
     end)

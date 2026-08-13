@@ -76,7 +76,8 @@ function Audiobook:init()
         -- Prefer *.fix25.lua / *.v25.lua when present (Boox MTP often fails to
         -- overwrite large same-name files; unique names always land).
         local function try_dofile_v25(name)
-            return try_dofile(_utils_dir .. name .. ".fix28.lua")
+            return try_dofile(_utils_dir .. name .. ".fix29.lua")
+                or try_dofile(_utils_dir .. name .. ".fix28.lua")
                 or try_dofile(_utils_dir .. name .. ".fix27.lua")
                 or try_dofile(_utils_dir .. name .. ".fix26.lua")
                 or try_dofile(_utils_dir .. name .. ".fix25.lua")
@@ -359,7 +360,7 @@ function Audiobook:_initSubmodules()
     -- ── Media playback modules (always load; works without a document) ──
     local ok_media, err_media = pcall(function()
         local function dofile_v25(name)
-            for _, suffix in ipairs({ ".fix28.lua", ".fix27.lua", ".fix26.lua", ".fix25.lua", ".v25.lua", ".lua" }) do
+            for _, suffix in ipairs({ ".fix29.lua", ".fix28.lua", ".fix27.lua", ".fix26.lua", ".fix25.lua", ".v25.lua", ".lua" }) do
                 local path = pp .. name .. suffix
                 local f = io.open(path, "r")
                 if f then
