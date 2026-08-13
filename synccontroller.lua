@@ -255,6 +255,8 @@ function SyncController:readNextSentence()
     end
 
     self.reading_sentence_idx = next_idx
+    -- New sentence: re-arm the one-shot replay guard (issue #44).
+    self._cut_retry_done = nil
     logger.warn("SyncController: readNextSentence idx=", self.reading_sentence_idx, "/", self.total_sentences, "state=", self.state)
 
     if self.reading_sentence_idx > self.total_sentences then
@@ -933,6 +935,23 @@ function SyncController:beginSentencePlayback(sentence)
             if (controller._chain_generation or 0) ~= my_chain_gen then
                 logger.warn("SyncController: Completion callback STALE gen=", my_chain_gen,
                     "current=", controller._chain_generation, ", ignoring")
+                return
+            end
+            -- Android MTK HAL teardown recovery (issue #44): the engine
+            -- flagged that the clip died far before its WAV duration.
+            -- Replay the same sentence once via the PCM stream instead of
+            -- advancing and losing it.  reading_sentence_idx still points
+            -- at this sentence, so the chain continues normally after the
+            -- retry.  _cut_retry_done bounds the replay to one attempt.
+            local early_death = controller.tts_engine._android_early_death
+            controller.tts_engine._android_early_death = nil
+            if early_death and not controller._cut_retry_done then
+                controller._cut_retry_done = true
+                logger.warn("SyncController: Replaying sentence", sentence.index,
+                    "after Android track teardown (issue #44)")
+                controller.highlight_manager:clearHighlights()
+                controller:_cleanConcatFiles()
+                controller:beginSentencePlayback(sentence)
                 return
             end
             local last_idx = sentence.index + sentences_in_play - 1

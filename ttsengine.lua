@@ -3014,6 +3014,8 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             or self._current_audio_duration_ms or 5000
         self._expected_play_duration_ms = dur_ms
         self._android_pipeline_duration_ms = nil
+        -- Consumed by the sentence controller to replay a cut sentence.
+        self._android_early_death = nil
         -- Check if playback already finished (Lua was slow to call play())
         local pipeline_status = atts:getPipelineStatus()
         if pipeline_status == 2 or pipeline_status == 3 then
@@ -3047,11 +3049,28 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 -- finished long ago but no completion ever arrives (the
                 -- HAL tore down the MediaPlayer track mid-sentence).
                 -- Switch to the persistent PCM stream for the rest of the
-                -- session.  The interrupted sentence is completed (its
-                -- tail died with the track); the next one plays via PCM.
+                -- session and flag the sentence for a replay: the audio
+                -- died with the track, not just its tail.
                 logger.warn("TTSEngine: Android playback stalled", played_ms,
                     "ms into a", dur_ms, "ms clip with no completion; switching to PCM stream playback for this session (issue #44)")
                 engine._android_pcm_auto = true
+                engine._android_early_death = true
+                atts:setPcmMode(true)
+                atts:stopPipeline()
+                engine:onPlaybackComplete()
+                return
+            end
+            if (status == 2 or status == 3) and not pcm_active
+                and played_ms >= 100 and played_ms < dur_ms - 800 then
+                -- Mid-clip teardown signature from issue #44: the pipeline
+                -- reported completion (or an error) far before the WAV
+                -- duration, so the MTK HAL killed the MediaPlayer track.
+                -- Switch to the persistent PCM stream for the rest of the
+                -- session and flag the sentence for a replay.
+                logger.warn("TTSEngine: Android clip cut short at", played_ms,
+                    "ms of", dur_ms, "ms; switching to PCM stream playback for this session (issue #44)")
+                engine._android_pcm_auto = true
+                engine._android_early_death = true
                 atts:setPcmMode(true)
                 atts:stopPipeline()
                 engine:onPlaybackComplete()
