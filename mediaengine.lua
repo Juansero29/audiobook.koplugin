@@ -1335,10 +1335,11 @@ function MediaEngine:_playAndroid(gen)
     end
 
     self._android_playback_confirmed = false
-    -- Output / BT chain lag subtracted by MediaSync highlight loop.
-    -- Wall-clock is locked once at audible start; this small latency keeps
-    -- highlights from leading the spoken audio on Boox.
-    self.position_latency_s = 0.25
+    -- Match Readest-style SMIL sync: highlight at the Media Overlay clock
+    -- (clipBegin), not an artificial delay.  BT/e-ink micro-skew is handled
+    -- by the Overlay sync offset setting / mini-player −/+ nudge (100 ms).
+    -- The old 0.25 s default made sentence underlines visibly lag the narration.
+    self.position_latency_s = 0
 
     logger.warn("MediaEngine: Android play", self.current_path,
         "offset=", offset, "duration=", self.current_duration)
