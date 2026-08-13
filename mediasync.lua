@@ -12,7 +12,7 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local Screen = require("device").screen
 local time = require("ui/time")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 local Geom = require("ui/geometry")
 local InfoMessage = require("ui/widget/infomessage")
 

@@ -7,7 +7,7 @@ Caches transcoded files to avoid repeated conversion.
 --]]
 
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local Transcoder = {}
 Transcoder.__index = Transcoder

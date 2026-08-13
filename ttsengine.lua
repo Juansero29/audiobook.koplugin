@@ -42,7 +42,7 @@ pcall(function() ffi.cdef[[ int GetPlayerState(void); ]] end)
 local _inkview_audio  -- loaded lazily on first PB InkView use
 local logger = require("logger")
 local time = require("ui/time")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 local T = require("ffi/util").template
 -- Shared utility modules (DRY: extracted from ttsengine, synccontroller, main)
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"

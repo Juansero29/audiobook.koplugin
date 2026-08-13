@@ -6,7 +6,7 @@ Follows the menu patterns from menubuilder.lua and mediasync.lua.
 @module absbrowse
 --]]
 
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 local T = require("ffi/util").template
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")

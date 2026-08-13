@@ -8,7 +8,7 @@ as their first parameter to access settings and engine state.
 @module menubuilder
 --]]
 
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 local T = require("ffi/util").template
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")

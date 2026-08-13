@@ -10,7 +10,7 @@ local Device = require("device")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local time = require("ui/time")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local ffi = require("ffi")
 pcall(function() ffi.cdef[[ int kill(int pid, int sig); ]] end)

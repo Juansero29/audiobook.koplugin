@@ -22,7 +22,7 @@ Reference: OGKevin/kobo.koplugin BT investigation
 
 local Device = require("device")
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local BTManager = {}
 

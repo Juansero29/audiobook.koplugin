@@ -7,7 +7,7 @@ Caches extracted audio to persistent storage (not /tmp, to avoid RAM exhaustion)
 --]]
 
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 -- Lua patterns: `.` does not match newlines. Storyteller (and many OPF
 -- producers) pretty-print SMIL/OPF with line breaks inside elements.
