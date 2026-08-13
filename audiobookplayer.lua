@@ -858,6 +858,10 @@ function AudiobookPlayer:onChapterList()
         local ok, err = pcall(cb)
         if not ok then
             logger.err("AudiobookPlayer: chapter list failed:", err)
+            local DL = package.loaded["audiobook_debuglog"]
+            if DL and DL.log then
+                pcall(DL.log, DL, "player: onChapterList failed:", tostring(err))
+            end
             UIManager:show(require("ui/widget/infomessage"):new{
                 text = _("Could not open chapter list.") .. "\n" .. tostring(err),
                 timeout = 6,

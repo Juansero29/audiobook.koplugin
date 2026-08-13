@@ -76,7 +76,9 @@ function Audiobook:init()
         -- Prefer *.fix25.lua / *.v25.lua when present (Boox MTP often fails to
         -- overwrite large same-name files; unique names always land).
         local function try_dofile_v25(name)
-            return try_dofile(_utils_dir .. name .. ".fix29.lua")
+            return try_dofile(_utils_dir .. name .. ".fix31.lua")
+                or try_dofile(_utils_dir .. name .. ".fix30.lua")
+                or try_dofile(_utils_dir .. name .. ".fix29.lua")
                 or try_dofile(_utils_dir .. name .. ".fix28.lua")
                 or try_dofile(_utils_dir .. name .. ".fix27.lua")
                 or try_dofile(_utils_dir .. name .. ".fix26.lua")
@@ -91,6 +93,13 @@ function Audiobook:init()
         MenuBuilder = try_dofile(_utils_dir .. "menubuilder.lua")
         Utils = try_dofile(_utils_dir .. "utils.lua")
         SessionRecorder = try_dofile(_utils_dir .. "sessionrecorder.lua")
+        -- Persistent debug ring for Android/Boox (included in bug reports).
+        local DebugLog = try_dofile(_utils_dir .. "debuglog.lua")
+        if DebugLog and DebugLog.init then
+            pcall(function() DebugLog.init(_utils_dir) end)
+            self._debug_log = DebugLog
+            package.loaded["audiobook_debuglog"] = DebugLog
+        end
     end)
     if not load_ok then
         logger.warn("Audiobook: module loading failed:", load_err)
@@ -360,7 +369,7 @@ function Audiobook:_initSubmodules()
     -- ── Media playback modules (always load; works without a document) ──
     local ok_media, err_media = pcall(function()
         local function dofile_v25(name)
-            for _, suffix in ipairs({ ".fix29.lua", ".fix28.lua", ".fix27.lua", ".fix26.lua", ".fix25.lua", ".v25.lua", ".lua" }) do
+            for _, suffix in ipairs({ ".fix31.lua", ".fix30.lua", ".fix29.lua", ".fix28.lua", ".fix27.lua", ".fix26.lua", ".fix25.lua", ".v25.lua", ".lua" }) do
                 local path = pp .. name .. suffix
                 local f = io.open(path, "r")
                 if f then
@@ -1694,8 +1703,9 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         table.insert(playlist, { name = nm, path = p })
     end
 
-    -- Flat chapter list for the Chapters menu (all ~27 SMIL sections, not the
-    -- 4 MP4 playlist segments). Playlist still switches audio parts.
+    -- Flat chapter list for the Chapters menu / scrubber.  One row per
+    -- (audio_file × content-doc boundary).  The UI dedupes by text_doc so a
+    -- chapter that spans many ~4 min MP4 parts appears once with its full duration.
     self._smil_overlay_chapters = {}
     for _, p in ipairs(files) do
         for _, ch in ipairs(by_file[p].chapters) do
@@ -1709,9 +1719,21 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         end
     end
 
+    local unique_n = 0
+    do
+        local seen = {}
+        for _, ch in ipairs(self._smil_overlay_chapters) do
+            local key = ch.text_doc or ch.title
+            if key and not seen[key] then
+                seen[key] = true
+                unique_n = unique_n + 1
+            end
+        end
+    end
+
     UIManager:show(InfoMessage:new{
         text = T(_("%1 sentences · %2 chapters · %3 audio parts"),
-            #timing_data, #self._smil_overlay_chapters, #files),
+            #timing_data, unique_n, #files),
         timeout = 3,
     })
 
