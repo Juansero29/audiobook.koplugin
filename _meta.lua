@@ -4,7 +4,13 @@ Plugin metadata for KOReader.
 @module _meta
 --]]
 
-local _ = require("gettext")
+-- Ensure this plugin dir is on package.path so audiobook_gettext loads
+-- when KOReader reads _meta before main.lua runs.
+do
+    local dir = (debug.getinfo(1, "S").source or ""):match("^@(.*/)") or "./"
+    package.path = dir .. "?.lua;" .. package.path
+end
+local _ = require("audiobook_gettext")
 
 return {
     name = "audiobook",

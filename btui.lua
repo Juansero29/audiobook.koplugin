@@ -13,7 +13,7 @@ local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 local T = require("ffi/util").template
 
 local BtUI = {}

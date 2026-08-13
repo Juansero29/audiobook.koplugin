@@ -7,7 +7,7 @@ Writes to a local sync journal immediately; flushes to ABS when connected.
 --]]
 
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local ABSSync = {}
 
