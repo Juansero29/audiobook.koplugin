@@ -369,8 +369,13 @@ Wait for TTS init to complete, polling with a timeout.
 --]]
 function AndroidTts:waitForInit(timeout_ms)
     timeout_ms = timeout_ms or 5000
-    local start = os.clock() * 1000
-    while (os.clock() * 1000 - start) < timeout_ms do
+    -- Bound the loop by iteration count, not os.clock(): on Android
+    -- os.clock() is CPU time, so when the TTS service is wedged each
+    -- blocking JNI status read barely advances the clock and the wait
+    -- becomes effectively unbounded.  That spins the UI thread into an
+    -- ANR (observed on Bigme HiBreak, issue #44).
+    local max_polls = math.ceil(timeout_ms / 50)
+    for _ = 1, max_polls do
         local status = self:getInitStatus()
         if status == 0 then
             logger.dbg("AndroidTts: Engine initialized OK")

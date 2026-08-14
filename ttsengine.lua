@@ -3004,7 +3004,12 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     -- Audio is already playing via the synthesizeAndPlay pipeline.
     -- We just need to set up word-timing and poll for completion.
     if self.audio_player_type == "android" then
-        local atts = self._android_tts
+        local atts = self._android_tts or self:_ensureAndroidTts()
+        if not atts then
+            logger.err("TTSEngine: Android TTS helper not available for playback")
+            self.is_speaking = false
+            return false
+        end
         self._concat_durations = nil
         self.play_generation = (self.play_generation or 0) + 1
         local my_gen = self.play_generation
@@ -3997,8 +4002,13 @@ Sets self.audio_player_type to "kindle-native-tts", "kindle-lipc", "gst-bt",
 @return string|nil Player command
 --]]
 function TTSEngine:findAudioPlayer()
-    -- 0) Android: use MediaPlayer via TtsHelper (no CLI player needed)
-    if self._android_tts then
+    -- 0) Android: playback goes through TtsHelper's MediaPlayer or PCM
+    -- stream; there is no CLI player to probe.  Do not gate this on
+    -- self._android_tts: the helper initializes lazily at first
+    -- synthesis (v0.1.17.23), so the startup probe would fall through
+    -- to the Linux checks and report a false "no audio device" (issue #44).
+    -- A real TTS init failure surfaces later at synthesis time.
+    if Device:isAndroid() then
         self.audio_player_type = "android"
         logger.dbg("TTSEngine: Using Android MediaPlayer for audio")
         return "android"
