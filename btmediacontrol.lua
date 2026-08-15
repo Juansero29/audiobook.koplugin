@@ -20,7 +20,7 @@ For sending feedback to the BT device:
 local Device = require("device")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local BtMediaControl = {}
 

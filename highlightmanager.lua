@@ -13,7 +13,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 -- Shared utility modules (DRY: ws helper)
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"

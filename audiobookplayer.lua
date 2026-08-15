@@ -37,7 +37,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 local T = require("ffi/util").template
 
 local AudiobookPlayer = InputContainer:extend{

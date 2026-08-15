@@ -7,7 +7,7 @@ Stores a JSON index and provides methods to add, retrieve, and delete items.
 --]]
 
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local ABSCache = {}
 

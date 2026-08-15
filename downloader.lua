@@ -10,7 +10,7 @@ local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local logger = require("logger")
 local time = require("ui/time")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local Downloader = {}
 

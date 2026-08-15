@@ -16,7 +16,7 @@ local UIManager = require("ui/uimanager")
 local ffi = require("ffi")
 local logger = require("logger")
 local time = require("ui/time")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local WavUtils = dofile(_utils_dir .. "wavutils.lua")

@@ -12,7 +12,20 @@ Provides text-to-speech with synchronized word highlighting.
 -- loaded inside init() where failures are caught and reported gracefully.
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
-local _ = require("gettext")
+-- Prefer plugin-local catalogs (l10n/fr, l10n/es); fall back to core gettext.
+do
+    local dir = (debug.getinfo(1, "S").source or ""):match("^@(.*/)") or "./"
+    package.path = dir .. "?.lua;" .. package.path
+end
+local _
+do
+    local ok_gt, gt = pcall(require, "audiobook_gettext")
+    if ok_gt then
+        _ = gt
+    else
+        _ = require("gettext")
+    end
+end
 
 -- Forward-declared module-level locals.  Populated by init() Phase 1.
 -- Every function in this file can reference them as upvalues; they start

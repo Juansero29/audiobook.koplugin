@@ -14,7 +14,7 @@ audio/, and screenshots/. When recording stops, a dialog shows the folder path.
 --]]
 
 local logger = require("logger")
-local _ = require("gettext")
+local _ = require("audiobook_gettext")
 local T = require("ffi/util").template
 
 -- These are loaded lazily inside init() to avoid failures at module load time.
