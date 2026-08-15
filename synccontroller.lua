@@ -209,8 +209,8 @@ function SyncController:_beginReading(text, created_bar)
     self._highest_dispatched_idx = nil
     -- Don't reset _piper_warmed_up here: it persists across page turns
     -- so espeak cold-start doesn't re-trigger when Piper is already warm.
-    -- Honor espeak-only mode: if the user enabled the setting (or it was
-    -- auto-enabled by a previous abandon), skip Piper from the start.
+    -- Honor espeak-only mode: if the user enabled the setting, skip Piper
+    -- from the start.  Abandons are session-scoped and never write it.
     if not self._piper_abandoned
             and self.plugin
             and self.plugin:getSetting("espeak_only_mode", false) then
@@ -289,7 +289,13 @@ function SyncController:readNextSentence()
     -- espeak-only mode: skip all Piper queueing/waiting
     if self._piper_abandoned and self.tts_engine and self.tts_engine.espeak_bin then
         logger.dbg("SyncController: espeak-only mode, sentence", self.reading_sentence_idx)
-        local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+        local fb_file = nil
+        if self.tts_engine:usePrefetched(sentence.text) then
+            -- Prefetched during the previous sentence's playback (issue #49)
+            fb_file = self.tts_engine.current_audio_file
+        else
+            fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+        end
         if fb_file then
             controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
             controller:beginSentencePlayback(sentence)
@@ -1092,7 +1098,8 @@ function SyncController:beginSentencePlayback(sentence)
             self._concat_wav_files = concat_wav_files
             -- For Piper: schedule prefetch for sentences BEYOND the concat
             -- batch so they'll be ready when this concat stream finishes.
-            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+                    and not self._piper_abandoned then
                 local last_concat_idx = self.reading_sentence_idx + #concat_sentences
                 for offset = 1, PIPER_LOOKAHEAD do
                     self:_prefetchNextSentence(last_concat_idx + offset)
@@ -1109,7 +1116,8 @@ function SyncController:beginSentencePlayback(sentence)
             -- Single sentence — prefetch upcoming ones.
             -- For Piper (~4-5× real-time on ARM), queue 20 sentences so
             -- both servers always have batches waiting.
-            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+                    and not self._piper_abandoned then
                 for offset = 1, PIPER_LOOKAHEAD do
                     self:_prefetchNextSentence(self.reading_sentence_idx + offset)
                 end
@@ -1181,8 +1189,11 @@ function SyncController:_prefetchNextSentence(explicit_idx)
     -- typical sentence finishes playing (~2-5s).
     local engine = self.tts_engine
     local text = next_sentence.text
+    -- Piper abandoned for the session: prefetch via espeak synthesis
+    -- instead of the dead Piper queue.
+    local use_espeak = self._piper_abandoned and true or false
     UIManager:scheduleIn(0.2, function()
-        engine:prefetch(text)
+        engine:prefetch(text, use_espeak)
     end)
 end
 
@@ -2178,8 +2189,9 @@ session.  Two triggers: too many consecutive espeak fallbacks, or a
 zero-delivery timeout when Piper has not completed a single synthesis
 batch after PIPER_ZERO_DELIVERY_ABANDON_S (its server keeps stealing CPU
 from espeak on hopeless devices, issue #49).  Shows a one-time warning,
-kills the Piper server to free CPU, and enables the persistent
-"espeak-only mode" setting so subsequent sessions skip Piper.
+kills the Piper server to free CPU, and switches the session to
+espeak-only mode.  Session-scoped only: Piper is tried again on the next
+playback session, and the user's engine setting is never modified.
 Called from espeak fallback success paths in readNextSentence().
 --]]
 function SyncController:_checkPiperAbandon()
@@ -2207,15 +2219,10 @@ function SyncController:_checkPiperAbandon()
     logger.warn("SyncController: Abandoning Piper:", reason, "-- killing servers")
     pcall(function() self.tts_engine._piper:shutdown() end)
 
-    -- Persist the setting so Piper is skipped on future sessions too
-    if self.plugin then
-        self.plugin:setSetting("espeak_only_mode", true)
-    end
-
     -- Show a non-blocking warning so the user understands what happened
     local InfoMessage = require("ui/widget/infomessage")
     UIManager:show(InfoMessage:new{
-        text = T(_("Piper neural TTS could not keep up on this device: %1.\n\nSwitching to espeak-only mode for stable playback. To re-enable Piper, go to:\n  Audiobook > Voice settings > TTS engine"),
+        text = T(_("Piper neural TTS could not keep up on this device: %1.\n\nSwitching to espeak for the rest of this session. Piper will be tried again the next time you start playback. To keep espeak permanently, select it in:\n  Audiobook > Voice settings > TTS engine"),
             reason),
         timeout = 10,
     })

@@ -1693,7 +1693,7 @@ so when the current sentence finishes we can skip straight to playback.
 @param text string Text of the next sentence
 @return boolean Success
 --]]
-function TTSEngine:prefetch(text)
+function TTSEngine:prefetch(text, use_espeak)
     if not self.backend or not text or text == "" then
         return false
     end
@@ -1706,7 +1706,7 @@ function TTSEngine:prefetch(text)
         return false
     end
     -- Piper: delegate to the async queue-based prefetcher
-    if self.backend == self.BACKENDS.PIPER then
+    if self.backend == self.BACKENDS.PIPER and not use_espeak then
         self._piper:enqueue(text)
         return true  -- launched (or already in queue)
     end
@@ -1719,15 +1719,30 @@ function TTSEngine:prefetch(text)
     -- Save current audio file/timing so synthesizeCommand doesn't overwrite them
     local saved_file = self.current_audio_file
     local saved_timing = self.timing_data
-    local ok = self:synthesizeCommand(text, function(success, timing)
-        if success then
-            -- Move the generated file into the prefetch slot
+    local ok
+    if use_espeak then
+        -- espeak session fallback (Piper abandoned): pre-synthesize the
+        -- next fallback sentence while the current one plays, so the chain
+        -- does not stall on blocking synthesis between sentences (#49).
+        local fb_file = self:espeakSynthesizeFallback(text)
+        ok = fb_file ~= nil
+        if ok then
             self._prefetch_file = self.current_audio_file
             self._prefetch_timing = self.timing_data
             self._prefetch_text = text
-            logger.dbg("TTSEngine: Prefetched audio for:", text:sub(1, 40))
+            logger.dbg("TTSEngine: Prefetched espeak fallback for:", text:sub(1, 40))
         end
-    end)
+    else
+        ok = self:synthesizeCommand(text, function(success, timing)
+            if success then
+                -- Move the generated file into the prefetch slot
+                self._prefetch_file = self.current_audio_file
+                self._prefetch_timing = self.timing_data
+                self._prefetch_text = text
+                logger.dbg("TTSEngine: Prefetched audio for:", text:sub(1, 40))
+            end
+        end)
+    end
     -- Restore the current audio state (the playing sentence's file)
     self.current_audio_file = saved_file
     self.timing_data = saved_timing

@@ -856,9 +856,9 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
             callback = function(touchmenu_instance)
                 engine:setBackend(backend.id)
                 plugin:setSetting("tts_backend", backend.id)
-                -- An explicit engine choice clears any prior auto-fallback to
-                -- espeak-only mode; otherwise the user's selection would be
-                -- silently overridden on the next page.
+                -- An explicit engine choice clears the espeak-only mode
+                -- setting; otherwise the user's selection would be silently
+                -- overridden on the next page.
                 plugin:setSetting("espeak_only_mode", false)
                 -- Close the menu so the user reopens Voice Settings and sees
                 -- the correct engine-specific items (pitch, pauses, etc.).
