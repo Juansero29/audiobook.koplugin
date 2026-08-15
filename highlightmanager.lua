@@ -11,6 +11,7 @@ lets crengine draw the selection highlight natively.
 
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
+local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local _ = require("audiobook_gettext")
@@ -20,6 +21,33 @@ local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local Utils = dofile(_utils_dir .. "utils.lua")
 
 local Screen = Device.screen
+
+--[[--
+Union of highlight box arrays, clamped to screen bounds.
+Returns a Geom refresh region or nil when there is nothing to refresh.
+--]]
+local function boxesUnionRegion(arrays)
+    local min_x, min_y, max_x, max_y
+    for _, arr in ipairs(arrays) do
+        if arr then
+            for _, b in ipairs(arr) do
+                local x2, y2 = b.x + b.w, b.y + b.h
+                if not min_x or b.x < min_x then min_x = b.x end
+                if not min_y or b.y < min_y then min_y = b.y end
+                if not max_x or x2 > max_x then max_x = x2 end
+                if not max_y or y2 > max_y then max_y = y2 end
+            end
+        end
+    end
+    if not min_x then return nil end
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    min_x = math.max(0, min_x)
+    min_y = math.max(0, min_y)
+    max_x = math.min(sw, max_x)
+    max_y = math.min(sh, max_y)
+    if max_x <= min_x or max_y <= min_y then return nil end
+    return Geom:new{x = min_x, y = min_y, w = max_x - min_x, h = max_y - min_y}
+end
 
 local HighlightManager = {
     STYLES = {
@@ -43,8 +71,35 @@ function HighlightManager:new(o)
     -- Pending boxes for non-invert styles, drawn by the view module
     o._pending_boxes = nil
     o._view_module_registered = false
+    -- Boxes of the highlight currently on screen (and their page), used to
+    -- limit the next e-ink refresh to the changed strip.
+    o._last_boxes = nil
+    o._last_boxes_page = nil
 
     return o
+end
+
+--[[--
+Refresh the screen region covering the previous and new highlight boxes.
+Pages containing images are refreshed dithered by KOReader (slow waveform),
+so a full-page refresh there flashes visibly once per sentence; limiting
+the update to the changed strip keeps those updates cheap and flash-free.
+When no boxes are known, fall back to the caller's previous full refresh.
+@param new_boxes table|nil Boxes of the newly drawn highlight
+@param page number|nil Current page, used to drop stale boxes from the union
+--]]
+function HighlightManager:_refreshHighlight(new_boxes, page)
+    local arrays = {}
+    if self._last_boxes and self._last_boxes_page == page then
+        table.insert(arrays, self._last_boxes)
+    end
+    if new_boxes and #new_boxes > 0 then
+        table.insert(arrays, new_boxes)
+    end
+    UIManager:setDirty(self.ui.dialog or "all", "ui",
+        boxesUnionRegion(arrays))
+    self._last_boxes = new_boxes
+    self._last_boxes_page = page
 end
 
 function HighlightManager:setStyle(style)
@@ -148,10 +203,8 @@ function HighlightManager:_highlightByFragmentId(doc, fragment_id)
         self:_ensureViewModule()
         pcall(function() doc:clearSelection() end)
         self._selection_active = false
-        UIManager:setDirty(self.ui.dialog or "all", "ui")
-    else
-        UIManager:setDirty(self.ui.dialog or "all", "ui")
     end
+    self:_refreshHighlight(boxes, doc:getCurrentPage())
     return true
 end
 
@@ -554,7 +607,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         self._pending_boxes = boxes
         self:_ensureViewModule()
         self.is_highlighting = true
-        UIManager:setDirty(self.ui.dialog or "all", "ui")
+        self:_refreshHighlight(boxes, cur_page)
         return true
     end
 end
@@ -649,7 +702,8 @@ function HighlightManager:clearHighlights()
     end
     self._pending_boxes = nil
     if self.is_highlighting then
-        UIManager:setDirty(self.ui.dialog or "all", "ui")
+        -- Refresh only the strip where the highlight was drawn.
+        self:_refreshHighlight(nil, self._last_boxes_page)
     end
     self.current_word = nil
     self.is_highlighting = false
