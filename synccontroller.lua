@@ -36,6 +36,11 @@ local PIPER_LOOKAHEAD = 20
 -- One Kobo page is typically 20-25 sentences; 30 gives Piper one full
 -- page of breathing room before we give up.
 local PIPER_ABANDON_THRESHOLD = 30
+-- When espeak has been carrying the whole session and Piper has not
+-- completed a single synthesis batch after this long, the device is
+-- hopeless for neural TTS: abandon early so the Piper server stops
+-- stealing CPU from espeak (its batches can poll for up to 180 s).
+local PIPER_ZERO_DELIVERY_ABANDON_S = 120
 
 -- ── Accumulate-then-play buffering ───────────────────────────────────
 -- Piper on ARM synthesizes at ~0.3-0.5× real-time (each 5 s sentence
@@ -92,6 +97,7 @@ function SyncController:new(o)
     -- Piper ever delivering, kill the server to free CPU on single-core.
     o._piper_abandoned = false
     o._espeak_fallback_count = 0
+    o._piper_first_fallback_at = nil
     -- RTF auto-degrade: 0 = not triggered, 1 = low-resource + splitting
     -- applied for the session, 2 = espeak session fallback active.
     o._piper_degrade_stage = 0
@@ -334,6 +340,7 @@ function SyncController:readNextSentence()
             local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
             if fb_file then
                 self._espeak_fallback_count = (self._espeak_fallback_count or 0) + 1
+                self:_checkPiperRtfEscalation()
                 self:_checkPiperAbandon()
                 controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
                 controller:beginSentencePlayback(sentence)
@@ -544,6 +551,7 @@ function SyncController:readNextSentence()
             local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
             if fb_file then
                 self._espeak_fallback_count = (self._espeak_fallback_count or 0) + 1
+                self:_checkPiperRtfEscalation()
                 self:_checkPiperAbandon()
                 controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
                 controller:beginSentencePlayback(sentence)
@@ -2073,6 +2081,7 @@ function SyncController:_playViaEspeakOrSkip(sentence, reason)
         local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
         if fb_file then
             self._espeak_fallback_count = (self._espeak_fallback_count or 0) + 1
+            self:_checkPiperRtfEscalation()
             self:_checkPiperAbandon()
             self:applySentenceTiming(sentence, self.tts_engine.timing_data)
             self:beginSentencePlayback(sentence)
@@ -2164,19 +2173,38 @@ function SyncController:_checkPiperRtfEscalation()
 end
 
 --[[--
-Check whether Piper should be abandoned after too many consecutive espeak
-fallbacks (i.e. Piper never delivered any audio).  Shows a one-time warning
-explaining the situation, kills the Piper server to free CPU, and enables
-the persistent "espeak-only mode" setting so subsequent sessions skip Piper.
+Check whether Piper should be abandoned while espeak fallbacks carry the
+session.  Two triggers: too many consecutive espeak fallbacks, or a
+zero-delivery timeout when Piper has not completed a single synthesis
+batch after PIPER_ZERO_DELIVERY_ABANDON_S (its server keeps stealing CPU
+from espeak on hopeless devices, issue #49).  Shows a one-time warning,
+kills the Piper server to free CPU, and enables the persistent
+"espeak-only mode" setting so subsequent sessions skip Piper.
 Called from espeak fallback success paths in readNextSentence().
 --]]
 function SyncController:_checkPiperAbandon()
     if self._piper_abandoned then return end
-    if (self._espeak_fallback_count or 0) < PIPER_ABANDON_THRESHOLD then return end
+    if not self.tts_engine or not self.tts_engine._piper then return end
+
+    -- Remember when espeak first had to carry the session on its own
+    if not self._piper_first_fallback_at then
+        self._piper_first_fallback_at = UIManager:getTime()
+    end
+
+    local reason
+    if (self._espeak_fallback_count or 0) >= PIPER_ABANDON_THRESHOLD then
+        reason = T(_("it still had not produced any audio after %1 espeak sentences"),
+            tostring(self._espeak_fallback_count))
+    elseif self.tts_engine._piper:getRtfSampleCount() == 0
+            and UIManager:getTime() - self._piper_first_fallback_at
+                >= PIPER_ZERO_DELIVERY_ABANDON_S then
+        reason = T(_("it still had not produced any audio after %1 minutes of espeak fallback"),
+            tostring(math.floor(PIPER_ZERO_DELIVERY_ABANDON_S / 60)))
+    end
+    if not reason then return end
 
     self._piper_abandoned = true
-    logger.warn("SyncController: Abandoning Piper after",
-        self._espeak_fallback_count, "espeak fallbacks -- killing servers")
+    logger.warn("SyncController: Abandoning Piper:", reason, "-- killing servers")
     pcall(function() self.tts_engine._piper:shutdown() end)
 
     -- Persist the setting so Piper is skipped on future sessions too
@@ -2187,13 +2215,8 @@ function SyncController:_checkPiperAbandon()
     -- Show a non-blocking warning so the user understands what happened
     local InfoMessage = require("ui/widget/infomessage")
     UIManager:show(InfoMessage:new{
-        text = "Piper neural TTS could not keep up on this device "
-            .. "(single-core ARM). After "
-            .. tostring(self._espeak_fallback_count)
-            .. " sentences, it still hadn't produced any audio.\n\n"
-            .. "Switching to espeak-only mode for stable playback. "
-            .. "To re-enable Piper, go to:\n"
-            .. "  Audiobook > Voice settings > TTS engine",
+        text = T(_("Piper neural TTS could not keep up on this device: %1.\n\nSwitching to espeak-only mode for stable playback. To re-enable Piper, go to:\n  Audiobook > Voice settings > TTS engine"),
+            reason),
         timeout = 10,
     })
 end
@@ -2237,6 +2260,7 @@ function SyncController:stop()
     self._piper_warmed_up = false
     self._piper_abandoned = false
     self._espeak_fallback_count = 0
+    self._piper_first_fallback_at = nil
     self._piper_degrade_stage = 0
     self._piper_degrade_mark = nil
     -- Session-scoped auto-degrade flags end with the session; the user's
