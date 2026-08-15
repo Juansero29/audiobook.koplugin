@@ -65,6 +65,7 @@ function AndroidPlayer:new(o)
     o._audio_started = false
     o._mp_baseline_ms = nil
     o._mp_stuck_reads = 0
+    o._volume = 1.0
     return o
 end
 
@@ -108,6 +109,8 @@ function AndroidPlayer:init()
         self._method.getDuration = getMethod(env, mp_class, "getDuration", "()I")
         self._method.setAudioAttributes = getMethod(env, mp_class,
             "setAudioAttributes", "(Landroid/media/AudioAttributes;)V")
+        self._method.setVolume = getMethod(env, mp_class,
+            "setVolume", "(FF)V")
 
         if not self._method.init
             or not self._method.setDataSource
@@ -120,7 +123,8 @@ function AndroidPlayer:init()
             return
         end
 
-        -- Build AudioAttributes USAGE_MEDIA / CONTENT_TYPE_MUSIC once.
+        -- USAGE_MEDIA + CONTENT_TYPE_SPEECH: narration mixes more cleanly with
+        -- background music (Spotify) than CONTENT_TYPE_MUSIC on many devices.
         self._attrs_ref = nil
         local aa_class = env[0].FindClass(env, "android/media/AudioAttributes")
         local builder_class = env[0].FindClass(env,
@@ -133,7 +137,7 @@ function AndroidPlayer:init()
                 "setContentType", "(I)Landroid/media/AudioAttributes$Builder;")
             local build = getMethod(env, builder_class,
                 "build", "()Landroid/media/AudioAttributes;")
-            -- USAGE_MEDIA=1, CONTENT_TYPE_MUSIC=2
+            -- USAGE_MEDIA=1, CONTENT_TYPE_SPEECH=1
             if b_init and set_usage and set_ctype and build then
                 local builder = env[0].NewObject(env, builder_class, b_init)
                 if builder and not checkException(env) then
@@ -141,7 +145,7 @@ function AndroidPlayer:init()
                     args[0].i = 1  -- USAGE_MEDIA
                     builder = env[0].CallObjectMethodA(env, builder, set_usage, args)
                     checkException(env)
-                    args[0].i = 2  -- CONTENT_TYPE_MUSIC
+                    args[0].i = 1  -- CONTENT_TYPE_SPEECH
                     builder = env[0].CallObjectMethodA(env, builder, set_ctype, args)
                     checkException(env)
                     local attrs = env[0].CallObjectMethod(env, builder, build)
@@ -281,10 +285,32 @@ function AndroidPlayer:play(path, seek_ms)
         self._audio_started = false
         self._mp_baseline_ms = nil
         self._mp_stuck_reads = 0
+        -- Per-player gain (independent of Android system/stream volume).
+        self:setVolume(self._volume or 1.0)
         logger.warn("AndroidPlayer: playing", path,
-            "seek_ms=", seek_ms, "duration_ms=", self._duration_ms)
+            "seek_ms=", seek_ms, "duration_ms=", self._duration_ms,
+            "volume=", self._volume)
     end
     return ok
+end
+
+--- Per-stream volume 0..1 (MediaPlayer.setVolume).  Does NOT change the
+--- Android system/AirPods volume — only this audiobook's gain relative to it.
+function AndroidPlayer:setVolume(vol)
+    vol = tonumber(vol) or 1.0
+    if vol < 0 then vol = 0 end
+    if vol > 1 then vol = 1 end
+    self._volume = vol
+    if not self._mp_ref or not self._method.setVolume then return end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local args = ffi.new("jvalue[2]")
+        args[0].f = vol
+        args[1].f = vol
+        env[0].CallVoidMethodA(env, self._mp_ref, self._method.setVolume, args)
+        checkException(env)
+    end)
 end
 
 function AndroidPlayer:_queryMpPositionMs()
@@ -367,32 +393,62 @@ function AndroidPlayer:_wallPositionMs()
 end
 
 function AndroidPlayer:pause()
-    if not self._mp_ref or not self._playing or self._paused then return end
-    local android = self._android
-    android.jni:context(android.app.activity.vm, function(jni)
-        jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.pause)
-        checkException(jni.env)
-    end)
+    if not self._mp_ref then return end
+    -- Prefer wall clock (stable on Boox); fall back to MediaPlayer if wall
+    -- has not locked yet.  Then re-anchor so pause/resume stay on the SMIL
+    -- timeline instead of drifting back to the original play-from-here mark.
+    local pos = self:_wallPositionMs()
+    if not self._audio_started then
+        local mp = self:_queryMpPositionMs()
+        if mp and mp > (pos or 0) then pos = mp end
+    end
+    pos = math.max(0, math.floor(tonumber(pos) or 0))
+    if not self._paused then
+        local android = self._android
+        android.jni:context(android.app.activity.vm, function(jni)
+            jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.pause)
+            checkException(jni.env)
+        end)
+        self._paused = true
+    end
+    -- Clean re-anchor at the pause point (clears pause_accum drift).
+    self:_reanchorWallToMs(pos)
     self._paused = true
     self._pause_wall_start = UIManager:getTime()
+    self._audio_started = true
+    self._ever_confirmed_playing = true
+    self._last_mp_pos_ms = pos
+    logger.warn("AndroidPlayer: paused at pos_ms=", pos)
+    return pos
 end
 
 function AndroidPlayer:resume()
-    if not self._mp_ref or not self._paused then return end
+    if not self._mp_ref then return false end
+    local resume_ms = self._last_mp_pos_ms or self:_wallPositionMs() or 0
+    resume_ms = math.max(0, math.floor(tonumber(resume_ms) or 0))
+
+    -- Explicit seek + start so MediaPlayer and the SMIL wall clock agree.
+    -- Some Boox/HAL paths resume from an earlier buffered position after pause.
     local android = self._android
     android.jni:context(android.app.activity.vm, function(jni)
-        jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.start)
-        checkException(jni.env)
+        local env = jni.env
+        if resume_ms > 50 and self._method.seekTo then
+            local args = ffi.new("jvalue[1]")
+            args[0].i = resume_ms
+            env[0].CallVoidMethodA(env, self._mp_ref, self._method.seekTo, args)
+            checkException(env)
+        end
+        env[0].CallVoidMethod(env, self._mp_ref, self._method.start)
+        checkException(env)
     end)
-    if self._pause_wall_start then
-        self._pause_accum_ms = (self._pause_accum_ms or 0)
-            + time.to_ms(UIManager:getTime() - self._pause_wall_start)
-        self._pause_wall_start = nil
-    end
+
+    self:_reanchorWallToMs(resume_ms)
     self._paused = false
     self._playing = true
-    -- Keep wall clock continuous across pause/resume — do NOT re-enter the
-    -- startup lock dance (that caused highlight thrashing on stop/restart).
+    self._audio_started = true
+    self._ever_confirmed_playing = true
+    logger.warn("AndroidPlayer: resumed at pos_ms=", resume_ms)
+    return true
 end
 
 function AndroidPlayer:stop()
@@ -469,26 +525,14 @@ function AndroidPlayer:isPlaybackDone()
     if self._paused then return false end
     if not self._playing then return true end
 
+    -- Duration-only completion.  Do NOT ask MediaPlayer.isPlaying() — on Boox
+    -- it flaps false mid-play / on pause and was causing false EOS → restart
+    -- from the original "play from here" seek offset.
     local pos = self:getPositionMs()
     local dur = self:getDurationMs()
     if dur and dur > 0 and pos >= (dur - 400) then
         self._playing = false
         return true
-    end
-
-    -- Secondary check: MediaPlayer reports stopped after we were confirmed playing.
-    if self._ever_confirmed_playing then
-        local android = self._android
-        local mp_playing = android.jni:context(android.app.activity.vm, function(jni)
-            local r = jni.env[0].CallBooleanMethod(jni.env,
-                self._mp_ref, self._method.isPlaying)
-            if checkException(jni.env) then return true end -- assume still playing on error
-            return r ~= 0
-        end)
-        if mp_playing == false and pos > (self._start_seek_ms or 0) + 2000 then
-            self._playing = false
-            return true
-        end
     end
     return false
 end

@@ -19,6 +19,14 @@ local InfoMessage = require("ui/widget/infomessage")
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local PLUGIN_PATH = _utils_dir
 
+--- Append to plugin debug.log (included in bug reports). Never throws.
+local function dlog(...)
+    local DL = package.loaded["audiobook_debuglog"]
+    if DL and DL.log then
+        pcall(DL.log, DL, ...)
+    end
+end
+
 local MediaSync = {
     STATE = {
         STOPPED = "stopped",
@@ -867,14 +875,34 @@ end
 
 function MediaSync:pause(auto)
     if self.state ~= self.STATE.PLAYING then return end
+    -- Snapshot position before flipping state so a later STOPPED→play restart
+    -- (or Android seek-restart) continues from here, not the original start.
+    local pos = 0
+    if self.media_engine then
+        pcall(function() pos = self.media_engine:getPosition() or 0 end)
+        if not pos or pos < 0 then pos = 0 end
+        self.media_engine._seek_offset = pos
+        self.media_engine._paused_position = pos
+    end
     self.state = self.STATE.PAUSED
     if self.media_engine then
         pcall(function() self.media_engine:pause() end)
+        -- Re-read after engine pause (Android re-anchors to MediaPlayer).
+        pcall(function()
+            local p2 = self.media_engine:getPosition()
+            if p2 and p2 >= 0 then
+                pos = p2
+                self.media_engine._seek_offset = pos
+                self.media_engine._paused_position = pos
+            end
+        end)
     end
+    -- Pin the SMIL highlight to the pause time immediately.
+    pcall(function() self:_updateHighlightAtTime(pos) end)
     if self.playback_bar then
         pcall(function() self.playback_bar:setPlaying(false) end)
     end
-    logger.dbg("MediaSync: paused", auto and "(auto)" or "")
+    logger.warn("MediaSync: paused", auto and "(auto)" or "", "at", pos)
 end
 
 function MediaSync:clearSentenceHighlight()
@@ -886,12 +914,31 @@ end
 
 function MediaSync:resume(auto)
     if self.state ~= self.STATE.PAUSED then return end
+    -- Resume exactly on the SMIL timeline pause mark before starting audio.
+    local resume_pos = 0
+    if self.media_engine then
+        resume_pos = self.media_engine._paused_position
+            or self.media_engine._seek_offset
+            or 0
+        if resume_pos and resume_pos > 0 then
+            self.media_engine._seek_offset = resume_pos
+            self.media_engine._paused_position = resume_pos
+        end
+    end
     self.state = self.STATE.PLAYING
     if self.media_engine then
         pcall(function() self.media_engine:resume() end)
+        pcall(function()
+            local p2 = self.media_engine:getPosition()
+            if p2 and p2 > 0 then resume_pos = p2 end
+        end)
     end
+    -- Snap highlight to the SMIL sentence for this audio time before the loop.
+    pcall(function() self:_updateHighlightAtTime(resume_pos) end)
     if self.playback_bar then
-        pcall(function() self.playback_bar:setPlaying(true) end)
+        pcall(function()
+            self.playback_bar:setPlaying(true)
+        end)
     end
     -- The sync loop self-terminates while paused: its tick bails out without
     -- rescheduling once state != PLAYING.  Restart it (and the position
@@ -901,7 +948,7 @@ function MediaSync:resume(auto)
     -- the highlight to where the audio actually is.
     self:_startSyncLoop(self._chain_generation)
     self:_startPositionPoller(self._chain_generation)
-    logger.dbg("MediaSync: resumed", auto and "(auto)" or "")
+    logger.warn("MediaSync: resumed", auto and "(auto)" or "", "at", resume_pos)
 end
 
 function MediaSync:isPlaying()
@@ -1040,6 +1087,85 @@ function MediaSync:_currentOverlayChapterIndex()
     return idx, chapters
 end
 
+local function overlayChapterKey(ch)
+    if not ch then return nil end
+    return ch.text_doc or ch.title
+end
+
+--- Audio segments that belong to one Storyteller content chapter.
+-- A single EPUB/XHTML chapter often spans many ~4–5 min MP4 parts, so the
+-- raw `_smil_overlay_chapters` list has one row per part boundary.
+-- @return segments, total_duration_s
+function MediaSync:_overlayChapterSegments(key)
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not key or not chapters or #chapters == 0 then return {}, 0 end
+
+    local segments = {}
+    for i, c in ipairs(chapters) do
+        local ckey = overlayChapterKey(c)
+        if ckey == key then
+            local start_t = tonumber(c.start_time) or 0
+            local end_t = nil
+            for j = i + 1, #chapters do
+                if chapters[j].audio_path == c.audio_path then
+                    end_t = tonumber(chapters[j].start_time)
+                    break
+                end
+            end
+            if not end_t then
+                local by_file = self.plugin and self.plugin._smil_by_file
+                local slot = by_file and c.audio_path and by_file[c.audio_path]
+                local timing = (slot and slot.timing) or self.timing_data
+                if timing then
+                    for k = #timing, 1, -1 do
+                        local e = timing[k]
+                        if (not c.text_doc or e.text_doc == c.text_doc)
+                            and (not e.audio_path or e.audio_path == c.audio_path) then
+                            end_t = tonumber(e.end_time) or tonumber(e.start_time)
+                            break
+                        end
+                    end
+                end
+            end
+            if not end_t then
+                end_t = start_t + 1
+            end
+            table.insert(segments, {
+                audio_path = c.audio_path,
+                start_time = start_t,
+                end_time = end_t,
+                dur = math.max(0.1, end_t - start_t),
+                idx = i,
+            })
+        end
+    end
+    local total = 0
+    for _, s in ipairs(segments) do total = total + s.dur end
+    return segments, total
+end
+
+--- One menu/skip entry per content document (deduped across MP4 parts).
+-- @return { { index, ch, duration }, ... }
+function MediaSync:_uniqueOverlayChapters()
+    local chapters = self.plugin and self.plugin._smil_overlay_chapters
+    if not chapters or #chapters == 0 then return {} end
+    local seen = {}
+    local unique = {}
+    for i, ch in ipairs(chapters) do
+        local key = overlayChapterKey(ch)
+        if key and not seen[key] then
+            seen[key] = true
+            local _, dur = self:_overlayChapterSegments(key)
+            table.insert(unique, {
+                index = i,
+                ch = ch,
+                duration = dur or 0,
+            })
+        end
+    end
+    return unique
+end
+
 --- Push the live chapter title into the player (full + mini bar).
 function MediaSync:_refreshPlaybackBarTitles()
     if not self.playback_bar then return end
@@ -1070,9 +1196,19 @@ end
 function MediaSync:nextChapter()
     -- Storyteller read-along: ⏭ means next SMIL chapter, not next ~4 min audio part.
     if self.overlay_mode then
-        local idx, chapters = self:_currentOverlayChapterIndex()
-        if chapters and idx and idx < #chapters then
-            self:seekToOverlayChapter(idx + 1)
+        local unique = self:_uniqueOverlayChapters()
+        if #unique == 0 then return end
+        local cur = select(1, self:_resolveOverlayChapter())
+        local cur_key = overlayChapterKey(cur)
+        local cur_u = 1
+        for i, u in ipairs(unique) do
+            if overlayChapterKey(u.ch) == cur_key then
+                cur_u = i
+                break
+            end
+        end
+        if cur_u < #unique then
+            self:seekToOverlayChapter(unique[cur_u + 1].index)
         end
         return
     end
@@ -1095,9 +1231,19 @@ end
 
 function MediaSync:prevChapter()
     if self.overlay_mode then
-        local idx, chapters = self:_currentOverlayChapterIndex()
-        if chapters and idx and idx > 1 then
-            self:seekToOverlayChapter(idx - 1)
+        local unique = self:_uniqueOverlayChapters()
+        if #unique == 0 then return end
+        local cur = select(1, self:_resolveOverlayChapter())
+        local cur_key = overlayChapterKey(cur)
+        local cur_u = 1
+        for i, u in ipairs(unique) do
+            if overlayChapterKey(u.ch) == cur_key then
+                cur_u = i
+                break
+            end
+        end
+        if cur_u > 1 then
+            self:seekToOverlayChapter(unique[cur_u - 1].index)
         end
         return
     end
@@ -1657,7 +1803,26 @@ function MediaSync:showPlaybackBar()
         return
     end
     -- For standalone audio (scrubber mode), use full-screen AudiobookPlayer overlay
-    local AudiobookPlayer = dofile(PLUGIN_PATH .. "audiobookplayer.lua")
+    local AudiobookPlayer
+    do
+        local candidates = {
+            PLUGIN_PATH .. "audiobookplayer.fix31.lua",
+            PLUGIN_PATH .. "audiobookplayer.fix30.lua",
+            PLUGIN_PATH .. "audiobookplayer.fix29.lua",
+            PLUGIN_PATH .. "audiobookplayer.lua",
+        }
+        for _, path in ipairs(candidates) do
+            local f = io.open(path, "r")
+            if f then
+                f:close()
+                AudiobookPlayer = dofile(path)
+                break
+            end
+        end
+    end
+    if not AudiobookPlayer then
+        AudiobookPlayer = dofile(PLUGIN_PATH .. "audiobookplayer.lua")
+    end
     -- Top-bar title = book name (NOT the first SMIL sentence text — that looked
     -- like random words next to the BT button).
     local title = _("Audiobook")
@@ -1721,7 +1886,16 @@ function MediaSync:showPlaybackBar()
             elseif self.media_engine and self.media_engine.current_path then
                 -- After a hard stop / botched track advance the bar can stay
                 -- visible while state is STOPPED — play must restart audio.
-                logger.warn("MediaSync: play from STOPPED — restarting current file")
+                -- Use the latest seek/pause mark so we do not jump back to the
+                -- original "Play aligned from here" offset.
+                local restart_pos = self.media_engine._paused_position
+                    or self.media_engine._seek_offset
+                    or 0
+                if restart_pos and restart_pos > 0 then
+                    self.media_engine._seek_offset = restart_pos
+                end
+                logger.warn("MediaSync: play from STOPPED — restarting at",
+                    self.media_engine._seek_offset or 0)
                 local gen = self._chain_generation + 1
                 self._chain_generation = gen
                 self.state = self.STATE.PLAYING
@@ -1995,6 +2169,19 @@ by showChapterList() and showPlaylist().
   self:_closeModalMenu()) -- chapters close on select, the playlist stays open.
 --]]
 function MediaSync:_showModalMenu(opts)
+    -- Always drop a previous chapter sheet first.
+    self:_closeModalMenu()
+
+    -- Android/Boox: opening KOReader's Menu widget synchronously from a
+    -- transport-bar button callback has been crashing the activity (blank
+    -- crash screen / ActivityThread top-resumed noise).  Use ButtonDialogTitle
+    -- and defer the show by a tick so we leave the gesture handler first.
+    local is_android = Device.isAndroid and Device:isAndroid()
+    if is_android then
+        self:_showModalMenuButtonDialog(opts)
+        return
+    end
+
     local Menu = require("ui/widget/menu")
     local CenterContainer = require("ui/widget/container/centercontainer")
     local InputContainer = require("ui/widget/container/inputcontainer")
@@ -2062,11 +2249,155 @@ function MediaSync:_showModalMenu(opts)
 
     menu.close_callback = function() ms:_closeModalMenu() end
 
-    UIManager:show(window)
+    UIManager:scheduleIn(0.05, function()
+        if self._chapter_menu_window == window then
+            UIManager:show(window)
+        end
+    end)
     return menu
 end
 
+--- Android-safe chapter/playlist picker (paginated ButtonDialog).
+--- Full Menu / giant ButtonDialog crashed on Boox; a short paginated
+--- ButtonDialog is the same widget KOReader uses elsewhere and stays light.
+function MediaSync:_showModalMenuButtonDialog(opts)
+    local items = opts.items or {}
+    if #items == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No chapters available."),
+            timeout = 2,
+        })
+        return
+    end
+
+    local ok_bd, ButtonDialog = pcall(require, "ui/widget/buttondialog")
+    if not ok_bd or not ButtonDialog then
+        logger.err("MediaSync: ButtonDialog unavailable:", ButtonDialog)
+        dlog("chapter: ButtonDialog missing:", tostring(ButtonDialog))
+        UIManager:show(InfoMessage:new{
+            text = _("Could not open chapter list.") .. "\nButtonDialog missing",
+            timeout = 4,
+        })
+        return
+    end
+
+    local PAGE_SIZE = 8
+    local page = 1
+    local current = tonumber(opts.current) or 1
+    if current < 1 then current = 1 end
+    if current > #items then current = #items end
+    page = math.floor((current - 1) / PAGE_SIZE) + 1
+
+    local ms = self
+    local dialog
+
+    local function close_picker()
+        if dialog then
+            pcall(function() UIManager:close(dialog) end)
+        end
+        ms._chapter_menu_window = nil
+        ms._chapter_menu = nil
+        dialog = nil
+    end
+
+    local function show_page()
+        local total_pages = math.max(1, math.ceil(#items / PAGE_SIZE))
+        if page < 1 then page = 1 end
+        if page > total_pages then page = total_pages end
+        local first = (page - 1) * PAGE_SIZE + 1
+        local last = math.min(#items, page * PAGE_SIZE)
+
+        local buttons = {}
+        for i = first, last do
+            local item = items[i]
+            if item then
+                local label = tostring(item.text or (_("Item") .. " " .. i))
+                if #label > 80 then
+                    label = label:sub(1, 77) .. "..."
+                end
+                if i == current then
+                    label = "> " .. label
+                end
+                local cb = item.callback
+                table.insert(buttons, {{
+                    text = label,
+                    callback = function()
+                        close_picker()
+                        UIManager:scheduleIn(0.1, function()
+                            if cb then pcall(cb) end
+                        end)
+                    end,
+                }})
+            end
+        end
+
+        -- Navigation row
+        table.insert(buttons, {
+            {
+                text = _("Prev"),
+                enabled = page > 1,
+                callback = function()
+                    page = page - 1
+                    close_picker()
+                    UIManager:scheduleIn(0.05, show_page)
+                end,
+            },
+            {
+                text = _("Close"),
+                callback = close_picker,
+            },
+            {
+                text = _("Next"),
+                enabled = page < total_pages,
+                callback = function()
+                    page = page + 1
+                    close_picker()
+                    UIManager:scheduleIn(0.05, show_page)
+                end,
+            },
+        })
+
+        local title = string.format("%s (%d/%d)",
+            tostring(opts.title or _("Chapters")), page, total_pages)
+
+        local ok, err = pcall(function()
+            dialog = ButtonDialog:new{
+                title = title,
+                buttons = buttons,
+            }
+            ms._chapter_menu_window = dialog
+            ms._chapter_menu = nil
+            UIManager:show(dialog)
+        end)
+        if not ok then
+            logger.err("MediaSync: chapter ButtonDialog failed:", err)
+            dlog("chapter: ButtonDialog:new failed:", tostring(err))
+            ms._chapter_menu_window = nil
+            UIManager:show(InfoMessage:new{
+                text = _("Could not open chapter list.") .. "\n" .. tostring(err),
+                timeout = 6,
+            })
+        end
+    end
+
+    UIManager:scheduleIn(0.2, function()
+        local ok, err = pcall(show_page)
+        if not ok then
+            logger.err("MediaSync: chapter picker failed:", err)
+            dlog("chapter: show_page failed:", tostring(err))
+            UIManager:show(InfoMessage:new{
+                text = _("Could not open chapter list.") .. "\n" .. tostring(err),
+                timeout = 6,
+            })
+        end
+    end)
+end
+
 function MediaSync:showChapterList()
+    dlog("chapter: showChapterList overlay=", tostring(self.overlay_mode),
+        "smil_n=", tostring(self.plugin and self.plugin._smil_overlay_chapters and #self.plugin._smil_overlay_chapters or 0),
+        "chapters_n=", tostring(self.chapters and #self.chapters or 0),
+        "playlist_n=", tostring(self.playlist_files and #self.playlist_files or 0))
     if self.overlay_mode and self.plugin and self.plugin._smil_overlay_chapters
         and #self.plugin._smil_overlay_chapters > 0 then
         self:showOverlayChapterList()
@@ -2104,6 +2435,19 @@ end
 function MediaSync:showOverlayChapterList()
     local chapters = self.plugin and self.plugin._smil_overlay_chapters
     if not chapters or #chapters == 0 then
+        dlog("chapter: overlay list empty")
+        UIManager:show(InfoMessage:new{
+            text = _("No chapters available."),
+            timeout = 2,
+        })
+        return
+    end
+
+    -- Dedup by content document: one menu row per Storyteller chapter.
+    -- Raw list has ~1 entry per MP4 part (often start_time=0 continuations).
+    local unique = self:_uniqueOverlayChapters()
+    if #unique == 0 then
+        dlog("chapter: unique overlay list empty raw_n=", #chapters)
         UIManager:show(InfoMessage:new{
             text = _("No chapters available."),
             timeout = 2,
@@ -2112,21 +2456,42 @@ function MediaSync:showOverlayChapterList()
     end
 
     local current_idx = 1
-    local _, idx = self:_resolveOverlayChapter()
-    if idx then current_idx = idx end
+    -- Do NOT name the first return `_`: that shadows gettext `_()` below.
+    local cur_ch = select(1, self:_resolveOverlayChapter())
+    local cur_key = overlayChapterKey(cur_ch)
+    for i, u in ipairs(unique) do
+        if overlayChapterKey(u.ch) == cur_key then
+            current_idx = i
+            break
+        end
+    end
+    dlog("chapter: overlay list raw_n=", #chapters,
+        "unique_n=", #unique, "current_idx=", current_idx)
 
     local items = {}
-    for i, ch in ipairs(chapters) do
+    for i, u in ipairs(unique) do
+        local ch = u.ch
+        local seek_idx = u.index
         table.insert(items, {
             text = (ch.title or _("Chapter") .. " " .. i)
-                .. "  (" .. self:_formatTime(ch.start_time) .. ")",
+                .. "  (" .. self:_formatTime(u.duration) .. ")",
             callback = function()
                 self:_closeModalMenu()
-                self:seekToOverlayChapter(i)
+                self:seekToOverlayChapter(seek_idx)
             end,
         })
     end
-    self:_showModalMenu{ title = _("Chapters"), items = items, current = current_idx }
+    local ok, err = pcall(function()
+        self:_showModalMenu{ title = _("Chapters"), items = items, current = current_idx }
+    end)
+    if not ok then
+        logger.err("MediaSync: showOverlayChapterList failed:", err)
+        dlog("chapter: showOverlayChapterList failed:", tostring(err))
+        UIManager:show(InfoMessage:new{
+            text = _("Could not open chapter list.") .. "\n" .. tostring(err),
+            timeout = 6,
+        })
+    end
 end
 
 function MediaSync:seekToOverlayChapter(index)
@@ -2242,59 +2607,11 @@ function MediaSync:_overlayChapterProgress(pos)
     local ch, idx = self:_resolveOverlayChapter()
     if not ch then return nil, nil end
 
-    local chapters = self.plugin and self.plugin._smil_overlay_chapters
-    if not chapters or #chapters == 0 then return nil, nil end
-
-    local key = ch.text_doc or ch.title
+    local key = overlayChapterKey(ch)
     if not key then return nil, nil end
 
-    -- Collect every overlay-chapter row that belongs to this content chapter,
-    -- in playlist/audio order.
-    local segments = {}
-    for i, c in ipairs(chapters) do
-        local ckey = c.text_doc or c.title
-        if ckey == key then
-            local start_t = tonumber(c.start_time) or 0
-            local end_t = nil
-            -- End = next chapter boundary on the same audio file…
-            for j = i + 1, #chapters do
-                if chapters[j].audio_path == c.audio_path then
-                    end_t = tonumber(chapters[j].start_time)
-                    break
-                end
-            end
-            -- …or last timing entry for this doc on that file.
-            if not end_t then
-                local by_file = self.plugin and self.plugin._smil_by_file
-                local slot = by_file and c.audio_path and by_file[c.audio_path]
-                local timing = (slot and slot.timing) or self.timing_data
-                if timing then
-                    for k = #timing, 1, -1 do
-                        local e = timing[k]
-                        if (not c.text_doc or e.text_doc == c.text_doc)
-                            and (not e.audio_path or e.audio_path == c.audio_path) then
-                            end_t = tonumber(e.end_time) or tonumber(e.start_time)
-                            break
-                        end
-                    end
-                end
-            end
-            if not end_t then
-                end_t = start_t + 1
-            end
-            table.insert(segments, {
-                audio_path = c.audio_path,
-                start_time = start_t,
-                end_time = end_t,
-                dur = math.max(0.1, end_t - start_t),
-                idx = i,
-            })
-        end
-    end
+    local segments, total = self:_overlayChapterSegments(key)
     if #segments == 0 then return nil, nil end
-
-    local total = 0
-    for _, s in ipairs(segments) do total = total + s.dur end
 
     local current_path = self.media_engine and self.media_engine.current_path
     local path_order = {}

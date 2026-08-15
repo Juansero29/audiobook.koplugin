@@ -1736,6 +1736,20 @@ function BugReport.generate(plugin)
         "",
         formatSection("Resources", resources),
         "",
+        "── Recent plugin debug log ──",
+        (function()
+            -- Prefer the live ring buffer registered at plugin init.
+            local DebugLog = package.loaded["audiobook_debuglog"]
+            if not (DebugLog and DebugLog.tail) then
+                local ok, mod = pcall(dofile, _utils_dir .. "debuglog.lua")
+                if ok then DebugLog = mod end
+            end
+            if DebugLog and DebugLog.tail then
+                return DebugLog.tail(150)
+            end
+            return "(debuglog.lua unavailable)"
+        end)(),
+        "",
         "=== End of Bug Report ===",
     }
 

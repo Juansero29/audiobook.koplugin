@@ -1335,13 +1335,19 @@ function MediaEngine:_playAndroid(gen)
     end
 
     self._android_playback_confirmed = false
-    -- Output / BT chain lag subtracted by MediaSync highlight loop.
-    -- Wall-clock is locked once at audible start; this small latency keeps
-    -- highlights from leading the spoken audio on Boox.
-    self.position_latency_s = 0.25
+    -- Match Readest-style SMIL sync: highlight at the Media Overlay clock
+    -- (clipBegin), not an artificial delay.  BT/e-ink micro-skew is handled
+    -- by the Overlay sync offset setting / mini-player −/+ nudge (100 ms).
+    -- The old 0.25 s default made sentence underlines visibly lag the narration.
+    self.position_latency_s = 0
 
     logger.warn("MediaEngine: Android play", self.current_path,
         "offset=", offset, "duration=", self.current_duration)
+
+    -- Apply saved media volume (♪ buttons) as MediaPlayer gain.
+    pcall(function()
+        player:setVolume(self._volume or 1.0)
+    end)
 
     self:_startAndroidCompletionWatcher(gen)
     return true
@@ -2684,7 +2690,23 @@ function MediaEngine:pause()
     end
 
     if self.backend == self.BACKENDS.ANDROID and self._android_player then
-        self._android_player:pause()
+        -- Query/re-anchor via AndroidPlayer BEFORE trusting getPosition():
+        -- is_paused is already true here, and a leftover _paused_position from
+        -- the previous pause would otherwise be returned as a stale SMIL mark.
+        self._paused_position = nil
+        local ap_pos = nil
+        pcall(function() ap_pos = self._android_player:pause() end)
+        local pos = 0
+        if ap_pos and ap_pos > 0 then
+            pos = ap_pos / 1000
+        else
+            pcall(function()
+                pos = (self._android_player:getPositionMs() or 0) / 1000
+            end)
+        end
+        self._paused_position = math.max(0, pos)
+        self._seek_offset = self._paused_position
+        logger.warn("MediaEngine: Android pause at", self._paused_position)
         return
     end
 
@@ -2759,12 +2781,45 @@ function MediaEngine:resume()
     end
 
     if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        local resume_pos = self._paused_position
+        if resume_pos == nil then
+            pcall(function() resume_pos = self:getPosition() or 0 end)
+        end
+        resume_pos = math.max(0, tonumber(resume_pos) or 0)
+        self._seek_offset = resume_pos
+        -- Keep pause mark until after a successful resume so seek-restart and
+        -- SMIL highlight can still read it if MediaPlayer start fails.
+        self._paused_position = resume_pos
+
         self.is_paused = false
         if self._pause_start_time then
             self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
             self._pause_start_time = nil
         end
-        self._android_player:resume()
+
+        local player = self._android_player
+        local has_player = player and player._mp_ref
+        local resumed = false
+        if has_player then
+            -- Force AndroidPlayer's resume seek target from our SMIL mark.
+            player._last_mp_pos_ms = math.floor(resume_pos * 1000)
+            local ok, result = pcall(function() return player:resume() end)
+            resumed = ok and result ~= false
+        end
+
+        if not resumed then
+            -- MediaPlayer was released / HAL dropped the session: seek-restart
+            -- at the saved pause position instead of the original start offset.
+            logger.warn("MediaEngine: Android resume via seek-restart at", resume_pos)
+            local complete = self._on_complete
+            local fail = self._on_fail
+            self:play(complete, fail)
+            return
+        end
+
+        self._play_start_time = UIManager:getTime()
+        self._total_pause_ms = 0
+        logger.warn("MediaEngine: Android resume at", resume_pos)
         return
     end
 
@@ -3230,11 +3285,19 @@ function MediaEngine:getPosition()
         return self._paused_position
     end
 
-    -- Android: MediaPlayer position (startup hold + MP re-anchor in AndroidPlayer).
+    -- Android: MediaPlayer position; while paused prefer the saved pause mark.
     if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        if self.is_paused and self._paused_position ~= nil then
+            return self._paused_position
+        end
         local pos_ms = self._android_player:getPositionMs()
         if pos_ms then
-            return pos_ms / 1000
+            local pos = pos_ms / 1000
+            -- Keep seek_offset fresh so STOPPED→play restarts from here.
+            if not self.is_paused then
+                self._seek_offset = pos
+            end
+            return pos
         end
     end
 
@@ -3406,6 +3469,15 @@ function MediaEngine:setVolume(pct)
     local v = pct / 100
     if math.abs(v - (self._volume or 1.0)) < 0.001 then return end
     self._volume = v
+
+    -- Android: MediaPlayer.setVolume is a live per-stream gain (0..1) on top
+    -- of the system/AirPods volume — no seek-restart, and independent of
+    -- Spotify/YouTube Music's own level.
+    if self.backend == self.BACKENDS.ANDROID and self._android_player then
+        pcall(function() self._android_player:setVolume(v) end)
+        logger.warn("MediaEngine: Android volume=", pct)
+        return
+    end
 
     if not self.is_playing then return end
 

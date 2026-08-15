@@ -675,6 +675,26 @@ function AudiobookPlayer:setupUI()
         }
     end
 
+    -- Chapter list on the mini bar (overlay): avoids expanding the fullscreen
+    -- player just to tap ☰, which was crashing on Boox.
+    local chapter_group = {}
+    if self.on_chapter_list then
+        self._mini_chapters = Button:new{
+            text = "☰",
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 16,
+            callback = function() self:onChapterList() end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        center_max_width = center_max_width - mini_btn_size - spacing
+        chapter_group = {
+            self._mini_chapters,
+            HorizontalSpan:new{ width = spacing },
+        }
+    end
+
     -- Create the centered title/time stack now that side buttons have reserved
     -- their full width, so the text cannot overlap the volume/sync buttons.
     self._mini_title = TextWidget:new{
@@ -700,6 +720,8 @@ function AudiobookPlayer:setupUI()
         HorizontalSpan:new{ width = spacing },
         self._mini_play_pause,
         HorizontalSpan:new{ width = spacing },
+        chapter_group[1] or HorizontalSpan:new{ width = 0 },
+        chapter_group[2] or HorizontalSpan:new{ width = 0 },
         vol_group[1] or HorizontalSpan:new{ width = 0 },
         vol_group[2] or HorizontalSpan:new{ width = 0 },
         vol_group[3] or HorizontalSpan:new{ width = 0 },
@@ -824,7 +846,28 @@ function AudiobookPlayer:_restore()
 end
 
 function AudiobookPlayer:onChapterList()
-    if self.on_chapter_list then self.on_chapter_list() end
+    if not self.on_chapter_list then return end
+    local cb = self.on_chapter_list
+    -- Boox crashes when a second top-level dialog is stacked on the fullscreen
+    -- player (covers_fullscreen + OpenGL).  Collapse to the mini bar first,
+    -- then open the chapter picker on the next tick.
+    if not self._minimized then
+        pcall(function() self:onMinimize() end)
+    end
+    UIManager:scheduleIn(0.25, function()
+        local ok, err = pcall(cb)
+        if not ok then
+            logger.err("AudiobookPlayer: chapter list failed:", err)
+            local DL = package.loaded["audiobook_debuglog"]
+            if DL and DL.log then
+                pcall(DL.log, DL, "player: onChapterList failed:", tostring(err))
+            end
+            UIManager:show(require("ui/widget/infomessage"):new{
+                text = _("Could not open chapter list.") .. "\n" .. tostring(err),
+                timeout = 6,
+            })
+        end
+    end)
 end
 
 function AudiobookPlayer:onShuffle()
@@ -849,20 +892,25 @@ end
 
 -- UI update helpers
 function AudiobookPlayer:setPlaying(is_playing)
-    if is_playing ~= self.is_playing then
-        self.is_playing = is_playing
-        local txt = is_playing and "⏸" or "▶"
+    -- Always push the icon/text even when the boolean is unchanged: on Boox
+    -- the mini-bar dirty region sometimes misses the first toggle.
+    self.is_playing = is_playing and true or false
+    local txt = self.is_playing and "⏸" or "▶"
+    if self.play_pause_button then
         self.play_pause_button:setText(txt, self.play_pause_button.width)
-        self._mini_play_pause:setText(txt, self._mini_play_pause.width)
-        UIManager:setDirty(self, function()
-            -- When minimized only the mini bar is on screen; its area is
-            -- exactly self.dimen (shrunk by onMinimize).
-            if self._minimized then
-                return "ui", self.dimen
-            end
-            return "ui", self.play_pause_button.dimen
-        end)
     end
+    if self._mini_play_pause then
+        self._mini_play_pause:setText(txt, self._mini_play_pause.width)
+    end
+    UIManager:setDirty(self, function()
+        if self._minimized then
+            return "ui", self.dimen
+        end
+        if self.play_pause_button and self.play_pause_button.dimen then
+            return "ui", self.play_pause_button.dimen
+        end
+        return "ui"
+    end)
 end
 
 function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec)
@@ -1253,8 +1301,8 @@ function AudiobookPlayer:_volumeText()
 end
 
 --- Nudge the volume by delta percent.  The on-screen value updates instantly;
---- the actual apply (which restarts the decode pipeline) is debounced so a
---- burst of taps coalesces into a single restart.
+--- non-Android backends debounce the apply (pipeline restart).  Android uses
+--- MediaPlayer.setVolume live, so apply immediately for responsive ♪ buttons.
 function AudiobookPlayer:_applyVolume(delta)
     local pct = (self.volume_pct or 100) + delta
     if pct < 0 then pct = 0 end
@@ -1273,6 +1321,17 @@ function AudiobookPlayer:_applyVolume(delta)
         if self._minimized then return "ui", self.dimen end
         return "ui", self.volume_widget and self.volume_widget.dimen or nil
     end)
+
+    local Device = require("device")
+    local live = Device.isAndroid and Device:isAndroid()
+    if live then
+        if self._vol_apply_timer then
+            UIManager:unschedule(self._vol_apply_timer)
+            self._vol_apply_timer = nil
+        end
+        if self.on_volume then self.on_volume(self.volume_pct) end
+        return
+    end
 
     if self._vol_apply_timer then
         UIManager:unschedule(self._vol_apply_timer)
@@ -1496,10 +1555,18 @@ function AudiobookPlayer:handleEvent(event)
                 local mini_y = self:_miniBarY()
                 local on_bar = ges.pos.y >= mini_y
                     and ges.pos.y < mini_y + self._mini_height
-                if on_bar and ges.ges == "tap" then
+                    if on_bar and ges.ges == "tap" then
                     -- Tap on play/pause button?
                     if self:_isTapOnWidget(ges.pos, self._mini_play_pause) then
                         self:onPlayPause()
+                        return true
+                    end
+                    -- Tap on chapter list (mini ☰)?
+                    if self._mini_chapters
+                        and self:_isTapOnWidget(ges.pos, self._mini_chapters) then
+                        if self._mini_chapters.callback then
+                            self._mini_chapters.callback()
+                        end
                         return true
                     end
                     -- Tap on close button?
