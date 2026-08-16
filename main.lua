@@ -925,14 +925,9 @@ function Audiobook:addToMainMenu(menu_items)
                                 end
                             else
                                 pcall(function() ms:_releaseMiniBarSpace() end)
-                                if self:getSetting("keep_media_overlay_bar", true)
-                                    and self:_hasMediaOverlays() then
-                                    -- Bar stays; inset is session-only until lock is on again.
-                                    pcall(function() ms:pinOverlayChrome() end)
-                                end
                             end
                         end,
-                        help_text = _("When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings after the first layout. Later opens typeset with that margin already applied, so CRE does not reflow again. Disable to restore your original margins and change them with KOReader’s usual margin controls."),
+                        help_text = _("When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings before CRE typesets. The next open rebuilds the layout once (text stays above the audiobook bar); after that, KOReader reuses that layout. Disable to restore your original margins and edit them with KOReader’s usual controls."),
                     },
                     {
                         text = _("Keep status bars during read-aloud"),
@@ -3556,27 +3551,60 @@ end
 function Audiobook:onPosUpdate(pos, refresh_type)
 end
 
--- Before ReaderTypeset reads copt_*, put the saved overlay inset into
--- KOReader's own bottom margin so the first CRE pass already matches.
+function Audiobook:_shouldLockKoreaderMargins()
+    return self:getSetting("lock_koreader_page_margins", true)
+        and self:getSetting("keep_media_overlay_bar", true)
+end
+
+function Audiobook:_defaultOverlayBottomUnscaled()
+    local screen = Device and Device.screen
+    if not screen then
+        return 46
+    end
+    local bar_h = screen:scaleBySize(44)
+    if screen.unscaleBySize then
+        return screen:unscaleBySize(bar_h) + 2
+    end
+    return 46
+end
+
+function Audiobook:_docWantsLockedOverlayMargins(config, document)
+    if not self:_shouldLockKoreaderMargins() then return false end
+    if not config then return false end
+    if config:readSetting("audiobook_overlay_margin_locked") then return true end
+    if config:readSetting("audiobook_overlay_bottom") then return true end
+    if config:readSetting("audiobook_overlay_orig_bottom") then return true end
+    local path = document and (document.file or document.file_path)
+    if path then
+        local pos = self:_getSavedAlignedPosition(path)
+        if pos then return true end
+    end
+    return false
+end
+
+-- Apply the overlay inset as KOReader's own bottom margin *before* CRE
+-- typesets. That is the one durable reload: later opens hit the new cache.
+-- Never SetPageMargins after the page is on screen (Android ANR).
 function Audiobook:onDocSettingsLoad(config, document)
     if not config then return end
-    if not self:getSetting("lock_koreader_page_margins", true) then return end
-    if not self:getSetting("keep_media_overlay_bar", true) then return end
-    if not config:readSetting("audiobook_overlay_margin_locked") then return end
+    if not self:_docWantsLockedOverlayMargins(config, document) then return end
     local needed = tonumber(config:readSetting("audiobook_overlay_bottom"))
-    if not needed then return end
-    if not config:readSetting("audiobook_overlay_orig_bottom") then
-        local current = config:readSetting("copt_b_page_margin")
-        if current ~= nil and current ~= needed then
-            config:saveSetting("audiobook_overlay_orig_bottom", current)
-        end
+        or self:_defaultOverlayBottomUnscaled()
+    if not needed or needed <= 0 then return end
+    local copt = tonumber(config:readSetting("copt_b_page_margin"))
+    if config:readSetting("audiobook_overlay_orig_bottom") == nil
+        and copt ~= nil and math.abs(copt - needed) > 1 then
+        config:saveSetting("audiobook_overlay_orig_bottom", copt)
     end
     config:saveSetting("copt_b_page_margin", needed)
+    config:saveSetting("audiobook_overlay_bottom", needed)
+    config:saveSetting("audiobook_overlay_margin_locked", true)
     local cfg = document and document.configurable
     if cfg then
         cfg.b_page_margin = needed
     end
-    dlog("overlay-margin", "docsettings-preload", "copt", needed)
+    pcall(function() config:flush() end)
+    dlog("overlay-margin", "docsettings-copt", "needed", needed, "was", copt)
 end
 
 --- Pin the overlay mini-bar and restore the last sentence (highlighted,

@@ -1021,19 +1021,20 @@ end
 function MediaSync:_persistBottomMargin(unscaled_bottom, overlay_inset)
     local ui = self.plugin and self.plugin.ui
     if not ui then return end
+    local ds = ui.doc_settings
     local tp = ui.typeset
     if tp and tp.unscaled_margins then
         tp.unscaled_margins[4] = unscaled_bottom
     end
-    -- ReaderConfig:onSaveSettings serializes document.configurable.b_page_margin
-    -- as sidecar copt_b_page_margin. Writing ui.configurable is a no-op: ReaderUI
-    -- does not have that field, so the next open always typeset the original 15.
     local cfg = self:_docConfigurable()
     if cfg then
         cfg.b_page_margin = unscaled_bottom
     end
-    local ds = ui.doc_settings
     if ds then
+        -- Durable KOReader setting: next open typesets with this bottom
+        -- margin (CRE cache rebuilds once, then hits). Do not SetPageMargins
+        -- after the document is on screen — that partial-rerenders the
+        -- current fragment and ANRs Android on large illustrated EPUBs.
         ds:saveSetting("copt_b_page_margin", unscaled_bottom)
         if overlay_inset then
             ds:saveSetting("audiobook_overlay_bottom", unscaled_bottom)
@@ -1076,54 +1077,27 @@ function MediaSync:_reserveMiniBarSpace()
     local m = tp.unscaled_margins
     local extra = self:_overlayBarExtraUnscaled(bar_h)
 
-    -- Keep-bar + lock: this book's KOReader bottom margin *is* the overlay
-    -- inset. After the first SetPageMargins, later opens typeset with it.
+    -- Keep-bar + lock: persist copt_b_page_margin, never SetPageMargins here.
+    -- Changing margins after the page is on screen partial-rerenders the
+    -- current DocFragment and ANRs Android. The inset is applied on the
+    -- next open via onDocSettingsLoad (before the first CRE typeset).
     if keep and lock and ds then
-        -- Overlay replaces the visual bottom inset: do not add orig on top
-        -- of the player height (that left a large empty band above the bar).
         local needed = extra + 2
         local orig = ds:readSetting("audiobook_overlay_orig_bottom")
         if orig == nil and math.abs((m[4] or 0) - needed) > 1 then
             orig = m[4]
             ds:saveSetting("audiobook_overlay_orig_bottom", orig)
         end
-        -- Skip UpdatePos only when the typeset bottom already matches.
-        -- Also re-apply when a previous formula reserved too much space.
-        if ds:readSetting("audiobook_overlay_margin_locked")
-            and math.abs((m[4] or 0) - needed) <= 1 then
-            self._bar_space_reserved = true
-            self._reserved_mini_bar_h = bar_h
-            -- Typeset already matches; still flush copt so the next cold open
-            -- does not load the original user margin and reflow again.
-            self:_persistBottomMargin(needed, true)
-            logger.warn("MediaSync: overlay margin already applied, skip reflow",
-                "bottom=", m[4], "needed=", needed)
-            dlog("overlay-margin", "locked-skip-reflow", "bar_h", bar_h,
-                "bottom", m[4], "needed", needed,
-                "copt", ds:readSetting("copt_b_page_margin"),
-                "rstate", ui.rolling and ui.rolling.rendering_state)
-            return
-        end
-        local t0 = time.now()
-        self:_persistBottomMargin(needed, true)
-        ui:handleEvent(Event:new("SetPageMargins", { m[1], m[2], m[3], needed }))
         ds:saveSetting("audiobook_overlay_margin_locked", true)
-        pcall(function() ds:flush() end)
+        self:_persistBottomMargin(needed, true)
         self._bar_space_reserved = true
         self._reserved_mini_bar_h = bar_h
-        local ms = math.floor(time.to_ms(time.since(t0)) + 0.5)
-        logger.warn("MediaSync: locked overlay bottom margin extra=", extra,
-            "needed=", needed, "orig=", orig, "live_m4=", m[4], "bar_h=", bar_h,
-            "footer_h=", self:_readerFooterHeight(),
-            "above_footer=", self:_miniBarAboveFooter() and 1 or 0,
-            "reclaim=", self:_footerReclaimsHeight() and 1 or 0,
-            "setmargins_ms=", ms)
-        dlog("overlay-margin", "locked-reflow", "extra", extra, "bar_h", bar_h,
-            "needed", needed, "orig", orig, "live_m4", m[4],
-            "footer_h", self:_readerFooterHeight(),
-            "copt", ds:readSetting("copt_b_page_margin"),
-            "setmargins_ms", ms,
-            "rstate", ui.rolling and ui.rolling.rendering_state)
+        logger.warn("MediaSync: overlay margin saved for next typeset",
+            "bottom=", m[4], "needed=", needed,
+            "copt=", ds:readSetting("copt_b_page_margin"))
+        dlog("overlay-margin", "locked-persist-copt", "bar_h", bar_h,
+            "bottom", m[4], "needed", needed,
+            "copt", ds:readSetting("copt_b_page_margin"))
         return
     end
 
@@ -1162,18 +1136,16 @@ function MediaSync:_releaseMiniBarSpace()
     local orig = ds and ds:readSetting("audiobook_overlay_orig_bottom")
     if orig ~= nil then
         self:_persistBottomMargin(orig)
-        if tp and tp.unscaled_margins then
-            local m = tp.unscaled_margins
-            ui:handleEvent(Event:new("SetPageMargins", { m[1], m[2], m[3], orig }))
-        end
+        -- Do not SetPageMargins here: restoring 15 after a 78 typeset is the
+        -- same CRE hit that ANRs Android on this book.
         if ds then
             ds:delSetting("audiobook_overlay_margin_locked")
             ds:delSetting("audiobook_overlay_orig_bottom")
             ds:delSetting("audiobook_overlay_bottom")
             pcall(function() ds:flush() end)
         end
-        logger.warn("MediaSync: restored original bottom margin", orig)
-        dlog("overlay-margin", "restored", orig)
+        logger.warn("MediaSync: restored original bottom margin setting", orig)
+        dlog("overlay-margin", "restored-settings", orig)
         return
     end
     if tp and tp.unscaled_margins then

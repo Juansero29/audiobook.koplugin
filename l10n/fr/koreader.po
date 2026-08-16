@@ -1154,8 +1154,8 @@ msgid "Lock KOReader page margins"
 msgstr "Figer les marges KOReader"
 
 #: main.lua:927
-msgid "When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings after the first layout. Later opens typeset with that margin already applied, so CRE does not reflow again. Disable to restore your original margins and change them with KOReader’s usual margin controls."
-msgstr "Lorsqu'elle est activée (par défaut), le plugin écrit la marge inférieure de ce livre dans les réglages KOReader après la première mise en page. Les ouvertures suivantes composent déjà la page avec cette marge : plus de rechargement CRE. Décochez pour retrouver vos marges d'origine et les modifier comme d'habitude dans KOReader."
+msgid "When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings before CRE typesets. The next open rebuilds the layout once (text stays above the audiobook bar); after that, KOReader reuses that layout. Disable to restore your original margins and edit them with KOReader’s usual controls."
+msgstr "Lorsqu'elle est activée (par défaut), le plugin écrit la marge inférieure de ce livre dans les réglages KOReader avant que CRE ne compose la page. La prochaine ouverture reconstruit la mise en page une fois (le texte reste au-dessus de la barre) ; ensuite KOReader réutilise cette mise en page. Décochez pour retrouver vos marges d'origine et les modifier comme d'habitude dans KOReader."
 
 #: main.lua:930
 msgid "Keep status bars during read-aloud"

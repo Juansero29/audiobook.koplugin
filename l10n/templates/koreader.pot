@@ -1054,7 +1054,7 @@ msgid "Lock KOReader page margins"
 msgstr ""
 
 #: main.lua:927
-msgid "When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings after the first layout. Later opens typeset with that margin already applied, so CRE does not reflow again. Disable to restore your original margins and change them with KOReader’s usual margin controls."
+msgid "When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings before CRE typesets. The next open rebuilds the layout once (text stays above the audiobook bar); after that, KOReader reuses that layout. Disable to restore your original margins and edit them with KOReader’s usual controls."
 msgstr ""
 
 #: main.lua:930
