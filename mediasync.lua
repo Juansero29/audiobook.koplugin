@@ -1267,8 +1267,13 @@ function MediaSync:seekToTime(seconds)
     if not self.media_engine then return end
     logger.warn("MediaSync: seekToTime", seconds)
     self.media_engine:seek(seconds, "absolute")
-    -- Force immediate UI update so the bar doesn't wait for the next poller tick
-    if self.playback_bar then
+    -- Overlay bar is chapter-scaled; file duration would flash the wrong time.
+    if self.overlay_mode then
+        self:_refreshPlaybackTimeUi()
+        UIManager:scheduleIn(0.25, function()
+            self:navigateToSentenceAtTime(seconds)
+        end)
+    elseif self.playback_bar then
         local dur = self.media_engine:getDuration() or 0
         if dur > 0 then
             local pct = math.floor((seconds / dur) * 100)
@@ -1304,14 +1309,30 @@ end
 
 function MediaSync:skipBack(seconds)
     seconds = seconds or 30
+    if self.overlay_mode and self:_skipOverlayBy(-(seconds)) then
+        return
+    end
     if not self.media_engine then return end
     self.media_engine:seek(-seconds, "relative")
 end
 
 function MediaSync:skipForward(seconds)
     seconds = seconds or 30
+    if self.overlay_mode and self:_skipOverlayBy(seconds) then
+        return
+    end
     if not self.media_engine then return end
     self.media_engine:seek(seconds, "relative")
+end
+
+--- Skip within the SMIL chapter timeline (may cross ~4 min audio parts).
+function MediaSync:_skipOverlayBy(delta_s)
+    local pos = self.media_engine and self.media_engine:getPosition() or 0
+    local ch_pos, ch_dur = self:_overlayChapterProgress(pos)
+    if not ch_dur or ch_dur <= 0 then return false end
+    local target = math.max(0, math.min(ch_dur, (ch_pos or 0) + delta_s))
+    self:seekToOverlayProgress(target / ch_dur)
+    return true
 end
 
 function MediaSync:prevSentence()
@@ -2482,6 +2503,10 @@ function MediaSync:showPlaybackBar()
             self:nextChapter()
         end,
         on_seek = function(pct)
+            if self.overlay_mode then
+                self:seekToOverlayProgress(pct)
+                return
+            end
             local dur = self.media_engine and self.media_engine:getDuration() or 0
             if dur > 0 then
                 self:seekToTime(pct * dur)
@@ -3071,28 +3096,72 @@ function MediaSync:seekToOverlayChapter(index)
     local chapters = self.plugin and self.plugin._smil_overlay_chapters
     if not chapters or not chapters[index] then return end
     local ch = chapters[index]
+    self:_seekToOverlayFileTime(ch.audio_path, ch.start_time or 0)
+end
+
+--- Scrubber pct is chapter-local (same scale as the overlay time display).
+function MediaSync:seekToOverlayProgress(pct)
+    pct = tonumber(pct) or 0
+    if pct < 0 then pct = 0 end
+    if pct > 1 then pct = 1 end
+    local pos = self.media_engine and self.media_engine:getPosition() or 0
+    local _, ch_dur = self:_overlayChapterProgress(pos)
+    if not ch_dur or ch_dur <= 0 then
+        local dur = self.media_engine and self.media_engine:getDuration() or 0
+        if dur > 0 then
+            self:seekToTime(pct * dur)
+        end
+        return
+    end
+    local ch = select(1, self:_resolveOverlayChapter())
+    local key = overlayChapterKey(ch)
+    local segments = self:_overlayChapterSegments(key)
+    if not segments or #segments == 0 then
+        local dur = self.media_engine and self.media_engine:getDuration() or 0
+        if dur > 0 then
+            self:seekToTime(pct * dur)
+        end
+        return
+    end
+    local target = pct * ch_dur
+    local acc = 0
+    local chosen
+    for i, s in ipairs(segments) do
+        local last = (i == #segments)
+        if last or target <= acc + s.dur then
+            local local_t = (s.start_time or 0) + (target - acc)
+            if local_t < (s.start_time or 0) then local_t = s.start_time or 0 end
+            if s.end_time and local_t > s.end_time then local_t = s.end_time end
+            chosen = { path = s.audio_path, time = local_t }
+            break
+        end
+        acc = acc + s.dur
+    end
+    if not chosen then return end
+    logger.warn("MediaSync: overlay seek pct=", pct, "chapter_t=", target,
+        "file=", chosen.path, "t=", chosen.time)
+    dlog("overlay seek", "pct=", pct, "target=", target, "t=", chosen.time)
+    self:_seekToOverlayFileTime(chosen.path, chosen.time)
+end
+
+function MediaSync:_seekToOverlayFileTime(audio_path, local_time)
+    local_time = tonumber(local_time) or 0
     local function after_audio_ready()
-        UIManager:scheduleIn(0.2, function()
-            self:seekToTime(ch.start_time)
-            if self.overlay_mode and ch.fragment_id then
-                UIManager:scheduleIn(0.3, function()
-                    self:navigateToSentenceAtTime(ch.start_time)
-                end)
-            end
+        UIManager:scheduleIn(0.15, function()
+            self:seekToTime(local_time)
         end)
     end
-    if ch.audio_path and self.media_engine
-        and self.media_engine.current_path ~= ch.audio_path then
-        -- Cross-file chapter jump: BT reconnect then load the new audio part.
+    if audio_path and self.media_engine
+        and self.media_engine.current_path ~= audio_path then
         self:_bridgeKindleA2dpForTrackChange(function()
             if self.plugin and self.plugin._playAudioFile then
-                self.plugin:_playAudioFile(ch.audio_path, self.playlist_files)
+                self.plugin:_playAudioFile(audio_path, self.playlist_files)
             end
             after_audio_ready()
         end)
         return
     end
-    after_audio_ready()
+    self:seekToTime(local_time)
 end
 
 function MediaSync:showPlaylist()

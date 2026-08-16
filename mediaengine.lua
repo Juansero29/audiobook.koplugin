@@ -3034,19 +3034,30 @@ function MediaEngine:seek(seconds, mode)
             target = self:getPosition() + seconds
         end
         target = math.max(0, target)
+        if self.current_duration and self.current_duration > 0 then
+            target = math.min(target, self.current_duration)
+        end
         self._seek_offset = target
-        if self.is_paused then
-            self._paused_position = target
-            return true
-        end
+        self._paused_position = target
         local player = self._android_player
-        if player then
-            player:seekToMs(math.floor(target * 1000))
-            self._play_start_time = UIManager:getTime()
-            self._total_pause_ms = 0
+        if self.is_paused then
+            -- Stay paused; resume() plays from _paused_position / _last_mp_pos_ms.
+            if player then
+                pcall(function()
+                    player._last_mp_pos_ms = math.floor(target * 1000)
+                    player:seekToMs(math.floor(target * 1000))
+                end)
+            end
+            logger.warn("MediaEngine: Android seek while paused", target)
             return true
         end
-        return false
+        -- Live MediaPlayer.seekTo is a no-op on some Boox HALs (UI jumps,
+        -- audio keeps the old timeline).  play() seeks before start(), which
+        -- does work — same seek-by-restart as the GST backends.
+        logger.warn("MediaEngine: Android seek-by-restart", target)
+        local complete = self._on_complete
+        local fail = self._on_fail
+        return self:play(complete, fail)
     end
 
     if self.backend == self.BACKENDS.MPV then
