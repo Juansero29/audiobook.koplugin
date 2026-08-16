@@ -9,6 +9,13 @@ Caches extracted audio to persistent storage (not /tmp, to avoid RAM exhaustion)
 local logger = require("logger")
 local _ = require("audiobook_gettext")
 
+local function dlog(...)
+    local DL = package.loaded["audiobook_debuglog"]
+    if DL and DL.log then
+        pcall(DL.log, "EpubMediaOverlay:", ...)
+    end
+end
+
 -- Lua patterns: `.` does not match newlines. Storyteller (and many OPF
 -- producers) pretty-print SMIL/OPF with line breaks inside elements.
 local RE_ANY_LAZY = "([%z\1-\255]-)"
@@ -529,6 +536,7 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
     -- Step 1: Find OPF path
     local opf_path = self:_findOpfPath(epub_path)
     if not opf_path then
+        dlog("could not find OPF")
         return nil, "could not find OPF"
     end
     logger.dbg("EpubMediaOverlay: OPF path =", opf_path)
@@ -536,15 +544,18 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
     -- Step 2: Parse OPF manifest
     local opf_xml = self:_extractFromZip(epub_path, opf_path)
     if not opf_xml or opf_xml == "" then
+        dlog("could not read OPF", opf_path)
         return nil, "could not read OPF"
     end
 
     local overlay_manifest, manifest_items = self:_parseOpfManifest(opf_xml)
     if not overlay_manifest or not next(overlay_manifest) then
+        dlog("no media overlays found in OPF")
         return nil, "no media overlays found"
     end
 
     logger.dbg("EpubMediaOverlay: found", self:_tableCount(overlay_manifest), "overlay entries")
+    dlog("found", self:_tableCount(overlay_manifest), "overlay entries")
 
     local all_timing_data = {}
     local opf_base = opf_path:match("^(.*)/") or ""
@@ -608,6 +619,7 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
         local smil_xml = self:_extractFromZip(epub_path, smil_path)
         if not smil_xml or smil_xml == "" then
             logger.warn("EpubMediaOverlay: could not read SMIL", smil_path)
+            dlog("could not read SMIL", smil_href)
             goto continue
         end
 
@@ -661,6 +673,7 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
     end
 
     if #all_timing_data == 0 then
+        dlog("no timing data extracted from", total_smils, "SMIL files")
         return nil, "no timing data extracted"
     end
 
@@ -676,6 +689,7 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
 
     logger.warn("EpubMediaOverlay: loaded", #all_timing_data, "timing entries,",
         unique_audio, "audio files")
+    dlog("loaded", #all_timing_data, "timing entries,", unique_audio, "audio files")
     return all_timing_data
 end
 

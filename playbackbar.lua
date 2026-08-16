@@ -26,6 +26,8 @@ local logger = require("logger")
 local _ = require("audiobook_gettext")
 
 local PlaybackBar = InputContainer:extend{
+    name = "AudiobookPlaybackBar",
+    _plugin_chrome = true,
     width = nil,
     height = nil,
     plugin = nil,
@@ -46,6 +48,7 @@ local PlaybackBar = InputContainer:extend{
     on_forward = nil,
     on_close = nil,
     on_realign = nil,
+    on_voice = nil,
     -- Scrubber mode for audio file playback
     scrubber_mode = false,
     on_seek = nil,
@@ -137,6 +140,20 @@ function PlaybackBar:setupUI()
         show_parent = self,
     }
 
+    -- Voice picker (installed TTS voices / HuggingFace languages)
+    self.voice_button = Button:new{
+        text = "♪",
+        width = button_width,
+        max_width = button_width,
+        height = button_height,
+        text_font_size = button_font_size,
+        callback = function()
+            self:onVoice()
+        end,
+        bordersize = Size.border.button,
+        show_parent = self,
+    }
+
     -- Close button
     self.close_button = Button:new{
         text = "✕",
@@ -159,7 +176,7 @@ function PlaybackBar:setupUI()
     self.word_display = TextWidget:new{
         text = display_text,
         face = Font:getFace("cfont", 16),
-        max_width = self.width - button_width * 5 - spacing * 7,
+        max_width = self.width - button_width * 6 - spacing * 8,
         truncate_left = true,
     }
     
@@ -188,6 +205,8 @@ function PlaybackBar:setupUI()
     -- Button row
     local button_row = HorizontalGroup:new{
         align = "center",
+        self.voice_button,
+        HorizontalSpan:new{ width = spacing },
         self.realign_button,
         HorizontalSpan:new{ width = spacing * 2 },
         self.rewind_button,
@@ -291,6 +310,21 @@ end
 function PlaybackBar:onRealign()
     if self.on_realign then
         self.on_realign()
+    end
+end
+
+function PlaybackBar:onVoice()
+    if self.on_voice then
+        self.on_voice()
+        return
+    end
+    local plugin = self.plugin
+        or (self.sync_controller and self.sync_controller.plugin)
+    if not plugin then return end
+    local dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+    local ok, MenuBuilder = pcall(dofile, dir .. "menubuilder.lua")
+    if ok and MenuBuilder and MenuBuilder.showVoicePicker then
+        MenuBuilder.showVoicePicker(plugin)
     end
 end
 
@@ -595,7 +629,7 @@ function PlaybackBar:_isOverlayActive()
     local non_toast = 0
     for i = 1, #stack do
         local w = stack[i].widget
-        if w ~= self and not w.toast then
+        if w ~= self and not w.toast and not w._plugin_chrome then
             non_toast = non_toast + 1
             if non_toast > 1 then
                 return true

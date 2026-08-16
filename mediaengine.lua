@@ -1319,6 +1319,10 @@ function MediaEngine:_playAndroid(gen)
     end
 
     pcall(function() player:stop() end)
+    -- Store rate on the player before play(); JNI applies it after prepare().
+    pcall(function()
+        player:setSpeed(self._playback_speed or 1.0)
+    end)
 
     local offset = self._seek_offset or 0
     local seek_ms = math.floor(offset * 1000)
@@ -1357,8 +1361,10 @@ function MediaEngine:_startAndroidCompletionWatcher(gen)
     local player = self._android_player
     if not player then return end
     local poll_count = 0
+    -- Slow rates (0.8x) need a longer wall-clock timeout to reach EOS.
+    local speed = math.max(0.25, self._playback_speed or 1.0)
     local max_polls = math.max(600,
-        math.floor((self.current_duration or 300) * 10))
+        math.floor((self.current_duration or 300) * 10 / math.min(1.0, speed)))
     local function poll()
         if self.play_generation ~= gen then return end
         if not self.is_playing then return end
@@ -3274,10 +3280,8 @@ function MediaEngine:getPosition()
     -- During a seek gap (after stop, before play restarts), return the seek
     -- offset so the UI doesn't flicker back to zero.
     if not self.is_playing then
-        if self._seek_offset and self._seek_offset > 0 then
-            return self._seek_offset
-        end
-        return 0
+        local held = tonumber(self._paused_position) or tonumber(self._seek_offset) or 0
+        return math.max(0, held)
     end
 
     -- Kindle A2DP pause-halt: pipeline is gone; hold the saved pause position.
@@ -3400,7 +3404,7 @@ function MediaEngine:isPaused()
 end
 
 -- ---------------------------------------------------------------------------
--- Playback speed (mpv / mplayer only)
+-- Playback speed (mpv / mplayer / Android MediaPlayer / atempo pipelines)
 -- ---------------------------------------------------------------------------
 
 function MediaEngine:setSpeed(speed)
@@ -3409,6 +3413,16 @@ function MediaEngine:setSpeed(speed)
     if speed > 3.0 then speed = 3.0 end
     local old_speed = self._playback_speed or 1.0
     self._playback_speed = speed
+
+    -- Android: MediaPlayer.setPlaybackParams is live (API 23+).  Always store
+    -- on the player so the next play() starts at this rate even if paused/stopped.
+    if self.backend == self.BACKENDS.ANDROID then
+        if self._android_player then
+            pcall(function() self._android_player:setSpeed(speed) end)
+        end
+        logger.warn("MediaEngine: Android speed=", speed)
+        return
+    end
 
     if not self.is_playing then return end
 

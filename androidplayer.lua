@@ -66,6 +66,8 @@ function AndroidPlayer:new(o)
     o._mp_baseline_ms = nil
     o._mp_stuck_reads = 0
     o._volume = 1.0
+    o._speed = 1.0
+    o._eos_reached_at = nil
     return o
 end
 
@@ -111,6 +113,23 @@ function AndroidPlayer:init()
             "setAudioAttributes", "(Landroid/media/AudioAttributes;)V")
         self._method.setVolume = getMethod(env, mp_class,
             "setVolume", "(FF)V")
+        -- API 23+: live speed via PlaybackParams (pitch stays 1.0).
+        self._method.getPlaybackParams = getMethod(env, mp_class,
+            "getPlaybackParams", "()Landroid/media/PlaybackParams;")
+        self._method.setPlaybackParams = getMethod(env, mp_class,
+            "setPlaybackParams", "(Landroid/media/PlaybackParams;)V")
+        local pp_class = env[0].FindClass(env, "android/media/PlaybackParams")
+        if pp_class and not checkException(env) then
+            self._method.ppSetSpeed = getMethod(env, pp_class,
+                "setSpeed", "(F)Landroid/media/PlaybackParams;")
+            self._method.ppSetPitch = getMethod(env, pp_class,
+                "setPitch", "(F)Landroid/media/PlaybackParams;")
+            self._pp_class = env[0].NewGlobalRef(env, pp_class)
+            env[0].DeleteLocalRef(env, pp_class)
+        else
+            checkException(env)
+            logger.warn("AndroidPlayer: PlaybackParams unavailable")
+        end
 
         if not self._method.init
             or not self._method.setDataSource
@@ -249,6 +268,10 @@ function AndroidPlayer:play(path, seek_ms)
             checkException(env)
         end
 
+        -- Apply speed after prepare() (required by MediaPlayer) so the first
+        -- samples already play at the requested rate.
+        self:_applySpeedEnv(env, mp)
+
         if seek_ms > 50 then
             local sargs = ffi.new("jvalue[1]")
             sargs[0].i = seek_ms
@@ -285,13 +308,96 @@ function AndroidPlayer:play(path, seek_ms)
         self._audio_started = false
         self._mp_baseline_ms = nil
         self._mp_stuck_reads = 0
+        self._eos_reached_at = nil
         -- Per-player gain (independent of Android system/stream volume).
         self:setVolume(self._volume or 1.0)
         logger.warn("AndroidPlayer: playing", path,
             "seek_ms=", seek_ms, "duration_ms=", self._duration_ms,
-            "volume=", self._volume)
+            "volume=", self._volume, "speed=", self._speed)
     end
     return ok
+end
+
+--- Apply PlaybackParams.setSpeed on a prepared MediaPlayer (local or global).
+--- Pitch is forced to 1.0 so 1.5x is time-stretch, not chipmunk.
+function AndroidPlayer:_applySpeedEnv(env, mp)
+    if not mp then return false end
+    local speed = self._speed or 1.0
+    if not self._method.getPlaybackParams
+        or not self._method.setPlaybackParams
+        or not self._method.ppSetSpeed then
+        if math.abs(speed - 1.0) >= 0.01 then
+            logger.warn("AndroidPlayer: speed control unavailable; ignoring", speed)
+        end
+        return false
+    end
+    local params = env[0].CallObjectMethod(env, mp, self._method.getPlaybackParams)
+    if checkException(env) or params == nil then
+        logger.warn("AndroidPlayer: getPlaybackParams failed")
+        return false
+    end
+    local args = ffi.new("jvalue[1]")
+    args[0].f = speed
+    local updated = env[0].CallObjectMethodA(env, params, self._method.ppSetSpeed, args)
+    if checkException(env) then
+        env[0].DeleteLocalRef(env, params)
+        logger.warn("AndroidPlayer: PlaybackParams.setSpeed failed")
+        return false
+    end
+    local to_set = updated or params
+    if self._method.ppSetPitch then
+        args[0].f = 1.0
+        local pitched = env[0].CallObjectMethodA(env, to_set, self._method.ppSetPitch, args)
+        if not checkException(env) and pitched then
+            to_set = pitched
+        end
+    end
+    env[0].CallVoidMethod(env, mp, self._method.setPlaybackParams, to_set)
+    local failed = checkException(env)
+    if updated and updated ~= params then
+        env[0].DeleteLocalRef(env, updated)
+    end
+    if to_set and to_set ~= params and to_set ~= updated then
+        env[0].DeleteLocalRef(env, to_set)
+    end
+    env[0].DeleteLocalRef(env, params)
+    if failed then
+        logger.warn("AndroidPlayer: setPlaybackParams failed speed=", speed)
+        return false
+    end
+    logger.warn("AndroidPlayer: speed=", speed)
+    return true
+end
+
+--- Playback rate 0.5..3.0.  Live on a running MediaPlayer; stored otherwise.
+function AndroidPlayer:setSpeed(speed)
+    speed = tonumber(speed) or 1.0
+    if speed < 0.5 then speed = 0.5 end
+    if speed > 3.0 then speed = 3.0 end
+    -- Re-anchor the wall clock at the current *media* position so highlights
+    -- keep tracking after a mid-play rate change (wall time is not media time).
+    local pos
+    if self._playing and self._wall_start then
+        pos = self:_wallPositionMs()
+    end
+    self._speed = speed
+    if pos then
+        self:_reanchorWallToMs(pos)
+        if self._paused then
+            self._pause_wall_start = UIManager:getTime()
+        end
+    end
+    if not self._mp_ref or not self._android then return end
+    local android = self._android
+    local was_active = self._playing and not self._paused
+    android.jni:context(android.app.activity.vm, function(jni)
+        self:_applySpeedEnv(jni.env, self._mp_ref)
+        -- Some OEM MediaPlayer implementations pause on setPlaybackParams.
+        if was_active and self._method.start then
+            jni.env[0].CallVoidMethod(jni.env, self._mp_ref, self._method.start)
+            checkException(jni.env)
+        end
+    end)
 end
 
 --- Per-stream volume 0..1 (MediaPlayer.setVolume).  Does NOT change the
@@ -385,7 +491,10 @@ function AndroidPlayer:_wallPositionMs()
         elapsed = time.to_ms(UIManager:getTime() - self._wall_start)
     end
     elapsed = (elapsed or 0) - (self._pause_accum_ms or 0)
-    local pos = (self._start_seek_ms or 0) + math.max(0, elapsed)
+    -- MediaPlayer speed scales media time vs wall clock.  Highlights use this
+    -- position, so elapsed real time must be multiplied by the current rate.
+    local speed = self._speed or 1.0
+    local pos = (self._start_seek_ms or 0) + math.floor(math.max(0, elapsed) * speed)
     if self._duration_ms and self._duration_ms > 0 then
         pos = math.min(pos, self._duration_ms)
     end
@@ -418,6 +527,7 @@ function AndroidPlayer:pause()
     self._audio_started = true
     self._ever_confirmed_playing = true
     self._last_mp_pos_ms = pos
+    self._eos_reached_at = nil
     logger.warn("AndroidPlayer: paused at pos_ms=", pos)
     return pos
 end
@@ -447,6 +557,7 @@ function AndroidPlayer:resume()
     self._playing = true
     self._audio_started = true
     self._ever_confirmed_playing = true
+    self._eos_reached_at = nil
     logger.warn("AndroidPlayer: resumed at pos_ms=", resume_ms)
     return true
 end
@@ -458,6 +569,7 @@ function AndroidPlayer:stop()
     self._audio_started = false
     self._mp_baseline_ms = nil
     self._mp_stuck_reads = 0
+    self._eos_reached_at = nil
 end
 
 function AndroidPlayer:seekToMs(msec)
@@ -476,6 +588,7 @@ function AndroidPlayer:seekToMs(msec)
     self._ever_confirmed_playing = true
     self._mp_baseline_ms = nil
     self._mp_stuck_reads = 0
+    self._eos_reached_at = nil
 end
 
 --- Position for sync and completion: monotonic wall-clock after a one-shot
@@ -520,6 +633,13 @@ function AndroidPlayer:isPlaying()
     return self._playing and true or false
 end
 
+-- After wall-clock hits MediaPlayer duration, wait this long before telling
+-- the playlist to advance.  The next-track path stop()s MediaPlayer immediately;
+-- on Boox (and BT/AirPods) the HAL still holds the last ~word or two.  Completing
+-- 400 ms *early* used to clip those words; draining 400 ms *after* duration
+-- lets them play, at the cost of a short gap between Storyteller parts.
+local EOS_DRAIN_MS = 400
+
 function AndroidPlayer:isPlaybackDone()
     if not self._mp_ref then return true end
     if self._paused then return false end
@@ -530,11 +650,24 @@ function AndroidPlayer:isPlaybackDone()
     -- from the original "play from here" seek offset.
     local pos = self:getPositionMs()
     local dur = self:getDurationMs()
-    if dur and dur > 0 and pos >= (dur - 400) then
-        self._playing = false
-        return true
+    if not (dur and dur > 0 and pos >= dur) then
+        self._eos_reached_at = nil
+        return false
     end
-    return false
+
+    if not self._eos_reached_at then
+        self._eos_reached_at = UIManager:getTime()
+        logger.warn("AndroidPlayer: duration reached, draining", EOS_DRAIN_MS,
+            "ms before next track  pos_ms=", pos, "dur_ms=", dur)
+        return false
+    end
+    local waited = time.to_ms(UIManager:getTime() - self._eos_reached_at) or 0
+    if waited < EOS_DRAIN_MS then
+        return false
+    end
+    self._playing = false
+    logger.warn("AndroidPlayer: EOS after drain  waited_ms=", waited)
+    return true
 end
 
 function AndroidPlayer:shutdown()
@@ -550,6 +683,12 @@ function AndroidPlayer:shutdown()
             jni.env[0].DeleteGlobalRef(jni.env, self._mp_class)
         end)
         self._mp_class = nil
+    end
+    if self._pp_class and self._android then
+        self._android.jni:context(self._android.app.activity.vm, function(jni)
+            jni.env[0].DeleteGlobalRef(jni.env, self._pp_class)
+        end)
+        self._pp_class = nil
     end
     self._initialized = false
 end

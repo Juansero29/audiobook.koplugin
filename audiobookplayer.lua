@@ -41,6 +41,9 @@ local _ = require("audiobook_gettext")
 local T = require("ffi/util").template
 
 local AudiobookPlayer = InputContainer:extend{
+    name = "AudiobookPlayer",
+    -- So TTS PlaybackBar:_isOverlayActive does not treat this mini bar as a menu.
+    _plugin_chrome = true,
     plugin = nil,
     is_playing = true,
     progress = 0,
@@ -82,6 +85,10 @@ local AudiobookPlayer = InputContainer:extend{
     on_sleep_timer_set = nil,
     on_sleep_timer_cancel = nil,
     on_refocus = nil,
+    -- TTS read-along: same chrome as aligned overlay, but speed/sleep on the
+    -- mini bar instead of SMIL sync-offset nudges, plus a settings picker.
+    tts_mode = false,
+    on_tts_settings = nil,
     -- Reference to the underlying ReaderUI or FileManager widget for event
     -- forwarding when minimized (since UIManager only dispatches to the top
     -- widget, we must manually forward events to the UI below).
@@ -248,6 +255,7 @@ function AudiobookPlayer:setupUI()
     if self.show_shuffle then visible_buttons = visible_buttons + 1 end
     if self.show_loop then visible_buttons = visible_buttons + 1 end
     if self.show_fix_audio then visible_buttons = visible_buttons + 1 end
+    if self.tts_mode then visible_buttons = visible_buttons + 1 end
     self.title_widget = TextWidget:new{
         text = self.title or _("Audiobook"),
         face = Font:getFace("cfont", 18),
@@ -282,6 +290,19 @@ function AudiobookPlayer:setupUI()
     table.insert(top_row_items, HorizontalSpan:new{ width = spacing })
     table.insert(top_row_items, self.speed_button)
     table.insert(top_row_items, HorizontalSpan:new{ width = math.floor(spacing / 2) })
+    if self.tts_mode then
+        self.settings_button = Button:new{
+            text = "⚙",
+            width = button_size,
+            height = button_size,
+            text_font_size = 20,
+            callback = function() self:onTtsSettings() end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        table.insert(top_row_items, self.settings_button)
+        table.insert(top_row_items, HorizontalSpan:new{ width = math.floor(spacing / 2) })
+    end
     table.insert(top_row_items, self.minimize_button)
     table.insert(top_row_items, HorizontalSpan:new{ width = math.floor(spacing / 2) })
     table.insert(top_row_items, self.close_button)
@@ -605,8 +626,35 @@ function AudiobookPlayer:setupUI()
     -- setting every tick, so each press shifts the highlight immediately;
     -- the new value flashes in the mini time display until the next
     -- regular time update overwrites it.
+    -- TTS: same slot holds speed + sleep timer (no SMIL sync offset).
     local nudge_group = {}
-    if self.on_sync_nudge then
+    if self.tts_mode then
+        self._mini_speed = Button:new{
+            text = self:_speedText(),
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 11,
+            callback = function() self:onSpeed() end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        self._mini_sleep = Button:new{
+            text = self:_formatSleepTimerText(self._sleep_timer_remaining, self._sleep_timer_active),
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 16,
+            callback = function() self:onSleepTimer() end,
+            bordersize = 0,
+            show_parent = self,
+        }
+        center_max_width = center_max_width - (mini_btn_size + spacing) * 2
+        nudge_group = {
+            self._mini_speed,
+            HorizontalSpan:new{ width = spacing },
+            self._mini_sleep,
+            HorizontalSpan:new{ width = spacing },
+        }
+    elseif self.on_sync_nudge then
         local function nudge(delta_ms)
             local v = self.on_sync_nudge(delta_ms)
             if v then
@@ -764,6 +812,9 @@ end
 --- Bottom inset so the mini player can sit above KOReader's status/progress bar.
 --- MediaSync also reflows page margins by this chrome height + mini bar so
 --- book text never renders underneath the player.
+--- keep_reader_status_bars is also set when KOReader's "Overlap status bar"
+--- is off, so the always-visible media overlay does not cover the footer
+--- or the last lines of the page.
 function AudiobookPlayer:_statusBarInset()
     if not self.keep_reader_status_bars then return 0 end
     local ui = self.plugin and self.plugin.ui
@@ -890,6 +941,10 @@ function AudiobookPlayer:onSpeed()
     if self.on_speed then self.on_speed() end
 end
 
+function AudiobookPlayer:onTtsSettings()
+    if self.on_tts_settings then self.on_tts_settings() end
+end
+
 -- UI update helpers
 function AudiobookPlayer:setPlaying(is_playing)
     -- Always push the icon/text even when the boolean is unchanged: on Boox
@@ -927,7 +982,13 @@ function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec)
         self.time_widget:setText(text)
         self._mini_time:setText(text)
         UIManager:setDirty(self, function()
-            return "ui", self.time_widget.dimen
+            if self._minimized then
+                return "ui", self.dimen
+            end
+            if self.time_widget and self.time_widget.dimen then
+                return "ui", self.time_widget.dimen
+            end
+            return "ui"
         end)
     end
 end
@@ -993,6 +1054,9 @@ function AudiobookPlayer:updateSleepTimer(remaining_seconds, active)
     local text = self:_formatSleepTimerText(self._sleep_timer_remaining, self._sleep_timer_active)
     if self.sleep_timer_button then
         self.sleep_timer_button:setText(text, self.sleep_timer_button.width)
+    end
+    if self._mini_sleep then
+        self._mini_sleep:setText(text, self._mini_sleep.width)
     end
     UIManager:setDirty(self, function()
         if self._minimized then
@@ -1287,13 +1351,22 @@ end
 
 function AudiobookPlayer:updateSpeed(speed)
     speed = tonumber(speed) or 1.0
-    if speed ~= self.playback_speed then
-        self.playback_speed = speed
+    self.playback_speed = speed
+    if self.speed_button then
         self.speed_button:setText(self:_speedText(), self.speed_button.width)
-        UIManager:setDirty(self, function()
-            return "ui", self.speed_button.dimen
-        end)
     end
+    if self._mini_speed then
+        self._mini_speed:setText(self:_speedText(), self._mini_speed.width)
+    end
+    UIManager:setDirty(self, function()
+        if self._minimized then
+            return "ui", self.dimen
+        end
+        if self.speed_button and self.speed_button.dimen then
+            return "ui", self.speed_button.dimen
+        end
+        return "ui"
+    end)
 end
 
 function AudiobookPlayer:_volumeText()
@@ -1460,6 +1533,14 @@ function AudiobookPlayer:_updateMiniWidgets()
         local txt = self.is_playing and "⏸" or "▶"
         self._mini_play_pause:setText(txt, self._mini_play_pause.width)
     end
+    if self._mini_speed then
+        self._mini_speed:setText(self:_speedText(), self._mini_speed.width)
+    end
+    if self._mini_sleep then
+        self._mini_sleep:setText(
+            self:_formatSleepTimerText(self._sleep_timer_remaining, self._sleep_timer_active),
+            self._mini_sleep.width)
+    end
     if self._mini_refocus then
         -- Make the existing ○ control more obvious while the hint is active.
         local label = self._return_hint_active and "◎" or "○"
@@ -1591,6 +1672,17 @@ function AudiobookPlayer:handleEvent(event)
                         if self._mini_sync_plus.callback then
                             self._mini_sync_plus.callback()
                         end
+                        return true
+                    end
+                    -- TTS mini bar: speed and sleep occupy the sync-nudge slot.
+                    if self._mini_speed
+                        and self:_isTapOnWidget(ges.pos, self._mini_speed) then
+                        self:onSpeed()
+                        return true
+                    end
+                    if self._mini_sleep
+                        and self:_isTapOnWidget(ges.pos, self._mini_sleep) then
+                        self:onSleepTimer()
                         return true
                     end
                     -- Tap on the volume buttons?
@@ -1741,6 +1833,7 @@ function AudiobookPlayer:handleEvent(event)
                 self.speed_button, self.close_button, self.minimize_button,
                 self.chapter_list_button, self.sleep_timer_button,
                 self.vol_minus_button, self.vol_plus_button,
+                self.settings_button,
             }
             if self.show_shuffle and self.shuffle_button then
                 table.insert(buttons, self.shuffle_button)
@@ -1826,6 +1919,11 @@ function AudiobookPlayer:_doRebuild(new_w, new_h)
     self.time_widget:setText(time_str or "0:00 / 0:00")
     self.progress_bar:setPercentage((progress or 0) / 100)
     self.speed_button:setText(self:_speedText(), self.speed_button.width)
+    if self.sleep_timer_button then
+        self.sleep_timer_button:setText(
+            self:_formatSleepTimerText(self._sleep_timer_remaining, self._sleep_timer_active),
+            self.sleep_timer_button.width)
+    end
     self:_updateMiniWidgets()
     -- Position at the correct coordinates for the new dimensions
     self.visible = true
@@ -1881,8 +1979,47 @@ function AudiobookPlayer:onCloseWidget()
     -- Cleanup hook
 end
 
+-- Compatibility with SyncController's PlaybackBar API.
+function AudiobookPlayer:updatePlayState(is_playing)
+    self:setPlaying(is_playing)
+end
+
+function AudiobookPlayer:updateCurrentWord(word)
+    if word and word ~= "" then
+        self:updateChapterTitle(word)
+    end
+end
+
+function AudiobookPlayer:setSuppressed(suppressed)
+    suppressed = suppressed and true or false
+    if self.suppressed == suppressed then return end
+    self.suppressed = suppressed
+    UIManager:setDirty("all", "ui")
+end
+
+function AudiobookPlayer:isSuppressed()
+    return self.suppressed and true or false
+end
+
+--- Extra window-stack widgets (menus/dialogs) besides this chrome.
+function AudiobookPlayer:_isOverlayActive()
+    local stack = UIManager._window_stack
+    if not stack then return false end
+    local non_toast = 0
+    for i = 1, #stack do
+        local w = stack[i].widget
+        if w ~= self and not w.toast and not w._plugin_chrome then
+            non_toast = non_toast + 1
+            if non_toast > 1 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 function AudiobookPlayer:paintTo(bb, x, y)
-    if not self.visible then return end
+    if not self.visible or self.suppressed then return end
     if self._minimized then
         -- Draw only the mini player bar at bottom (optionally above status bar).
         -- UIManager's window.y for this widget is always 0 (set when first shown),
