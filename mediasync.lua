@@ -18,6 +18,7 @@ local InfoMessage = require("ui/widget/infomessage")
 
 local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local PLUGIN_PATH = _utils_dir
+local Utils = dofile(_utils_dir .. "utils.lua")
 
 --- Append to plugin debug.log (included in bug reports). Never throws.
 local function dlog(...)
@@ -262,15 +263,20 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
             local ok, res, words = pcall(function()
                 return ui.document:findText(pattern, origin, direction, true, cur_page, false, 20)
             end)
-            logger.warn("MediaSync: findText try",
-                "pattern=", pattern,
-                "origin=", origin,
-                "dir=", direction,
-                "ok=", tostring(ok),
-                "type=", type(res),
-                "count=", (res and #res or 0),
-                "words=", tostring(words))
-            if ok and res and #res > 0 then return res end
+            local brief = #pattern > 40 and pattern:sub(1, 40) .. "…" or pattern
+            if not ok then
+                logger.warn("MediaSync: findText error",
+                    "pattern=", brief, "dir=", direction, "err=", tostring(res))
+                return nil
+            end
+            if res and #res > 0 then
+                logger.warn("MediaSync: findText hit",
+                    "pattern=", brief, "dir=", direction,
+                    "count=", #res, "words=", tostring(words))
+                return res
+            end
+            logger.dbg("MediaSync: findText miss",
+                "pattern=", brief, "dir=", direction)
             return nil
         end
 
@@ -341,17 +347,7 @@ end
 -- extracted SMIL text and the rendered text can differ in whitespace,
 -- punctuation, and zero-width characters.
 function MediaSync:_normalizeSearchText(text)
-    if not text then return "" end
-    local t = text
-        :gsub("%s+", " ")
-        :gsub("[\226\128\152-\226\128\155]", "'")    -- curly quotes → straight
-        :gsub("[\226\128\156-\226\128\159]", '"')    -- curly double quotes
-        :gsub("\226\128\147", "-")                    -- en-dash
-        :gsub("\226\128\148", "-")                    -- em-dash
-        :gsub("\194\160", " ")                        -- non-breaking space
-        :gsub("[\226\128\139\226\128\169]", "")       -- zero-width chars
-        :gsub("\239\187\191", "")                     -- BOM
-    return t
+    return Utils.normalizeForMatching(text)
 end
 
 -- Check whether a fragment id is resolvable in the currently loaded content

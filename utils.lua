@@ -29,6 +29,32 @@ function Utils.ws(s)
     return s:gsub("%s+", " "):match("^%s*(.-)%s*$")
 end
 
+--- Normalize text for matching against crengine-rendered text.
+-- SMIL/source text and rendered text differ systematically: curly quotes,
+-- dashes, non-breaking spaces, zero-width chars, and (in some production
+-- pipelines) runs of straight apostrophes used as an escaping convention,
+-- e.g. "June'''s" for "June's".  Matching only, never for display.
+-- @param s string
+-- @return string
+function Utils.normalizeForMatching(s)
+    if not s then return "" end
+    return s
+        :gsub("[\n\r]+", " ")
+        :gsub("%s+", " ")
+        :gsub("\226\128[\152-\155]", "'")    -- curly quotes U+2018-U+201B → straight '
+        :gsub("\226\128[\156-\159]", '"')    -- curly double quotes U+201C-U+201F → straight "
+        :gsub("\194\171", '"')               -- « guillemet → straight "
+        :gsub("\194\187", '"')               -- » guillemet → straight "
+        :gsub("\226\128[\147-\148]", "-")    -- en/em-dash → hyphen
+        :gsub("\226\128\166", "...")         -- ellipsis
+        :gsub("\194\160", " ")               -- non-breaking space → space
+        :gsub("\194\173", "")                -- soft hyphen removed
+        :gsub("\226\128[\139\169]", "")      -- zero-width chars removed
+        :gsub("\239\187\191", "")            -- BOM removed
+        :gsub("''+", "'")                    -- apostrophe-run artifact
+        :gsub("^%s+", ""):gsub("%s+$", "")
+end
+
 --- Count the number of syllables in an English word (heuristic).
 -- @param word string
 -- @return number  Syllable count (minimum 1)

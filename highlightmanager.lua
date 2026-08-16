@@ -227,24 +227,11 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
     -- Clear any existing selection
     pcall(function() doc:clearSelection() end)
 
-    -- Normalize sentence text for matching: collapse whitespace and
-    -- normalize common Unicode punctuation that getTextFromPositions()
-    -- may return differently (curly quotes → straight, em-dash → hyphen,
-    -- non-breaking spaces → regular spaces, zero-width chars removed).
-    local sent_text = Utils.ws(sentence.text)
+    -- Normalize sentence text for matching: collapse whitespace, normalize
+    -- common Unicode punctuation that getTextFromPositions() may return
+    -- differently, and undo apostrophe-run escaping in SMIL text.
+    local sent_text = Utils.normalizeForMatching(sentence.text)
     if sent_text == "" then return end
-    -- Unicode punctuation normalization for reliable matching
-    sent_text = sent_text
-        :gsub("[\226\128\152-\226\128\155]", "'")    -- curly quotes → straight '
-        :gsub("[\226\128\156-\226\128\159]", '"')    -- curly double quotes → straight "
-        :gsub("\194\171", '"'):gsub("\194\187", '"') -- « » guillemets → straight "
-        :gsub("\226\128\147", "-")                    -- en-dash → hyphen
-        :gsub("\226\128\148", "-")                    -- em-dash → hyphen
-        :gsub("\226\128\166", "...")                  -- ellipsis …
-        :gsub("\194\160", " ")                        -- non-breaking space → space
-        :gsub("\194\173", "")                         -- soft hyphen
-        :gsub("[\226\128\139\226\128\169]", "")       -- zero-width chars removed
-        :gsub("\239\187\191", "")                     -- BOM removed
 
     -- ── Cached line map ──────────────────────────────────────────
     local cur_w, cur_h = Screen:getWidth(), Screen:getHeight()
@@ -283,21 +270,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
                 {x = box.x, y = box.y + math.floor(box.h / 2)},
                 {x = box.x + box.w - 1, y = box.y + math.floor(box.h / 2)},
                 true)
-            local lt = (r and r.text) and Utils.ws(r.text) or ""
-            -- Normalize Unicode punctuation to match sentence text
-            if lt ~= "" then
-                lt = lt
-                    :gsub("[\226\128\152-\226\128\155]", "'")
-                    :gsub("[\226\128\156-\226\128\159]", '"')
-                    :gsub("\194\171", '"'):gsub("\194\187", '"')
-                    :gsub("\226\128\147", "-")
-                    :gsub("\226\128\148", "-")
-                    :gsub("\226\128\166", "...")
-                    :gsub("\194\160", " ")
-                    :gsub("\194\173", "")
-                    :gsub("[\226\128\139\226\128\169]", "")
-                    :gsub("\239\187\191", "")
-            end
+            local lt = (r and r.text) and Utils.normalizeForMatching(r.text) or ""
             if i > 1 and lt ~= "" then
                 built_text = built_text .. " "
             end

@@ -2517,17 +2517,7 @@ function Audiobook:_fragmentFromXPointer(xp)
 end
 
 function Audiobook:_normalizeSelText(text)
-    if not text or text == "" then return "" end
-    return text
-        :gsub("[\n\r]+", " ")
-        :gsub("%s+", " ")
-        :gsub("^%s*", "")
-        :gsub("%s*$", "")
-        :gsub("[\226\128\152-\226\128\155]", "'")
-        :gsub("[\226\128\156-\226\128\159]", '"')
-        :gsub("\194\171", '"'):gsub("\194\187", '"')
-        :gsub("\226\128\147", "-"):gsub("\226\128\148", "-")
-        :gsub("\226\128\166", "...")
+    return Utils.normalizeForMatching(text)
 end
 
 function Audiobook:_matchSmilEntryFromSelection(selected_text, timing_data, parser)
@@ -3363,17 +3353,7 @@ end
 -- extracted SMIL text and the rendered text can differ in whitespace,
 -- punctuation, and zero-width characters.
 function Audiobook:_normalizeSearchText(text)
-    if not text then return "" end
-    local t = text
-        :gsub("%s+", " ")
-        :gsub("[\226\128\152-\226\128\155]", "'")    -- curly quotes -> straight
-        :gsub("[\226\128\156-\226\128\159]", '"')    -- curly double quotes
-        :gsub("\226\128\147", "-")                    -- en-dash
-        :gsub("\226\128\148", "-")                    -- em-dash
-        :gsub("\194\160", " ")                        -- non-breaking space
-        :gsub("[\226\128\139\226\128\169]", "")       -- zero-width chars
-        :gsub("\239\187\191", "")                     -- BOM
-    return t
+    return Utils.normalizeForMatching(text)
 end
 
 -- Find a page number that belongs to the target content document.
