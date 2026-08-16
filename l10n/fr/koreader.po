@@ -1146,14 +1146,22 @@ msgid "Keep the audiobook bar"
 msgstr "Conserver la barre du livre audio"
 
 #: main.lua:906
-msgid "When enabled (default), the mini audiobook bar stays on screen after you stop narration, and its bottom inset is saved with the book. KOReader then keeps the same page layout instead of reflowing the EPUB every time you start, stop, or reopen the book — which can freeze the app on large illustrated EPUBs. Disable to hide the bar when idle and restore your original page margins."
-msgstr "Lorsqu'elle est activée (par défaut), la mini-barre du livre audio reste affichée après l'arrêt de la narration, et sa marge inférieure est enregistrée avec le livre. KOReader conserve alors la même mise en page au lieu de recalculer l'EPUB à chaque lecture, arrêt ou réouverture — ce qui peut figer l'application sur les gros livres illustrés. Désactivez pour masquer la barre au repos et restaurer vos marges d'origine."
+msgid "When enabled (default), the mini audiobook bar stays on screen after you stop narration. Disable to hide the bar when idle."
+msgstr "Lorsqu'elle est activée (par défaut), la mini-barre du livre audio reste affichée après l'arrêt de la narration. Désactivez pour masquer la barre au repos."
 
-#: main.lua:909 main.lua:920
+#: main.lua:909
+msgid "Lock KOReader page margins"
+msgstr "Figer les marges KOReader"
+
+#: main.lua:927
+msgid "When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings after the first layout. Later opens typeset with that margin already applied, so CRE does not reflow again. Disable to restore your original margins and change them with KOReader’s usual margin controls."
+msgstr "Lorsqu'elle est activée (par défaut), le plugin écrit la marge inférieure de ce livre dans les réglages KOReader après la première mise en page. Les ouvertures suivantes composent déjà la page avec cette marge : plus de rechargement CRE. Décochez pour retrouver vos marges d'origine et les modifier comme d'habitude dans KOReader."
+
+#: main.lua:930
 msgid "Keep status bars during read-aloud"
 msgstr "Conserver les barres d’état pendant la lecture à voix haute"
 
-#: main.lua:917 main.lua:928
+#: main.lua:946
 msgid "When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar / progress bar (alt status bar at the top is unchanged). The page always reflows so book text ends above the mini player — the player never covers readable text. When disabled (default), the mini player sits at the bottom of the screen (may cover the status bar) but text is still reflowed above it."
 msgstr "Lorsqu'il est activé, le mini-lecteur minimisé en lecture haute se trouve au-dessus de la barre d'état inférieure/barre de progression de KOReader (la barre d'état alternative en haut reste inchangée). La page est toujours redistribuée de sorte que le texte du livre se termine au-dessus du mini-lecteur — le lecteur ne couvre jamais le texte lisible. Lorsqu'il est désactivé (par défaut), le mini-lecteur se trouve en bas de l'écran (peut couvrir la barre d'état) mais le texte est toujours redistribué au-dessus."
 

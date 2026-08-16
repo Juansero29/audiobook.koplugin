@@ -294,6 +294,7 @@ local function collectPluginInfo(plugin)
             piper_model = plugin:getSetting("piper_model", nil) and
                 sanitizePath(plugin:getSetting("piper_model", "")) or "none",
             keep_media_overlay_bar = tostring(plugin:getSetting("keep_media_overlay_bar", true)),
+            lock_koreader_page_margins = tostring(plugin:getSetting("lock_koreader_page_margins", true)),
             smil_sync_offset_ms = tostring(plugin:getSetting("smil_sync_offset_ms", 0)),
             media_follow_page_turn = tostring(plugin:getSetting("media_follow_page_turn", true)),
         }

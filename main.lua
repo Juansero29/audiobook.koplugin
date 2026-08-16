@@ -903,18 +903,36 @@ function Audiobook:addToMainMenu(menu_items)
                                 end)
                             end
                         end,
-                        help_text = _("When enabled (default), the mini audiobook bar stays on screen after you stop narration, and its bottom inset is saved with the book. KOReader then keeps the same page layout instead of reflowing the EPUB every time you start, stop, or reopen the book — which can freeze the app on large illustrated EPUBs. Disable to hide the bar when idle and restore your original page margins."),
+                        help_text = _("When enabled (default), the mini audiobook bar stays on screen after you stop narration. Disable to hide the bar when idle."),
                     },
                     {
-                        text = _("Keep status bars during read-aloud"),
-                        enabled_func = function() return (self.ui and self.ui.document) or false end,
+                        text = _("Lock KOReader page margins"),
+                        enabled_func = function()
+                            return (self.ui and self.ui.document
+                                and self:getSetting("keep_media_overlay_bar", true)) and true or false
+                        end,
                         checked_func = function()
-                            return self:getSetting("keep_reader_status_bars", false)
+                            return self:getSetting("lock_koreader_page_margins", true)
                         end,
                         callback = function()
-                            self:toggleSetting("keep_reader_status_bars", false)
+                            self:toggleSetting("lock_koreader_page_margins", true)
+                            local now = self:getSetting("lock_koreader_page_margins", true)
+                            local ms = self.media_sync
+                            if not ms then return end
+                            if now then
+                                if self:_hasMediaOverlays() then
+                                    pcall(function() ms:pinOverlayChrome() end)
+                                end
+                            else
+                                pcall(function() ms:_releaseMiniBarSpace() end)
+                                if self:getSetting("keep_media_overlay_bar", true)
+                                    and self:_hasMediaOverlays() then
+                                    -- Bar stays; inset is session-only until lock is on again.
+                                    pcall(function() ms:pinOverlayChrome() end)
+                                end
+                            end
                         end,
-                        help_text = _("When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar / progress bar (alt status bar at the top is unchanged). The page always reflows so book text ends above the mini player — the player never covers readable text. When disabled (default), the mini player sits at the bottom of the screen (may cover the status bar) but text is still reflowed above it."),
+                        help_text = _("When enabled (default), the plugin writes this book’s bottom page margin into KOReader’s own settings after the first layout. Later opens typeset with that margin already applied, so CRE does not reflow again. Disable to restore your original margins and change them with KOReader’s usual margin controls."),
                     },
                     {
                         text = _("Keep status bars during read-aloud"),
@@ -3538,6 +3556,29 @@ end
 function Audiobook:onPosUpdate(pos, refresh_type)
 end
 
+-- Before ReaderTypeset reads copt_*, put the saved overlay inset into
+-- KOReader's own bottom margin so the first CRE pass already matches.
+function Audiobook:onDocSettingsLoad(config, document)
+    if not config then return end
+    if not self:getSetting("lock_koreader_page_margins", true) then return end
+    if not self:getSetting("keep_media_overlay_bar", true) then return end
+    if not config:readSetting("audiobook_overlay_margin_locked") then return end
+    local needed = tonumber(config:readSetting("audiobook_overlay_bottom"))
+    if not needed then return end
+    if not config:readSetting("audiobook_overlay_orig_bottom") then
+        local current = config:readSetting("copt_b_page_margin")
+        if current ~= nil and current ~= needed then
+            config:saveSetting("audiobook_overlay_orig_bottom", current)
+        end
+    end
+    config:saveSetting("copt_b_page_margin", needed)
+    local cfg = document and document.configurable
+    if cfg then
+        cfg.b_page_margin = needed
+    end
+    dlog("overlay-margin", "docsettings-preload", "copt", needed)
+end
+
 --- Pin the overlay mini-bar and restore the last sentence (highlighted,
 --- audio armed, not playing) so Play continues from there.
 function Audiobook:onReaderReady()
@@ -3879,6 +3920,12 @@ end
 
 function Audiobook:onCloseDocument()
     logger.warn("Audiobook: onCloseDocument event received")
+    -- Re-assert the overlay inset before ReaderConfig writes copt_* so the
+    -- next open typesets with it (skip CRE reflow). Dropping chrome must not
+    -- restore the original 15 px bottom margin when keep-bar is on.
+    if self.media_sync then
+        pcall(function() self.media_sync:_persistLockedOverlayMargin() end)
+    end
     -- Do NOT stop the session recorder here: opening a new book from the
     -- file browser fires CloseDocument, and the user expects the recording
     -- to persist across book changes. The recorder still stops on suspend,
