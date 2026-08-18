@@ -145,6 +145,12 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
         if sentence.fragment_id then
             local ok = self:_highlightByFragmentId(doc, sentence.fragment_id)
             if ok then return true end
+            -- The fragment id is not in the current DocFragment (sentence is
+            -- in the next content document).  A fuzzy text match against the
+            -- still-visible page would highlight the wrong sentence and, in
+            -- overlay mode, report success so the page-advance jump never
+            -- fires.  Return false so the caller navigates to the fragment.
+            return false
         end
         return self:_highlightSentenceRolling(sentence, parsed_data, doc)
     else
