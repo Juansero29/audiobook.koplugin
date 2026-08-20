@@ -214,9 +214,13 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
     -- spine order to know which DocFragment contains the target document.
     if self:_gotoViaSpineDocFragment(text_doc, fragment_id, start_page) then
         cache_current_xpointer()
-        if fragment_in_document() then scroll_to_fragment() end
-        UIManager:setDirty("all", "ui")
-        return true
+        if fragment_in_document() then
+            scroll_to_fragment()
+            UIManager:setDirty("all", "ui")
+            return true
+        end
+        -- Same chapter, different page: #id often still does not resolve.
+        -- Fall through to findText instead of claiming success on the wrong page.
     end
 
     -- 4. getPageFromXPointer probe (skip page 1 — bogus on Kindle).
@@ -237,9 +241,11 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
     if allow_scan then
         if self:_gotoViaToc(text_doc, fragment_id, start_page) then
             cache_current_xpointer()
-            if fragment_in_document() then scroll_to_fragment() end
-            UIManager:setDirty("all", "ui")
-            return true
+            if fragment_in_document() then
+                scroll_to_fragment()
+                UIManager:setDirty("all", "ui")
+                return true
+            end
         end
     end
 
@@ -362,6 +368,18 @@ function MediaSync:_fragmentInDocument(fragment_id)
     return ok and in_doc
 end
 
+-- Check whether a fragment id is resolvable in the currently loaded content
+-- document.
+function MediaSync:_fragmentInDocument(fragment_id)
+    local ui = self.plugin and self.plugin.ui
+    if not ui or not ui.document or not fragment_id then return false end
+    local xp = "#" .. fragment_id
+    local ok, in_doc = pcall(function()
+        return ui.document:isXPointerInDocument(xp)
+    end)
+    return ok and in_doc
+end
+
 -- Try to jump to the content document that contains a SMIL fragment by using
 -- the EPUB table of contents.  The SMIL parser already loaded a mapping from
 -- content-document basename to chapter title; we match that title against the
@@ -437,11 +455,21 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
     local ui = self.plugin and self.plugin.ui
     if not ui or not ui.document or not docfrag_n or not fragment_id then return false end
     local doc = ui.document
+    -- Direct-child tag[@id] misses Storyteller spans nested in <h1>/<p>
+    -- (Word-exported AlexandriZ HTML). Nested paths first.
+    local nested = {
+        "h1/span", "p/span", "div/span", "div/p/span",
+        "h2/span", "h3/span", "blockquote/span",
+    }
     local tags = {"span", "p", "div", "h1", "h2", "h3", "h4", "li", "td", "em", "strong", "a"}
     local bodies = {"body", "body.0"}
     local probes = {}
     for _, body in ipairs(bodies) do
         table.insert(probes, string.format("/body/DocFragment[%d]/%s/id('%s')", docfrag_n, body, fragment_id))
+        for _, path in ipairs(nested) do
+            table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']",
+                docfrag_n, body, path, fragment_id))
+        end
         for _, tag in ipairs(tags) do
             table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", docfrag_n, body, tag, fragment_id))
         end
@@ -459,7 +487,7 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
                 "ok=", tostring(ok_goto),
                 "page_before=", before_page, "page_after=", after_page)
             if ok_goto and after_page then
-                if fragment_in_document() then
+                if self:_fragmentInDocument(fragment_id) then
                     return true, norm
                 end
                 if after_page ~= before_page then

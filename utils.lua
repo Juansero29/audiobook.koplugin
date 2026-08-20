@@ -93,6 +93,220 @@ function Utils.normalizeDirPath(path)
     return path
 end
 
+--- Fold a token for alignment: lowercase, drop apostrophes/punctuation, strip
+--- a trailing hyphen (CRe line-break hyphenation). Matching only.
+function Utils.foldWord(w)
+    if not w or w == "" then return "" end
+    w = w:lower()
+    w = w:gsub("\195\137", "\195\169") -- É → é
+    w = w:gsub("\195\136", "\195\168") -- È → è
+    w = w:gsub("\195\138", "\195\170") -- Ê → ê
+    w = w:gsub("\195\128", "\195\160") -- À → à
+    w = w:gsub("\195\135", "\195\167") -- Ç → ç
+    w = w:gsub("'", ""):gsub("\226\128\153", "")
+    w = w:gsub("^%p+", ""):gsub("%p+$", "")
+    w = w:gsub("%-$", "")
+    return w
+end
+
+--- Tokens of `s` with original character spans. Merges a hyphenated line-break
+--- ("exem-" + "ple") and a French elision ("L'" + "homme").
+function Utils.tokenizeForAlign(s)
+    local toks = {}
+    if not s or s == "" then return toks end
+    local pos = 1
+    while true do
+        local a, b = s:find("%S+", pos)
+        if not a then break end
+        local raw = s:sub(a, b)
+        pos = b + 1
+        if raw:sub(-1) == "-" then
+            local a2, b2 = s:find("%S+", pos)
+            if a2 then
+                raw = raw:sub(1, -2) .. s:sub(a2, b2)
+                b = b2
+                pos = b2 + 1
+            end
+        elseif raw:find("'", 1, true) and #raw <= 4 then
+            local a2, b2 = s:find("%S+", pos)
+            if a2 then
+                raw = raw .. s:sub(a2, b2)
+                b = b2
+                pos = b2 + 1
+            end
+        end
+        local fold = Utils.foldWord(raw)
+        if fold ~= "" then
+            toks[#toks + 1] = { fold = fold, a = a, b = b }
+        end
+    end
+    return toks
+end
+
+--- Align `words` (SMIL) onto `page` (rendered). Returns
+--- first_word, last_word, char_start, char_end in `page`, or nil.
+--- Bookends the first and last matching words so a hyphenation hole in the
+--- middle does not drop the start or end of the phrase.
+function Utils.alignSentenceOnPage(words, page)
+    if not words or #words == 0 or not page or page == "" then return nil end
+    local toks = Utils.tokenizeForAlign(page)
+    if #toks == 0 then return nil end
+    local sent = {}
+    for i = 1, #words do
+        sent[i] = Utils.foldWord(words[i])
+    end
+
+    local function findFrom(i, min_p, max_p)
+        local f = sent[i]
+        if not f or f == "" then return nil end
+        local hi = max_p or #toks
+        for p = min_p, hi do
+            local tf = toks[p].fold
+            if tf == f then return p end
+            if #tf >= 3 and #f >= 3 then
+                if f:sub(1, #tf) == tf or tf:sub(1, #f) == f then return p end
+            end
+        end
+        return nil
+    end
+
+    local first_w, first_p
+    for i = 1, #words do
+        local p = findFrom(i, 1, #toks)
+        if p then
+            first_w, first_p = i, p
+            break
+        end
+    end
+    if not first_w then return nil end
+
+    local last_w, last_p = first_w, first_p
+    local p_cur = first_p
+    for i = first_w + 1, #words do
+        if sent[i] ~= "" then
+            local gap = (#sent[i] <= 3) and 5 or 12
+            if i >= #words - 1 then gap = 20 end
+            local p = findFrom(i, p_cur + 1, math.min(#toks, p_cur + gap))
+            if p then
+                last_w, last_p = i, p
+                p_cur = p
+            end
+        end
+    end
+    if last_p < first_p then
+        last_p = first_p
+        last_w = first_w
+    end
+    local span = last_w - first_w + 1
+    if span <= 2 and #words > 6 and first_w > 3 and last_w < #words - 2 then
+        return nil
+    end
+    return first_w, last_w, toks[first_p].a, toks[last_p].b
+end
+
+--- Split on whitespace. UTF-8 safe (does not slice codepoints).
+function Utils.splitWords(s)
+    local words = {}
+    if not s or s == "" then return words end
+    for w in s:gmatch("%S+") do
+        words[#words + 1] = w
+    end
+    return words
+end
+
+--- Longest prefix of `words` that appears as a contiguous phrase in `page`.
+function Utils.wordPrefixCount(words, page)
+    if not words or #words == 0 or not page or page == "" then return 0 end
+    local lo, hi = 0, #words
+    while lo < hi do
+        local mid = math.floor((lo + hi + 1) / 2)
+        local prefix = table.concat(words, " ", 1, mid)
+        if page:find(prefix, 1, true) then
+            lo = mid
+        else
+            hi = mid - 1
+        end
+    end
+    return lo
+end
+
+--- Index of the first word that contains a letter/digit (skip leading punctuation).
+function Utils.contentWordStart(words)
+    if not words then return 1 end
+    for i = 1, #words do
+        if not words[i]:match("^%p+$") then return i end
+    end
+    return 1
+end
+
+--- Longest prefix of `words` on `page`, ignoring a leading punctuation token.
+function Utils.sentencePrefixOnPage(words, page)
+    if not words or #words == 0 or not page or page == "" then return 0 end
+    local start = Utils.contentWordStart(words)
+    if start == 1 then
+        return Utils.wordPrefixCount(words, page)
+    end
+    local rest = {}
+    for i = start, #words do
+        rest[#rest + 1] = words[i]
+    end
+    local n = Utils.wordPrefixCount(rest, page)
+    if n <= 0 then return 0 end
+    return n + start - 1
+end
+
+--- Longest suffix of `words` that appears as a contiguous phrase in `page`.
+-- Used after a mid-sentence page turn: only the tail is on screen.
+function Utils.sentenceSuffixOnPage(words, page)
+    if not words or #words == 0 or not page or page == "" then return 0 end
+    for n = #words, 1, -1 do
+        local suffix = table.concat(words, " ", #words - n + 1, #words)
+        if page:find(suffix, 1, true) then
+            return n
+        end
+    end
+    return 0
+end
+
+--- First and last sentence-word indices of the longest contiguous run of
+--- `words` that appears in `page`. nil when nothing matches.
+--- Prefers the longest *span* (not the match that ends furthest): a later
+--- one-word coincidence like "de" must not replace a 12-word prefix.
+function Utils.visibleSentenceWordRange(words, page)
+    if not words or #words == 0 or not page or page == "" then return nil end
+    local best_i, best_j = nil, nil
+    local function consider(i, j)
+        if not i or not j or j < i then return end
+        local span = j - i + 1
+        local best_span = (best_i and (best_j - best_i + 1)) or 0
+        if span > best_span or (span == best_span and i < best_i) then
+            best_i, best_j = i, j
+        end
+    end
+    local prefix = Utils.sentencePrefixOnPage(words, page)
+    if prefix > 0 then
+        consider(1, prefix)
+        if prefix >= #words then return 1, #words end
+    end
+    for i = (prefix > 0 and prefix + 1 or 1), #words do
+        local lo, hi = 0, #words - i + 1
+        while lo < hi do
+            local mid = math.floor((lo + hi + 1) / 2)
+            local slice = table.concat(words, " ", i, i + mid - 1)
+            if page:find(slice, 1, true) then
+                lo = mid
+            else
+                hi = mid - 1
+            end
+        end
+        if lo > 0 then
+            consider(i, i + lo - 1)
+        end
+    end
+    if not best_i then return nil end
+    return best_i, best_j
+end
+
 --- Detect the number of CPU cores (same logic as piperqueue.lua).
 -- @return number  Core count (1 when undetectable)
 function Utils.getCpuCores()
