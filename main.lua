@@ -1369,6 +1369,11 @@ function Audiobook:startReadAlong(text, start_pos)
             cancel_text = _("Cancel"),
             ok_callback = function()
                 pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
+                if self.media_sync then
+                    pcall(function()
+                        self.media_sync:stop(nil, { drop_chrome = true })
+                    end)
+                end
                 self.sync_controller:start(page_text)
             end,
         })
@@ -1377,6 +1382,15 @@ function Audiobook:startReadAlong(text, start_pos)
 
     -- Notify BT device that playback is starting
     pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
+
+    -- Built-in audiobook chrome (mini bar) must not stay on screen: the TTS
+    -- sync loop treats extra window-stack widgets as a menu and auto-pauses
+    -- forever (UI appears frozen).
+    if self.media_sync then
+        pcall(function()
+            self.media_sync:stop(nil, { drop_chrome = true })
+        end)
+    end
 
     self.sync_controller:start(page_text)
 end
@@ -1938,9 +1952,9 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
         -- Arming the pinned bar on book open: resume the saved mark silently
         -- (no prompt, no audio); Play continues from there.
         if allow_resume and not (start_entry and start_entry.audio_path) then
-            local saved_pos, _, saved_audio = self:_getSavedAlignedPosition(doc_path)
-            if saved_pos and saved_pos > 10 and saved_audio and by_file[saved_audio] then
-                start_entry = { audio_path = saved_audio, start_time = saved_pos }
+            local saved_pos = self:_getSavedAlignedPosition(doc_path)
+            if saved_pos and saved_pos > 10 then
+                start_entry = self:_resumeEntryFromSave(doc_path, timing_data, by_file)
             end
         end
         if not (start_entry and start_entry.audio_path) then
@@ -2312,18 +2326,21 @@ function Audiobook:_clearAlignedPosition(doc_path)
 end
 
 function Audiobook:_getSavedAlignedPosition(doc_path)
-    if not doc_path then return nil, nil, nil, nil end
+    if not doc_path then return nil, nil, nil, nil, nil, nil end
     local positions = self:getSetting("aligned_positions", {})
     local key = self:_getAudioPositionKey(doc_path)
     local entry = positions[key]
     if entry and entry.path == doc_path then
-        return entry.position, entry.timestamp, entry.audio_path, entry.chapter_title
+        return entry.position, entry.timestamp, entry.audio_path, entry.chapter_title,
+            entry.fragment_id, entry.text_doc
     end
-    return nil, nil, nil, nil
+    return nil, nil, nil, nil, nil, nil
 end
 
-function Audiobook:_saveAlignedPosition(doc_path, audio_path, position, chapter_title)
-    if not doc_path or not position or position <= 10 then return end
+function Audiobook:_saveAlignedPosition(doc_path, audio_path, position, chapter_title, fragment_id, text_doc)
+    if not doc_path or not audio_path then return end
+    position = tonumber(position)
+    if not position or position < 0 then return end
     local positions = self:getSetting("aligned_positions", {})
     local key = self:_getAudioPositionKey(doc_path)
     positions[key] = {
@@ -2331,6 +2348,8 @@ function Audiobook:_saveAlignedPosition(doc_path, audio_path, position, chapter_
         audio_path = audio_path,
         position = position,
         chapter_title = chapter_title,
+        fragment_id = fragment_id,
+        text_doc = text_doc,
         timestamp = os.time(),
     }
     -- Prune old entries (keep last 50)
@@ -2349,6 +2368,111 @@ function Audiobook:_saveAlignedPosition(doc_path, audio_path, position, chapter_
     self:setSetting("aligned_positions", positions)
 end
 
+--- Snapshot the current overlay sentence so the next open can restore it
+--- without a resume dialog.
+function Audiobook:_saveCurrentAlignedProgress(pos)
+    local ms = self.media_sync
+    if not ms or not ms.overlay_mode then return end
+    local eng = ms.media_engine
+    if not eng then return end
+    local path = eng.current_path
+    if not path then return end
+    if pos == nil then
+        local ok_pos, p = pcall(function() return eng:getPosition() end)
+        pos = (ok_pos and p) or eng._paused_position or eng._seek_offset or 0
+    end
+    pos = tonumber(pos) or 0
+    local doc_path = (self.ui and self.ui.document
+        and (self.ui.document.file_path or self.ui.document.file))
+        or self._smil_doc_path
+    if not doc_path then return end
+    local chapter_title
+    if ms.getCurrentChapter then
+        local ok_ch, ch = pcall(function() return ms:getCurrentChapter() end)
+        if ok_ch and ch then chapter_title = ch.title end
+    end
+    local fragment_id, text_doc
+    local idx = ms._current_sentence_idx
+    local sent = idx and ms.timing_data and ms.timing_data[idx]
+    if sent then
+        fragment_id = sent.fragment_id
+        text_doc = sent.text_doc
+    end
+    self:_saveAlignedPosition(doc_path, path, pos, chapter_title, fragment_id, text_doc)
+end
+
+--- Rebuild a SMIL start entry from the last saved overlay position.
+function Audiobook:_resumeEntryFromSave(doc_path, timing_data, by_file)
+    local saved_pos, _, saved_audio, _, frag, text_doc = self:_getSavedAlignedPosition(doc_path)
+    saved_pos = tonumber(saved_pos)
+    if not saved_pos or saved_pos < 0 then return nil end
+    if not saved_audio and not frag then return nil end
+
+    local function match_file(path)
+        if not path then return nil end
+        if by_file and by_file[path] then return path end
+        if by_file then
+            local base = path:match("([^/]+)$")
+            for p, _ in pairs(by_file) do
+                if p == path or (base and p:match("([^/]+)$") == base) then
+                    return p
+                end
+            end
+        end
+        return path
+    end
+
+    local audio = match_file(saved_audio)
+
+    -- Prefer the exact SMIL fragment (sentence-precision resume).
+    if frag and timing_data then
+        for _, e in ipairs(timing_data) do
+            if e.fragment_id == frag
+                and (not text_doc or not e.text_doc or e.text_doc == text_doc) then
+                return {
+                    audio_path = e.audio_path or audio,
+                    start_time = saved_pos,
+                    fragment_id = e.fragment_id,
+                    text_doc = e.text_doc,
+                }
+            end
+        end
+    end
+
+    -- Fall back to file+time: find the clip containing the saved position.
+    if audio and by_file and by_file[audio] then
+        local slice = by_file[audio].timing or {}
+        for _, e in ipairs(slice) do
+            local t0 = e.start_time or 0
+            local t1 = e.end_time or math.huge
+            if saved_pos >= t0 and saved_pos < t1 then
+                return {
+                    audio_path = audio,
+                    start_time = saved_pos,
+                    fragment_id = e.fragment_id,
+                    text_doc = e.text_doc,
+                }
+            end
+        end
+        local last = slice[#slice]
+        if last then
+            return {
+                audio_path = audio,
+                start_time = saved_pos,
+                fragment_id = last.fragment_id,
+                text_doc = last.text_doc,
+            }
+        end
+    end
+
+    return {
+        audio_path = audio,
+        start_time = saved_pos,
+        fragment_id = frag,
+        text_doc = text_doc,
+    }
+end
+
 function Audiobook:_promptResumeAlignedPlayback(doc_path, timing_data, default_start_entry, on_start_entry)
     if not doc_path then
         on_start_entry(default_start_entry)
@@ -2358,6 +2482,22 @@ function Audiobook:_promptResumeAlignedPlayback(doc_path, timing_data, default_s
     -- Threshold: offer to resume only if we have more than 10 s of progress.
     if not saved_pos or saved_pos <= 10 then
         on_start_entry(default_start_entry)
+        return
+    end
+
+    local resume = self:_resumeEntryFromSave(doc_path, timing_data, self._smil_by_file)
+
+    if Device:isAndroid() then
+        -- Android: resume silently and say where we landed (no modal prompt).
+        if resume then
+            on_start_entry(resume)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Resumed from %1"), self:_formatAudioTime(saved_pos)),
+                timeout = 2,
+            })
+        else
+            on_start_entry(default_start_entry)
+        end
         return
     end
 
@@ -2392,11 +2532,10 @@ function Audiobook:_promptResumeAlignedPlayback(doc_path, timing_data, default_s
         ok_text = _("Resume"),
         cancel_text = default_label,
         ok_callback = function()
-            local resume_entry = {
+            on_start_entry(resume or {
                 audio_path = saved_audio,
                 start_time = saved_pos,
-            }
-            on_start_entry(resume_entry)
+            })
         end,
         cancel_callback = function()
             if default_start_entry then
@@ -3033,7 +3172,8 @@ function Audiobook:_killOrphanProcessesFromPreviousSession()
     end
 end
 
-function Audiobook:stopReadAlong()
+function Audiobook:stopReadAlong(opts)
+    opts = opts or {}
     if not self._init_ok then return end
     logger.warn("Audiobook: stopReadAlong() called")
     -- Save media playback position before stopping
@@ -3088,7 +3228,9 @@ function Audiobook:stopReadAlong()
                 end
             end
         end
-        pcall(function() self.media_sync:stop() end)
+        pcall(function() self.media_sync:stop(false, { drop_chrome = opts.drop_chrome }) end)
+    elseif self.media_sync and opts.drop_chrome then
+        pcall(function() self.media_sync:stop(false, { drop_chrome = true }) end)
     end
     pcall(function() BtUI.stopWatcher(self) end)
     pcall(function() BtMediaControl.stop() end)
@@ -3320,6 +3462,7 @@ end
 function Audiobook:_currentAudioSentenceVisible()
     -- True when the sentence currently tied to the audio position appears on
     -- the visible page (so we should keep the highlight / hide "return").
+    -- A wrapping sentence is visible if either its prefix or its tail is here.
     if not self.media_sync or not self.media_sync.overlay_mode then return false end
     local idx = self.media_sync._current_sentence_idx
     local sent = idx and self.media_sync.timing_data and self.media_sync.timing_data[idx]
@@ -3327,9 +3470,15 @@ function Audiobook:_currentAudioSentenceVisible()
     local page_text = self:getCurrentPageText()
     if not page_text or page_text == "" then return false end
     local needle = self:_normalizeSelText(sent.text)
-    if #needle > 48 then needle = needle:sub(1, 48) end
     page_text = self:_normalizeSelText(page_text)
-    return needle ~= "" and page_text:find(needle, 1, true) ~= nil
+    if needle == "" then return false end
+    if page_text:find(needle, 1, true) then return true end
+    local words = Utils.splitWords(needle)
+    if #words == 0 then return false end
+    local prefix_n = Utils.sentencePrefixOnPage(words, page_text)
+    if prefix_n >= math.min(3, #words) then return true end
+    local suffix_n = Utils.sentenceSuffixOnPage(words, page_text)
+    return suffix_n >= math.min(2, #words)
 end
 
 function Audiobook:_showReturnToReadAloudButton()
@@ -3710,7 +3859,7 @@ function Audiobook:onCloseDocument()
     -- file browser fires CloseDocument, and the user expects the recording
     -- to persist across book changes. The recorder still stops on suspend,
     -- sleep-cover close, or explicit Stop.
-    self:stopReadAlong()
+    self:stopReadAlong({ drop_chrome = true })
 end
 
 -- Safety net: if UIManager tears down the widget tree (exit, doc switch)
@@ -3720,7 +3869,7 @@ function Audiobook:onCloseWidget()
     -- Do NOT stop the session recorder here for the same reason as above:
     -- widget teardown can happen when switching documents, and we want the
     -- recording to continue.
-    self:stopReadAlong()
+    self:stopReadAlong({ drop_chrome = true })
     if self._init_ok then
         self:_removeSleepCoverOverride()
     end

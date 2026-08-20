@@ -24,7 +24,7 @@ local Utils = dofile(_utils_dir .. "utils.lua")
 local function dlog(...)
     local DL = package.loaded["audiobook_debuglog"]
     if DL and DL.log then
-        pcall(DL.log, DL, ...)
+        pcall(DL.log, ...)
     end
 end
 
@@ -802,6 +802,10 @@ function MediaSync:stop(keep_chapter_menu, opts)
     local track_transition = opts.track_transition and true or false
     local drop_chrome = opts.drop_chrome and true or false
     local was_playing = self.state ~= self.STATE.STOPPED
+    if self.overlay_mode and was_playing and not track_transition
+        and self.plugin and self.plugin._saveCurrentAlignedProgress then
+        pcall(function() self.plugin:_saveCurrentAlignedProgress() end)
+    end
     self.state = self.STATE.STOPPED
     self._chain_generation = self._chain_generation + 1
 
@@ -1352,14 +1356,30 @@ end
 
 function MediaSync:skipBack(seconds)
     seconds = seconds or 30
+    if self.overlay_mode and self:_skipOverlayBy(-(seconds)) then
+        return
+    end
     if not self.media_engine then return end
     self.media_engine:seek(-seconds, "relative")
 end
 
 function MediaSync:skipForward(seconds)
     seconds = seconds or 30
+    if self.overlay_mode and self:_skipOverlayBy(seconds) then
+        return
+    end
     if not self.media_engine then return end
     self.media_engine:seek(seconds, "relative")
+end
+
+--- Skip within the SMIL chapter timeline (may cross ~4 min audio parts).
+function MediaSync:_skipOverlayBy(delta_s)
+    local pos = self.media_engine and self.media_engine:getPosition() or 0
+    local ch_pos, ch_dur = self:_overlayChapterProgress(pos)
+    if not ch_dur or ch_dur <= 0 then return false end
+    local target = math.max(0, math.min(ch_dur, (ch_pos or 0) + delta_s))
+    self:seekToOverlayProgress(target / ch_dur)
+    return true
 end
 
 function MediaSync:prevSentence()
@@ -1749,6 +1769,8 @@ function MediaSync:_updateHighlightAtTime(pos)
     if sent_idx ~= self._current_sentence_idx then
         self._current_sentence_idx = sent_idx
         self._current_word_idx = 1
+        self._hl_fail_count = 0
+        self._hl_retry_at = nil
         -- EPUB Media Overlay: keep the book view following the narration.
         -- The SMIL fragment id resolves as a "#id" xpointer in crengine;
         -- turn the page before highlighting so the text-matching
@@ -1769,7 +1791,9 @@ function MediaSync:_updateHighlightAtTime(pos)
                 self.plugin._suppress_media_sync_auto_page_follow = nil
             end
         end
-        if self.highlight_manager and (sentence.text or sentence.fragment_id) then
+        if browsing_away then
+            -- Stay on the user's page: do not paint a coincidental phrase.
+        elseif self.highlight_manager and (sentence.text or sentence.fragment_id) then
             -- Build a synthetic sentence object for HighlightManager
             local sent_obj = {
                 text = sentence.text or "",
@@ -1785,16 +1809,9 @@ function MediaSync:_updateHighlightAtTime(pos)
             if hl_ok and sentence.fragment_id then
                 self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
             end
-            -- Narration caught up to the page the user was browsing.
-            if hl_ok and browsing_away and self.plugin then
-                self.plugin._readaloud_browsing_away = false
-                browsing_away = false
-                if self.plugin._hideReturnToReadAloudButton then
-                    pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
-                end
-            elseif browsing_away and not hl_ok then
-                -- Stay off-page: drop the failed highlight attempt immediately.
-                pcall(function() self.highlight_manager:clearHighlights() end)
+            if hl_ok then
+                self._highlighted_sentence_idx = sent_idx
+                self._hl_fail_count = 0
             end
 
             -- If the sentence is not on the visible page, JUMP to its fragment
@@ -1842,6 +1859,8 @@ function MediaSync:_updateHighlightAtTime(pos)
                             end)
                             if retry_ok then
                                 ms._last_hl_idx = target_idx
+                                ms._highlighted_sentence_idx = target_idx
+                                ms._hl_fail_count = 0
                                 ms:_cacheResolvedXPointer(
                                     sentence.text_doc, sentence.fragment_id)
                             else
@@ -1866,6 +1885,14 @@ function MediaSync:_updateHighlightAtTime(pos)
         end
     end
 
+    -- "Play aligned from here" stamps _current_sentence_idx before the view
+    -- has settled, so the block above never runs for that first sentence.
+    -- Keep retrying until the highlight actually lands.
+    if sent_idx == self._current_sentence_idx
+        and self._highlighted_sentence_idx ~= sent_idx then
+        self:_ensureSentenceHighlighted(sentence, sent_idx)
+    end
+
     -- Find current word within sentence (if word-level timing available)
     if sentence.words and #sentence.words > 0 then
         local word_idx = self:_findWordAtTime(sentence.words, pos)
@@ -1885,6 +1912,256 @@ function MediaSync:_updateHighlightAtTime(pos)
             end
         end
     end
+
+    -- Mid-sentence page follow (Readest-style). SMIL is phrase-timed, so a
+    -- sentence laid out across a page break would otherwise leave the view on
+    -- page 1 while the narrator reads the tail on page 2. Compare how far
+    -- through the sentence's *text* the current page still shows against how
+    -- far through its *audio* we are — no invented per-word timestamps.
+    if self.overlay_mode then
+        self:_followSentenceAcrossPages(sentence, pos)
+    end
+end
+
+function MediaSync:_ensureSentenceHighlighted(sentence, sent_idx)
+    if not self.highlight_manager then return end
+    if not (sentence and (sentence.text or sentence.fragment_id)) then return end
+    if self.plugin and self.plugin._readaloud_browsing_away then return end
+    local fails = self._hl_fail_count or 0
+    if fails >= 10 then return end
+    local now = time.now()
+    if self._hl_retry_at and now < self._hl_retry_at then return end
+    self._hl_retry_at = now + time.s(0.35)
+
+    local sent_obj = {
+        text = sentence.text or "",
+        start_pos = sentence.start_pos or 0,
+        end_pos = sentence.end_pos or #(sentence.text or ""),
+        fragment_id = sentence.fragment_id,
+        text_doc = sentence.text_doc,
+    }
+    local hl_ok = false
+    pcall(function()
+        hl_ok = self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+    end)
+    if hl_ok then
+        self._highlighted_sentence_idx = sent_idx
+        self._hl_fail_count = 0
+        self._hl_retry_at = nil
+        if sentence.fragment_id then
+            self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+        end
+        logger.warn("MediaSync: first-sentence highlight ok idx=", sent_idx)
+    else
+        self._hl_fail_count = fails + 1
+    end
+end
+
+-- Page text used to decide a mid-sentence turn. Crops the mini-player and
+-- a partial last line so words the reader cannot see do not inflate the
+-- break fraction (that turned the page late).
+function MediaSync:_visiblePageText()
+    local ui = self.plugin and self.plugin.ui
+    local doc = ui and ui.document
+    if not (ui and ui.rolling and doc) then
+        if self.plugin and self.plugin.getCurrentPageText then
+            local ok, txt = pcall(function() return self.plugin:getCurrentPageText() end)
+            if ok then return txt end
+        end
+        return nil
+    end
+    local w, h = Screen:getWidth(), Screen:getHeight()
+    local crop = Screen:scaleBySize(18)
+    if self._reserved_mini_bar_h and self._reserved_mini_bar_h > 0 then
+        crop = crop + self._reserved_mini_bar_h
+    end
+    local y1 = math.max(1, h - crop)
+    local ok, res = pcall(doc.getTextFromPositions, doc,
+        {x = 0, y = 0}, {x = w, y = y1}, true)
+    if ok and res and res.text and res.text ~= "" then
+        return res.text
+    end
+    return nil
+end
+
+-- How much of the SMIL phrase is still on this page, from the start.
+-- Uses the prefix only: a later one-word coincidence must not inflate the
+-- break (that turned the page at 82–95% of the clip).
+function MediaSync:_fragmentVisiblePrefix(sentence, sent_words)
+    -- Kindle: per-box text extraction is too slow on the mid-sentence tick;
+    -- the whole-page prefix from _visiblePageText is enough there.
+    if Device:isKindle() then return nil end
+    local ui = self.plugin and self.plugin.ui
+    local doc = ui and ui.document
+    local fid = sentence and sentence.fragment_id
+    if not (doc and fid and sent_words and #sent_words > 0) then return nil end
+    local ok, xp = pcall(function()
+        return doc:getNormalizedXPointer("#" .. fid)
+    end)
+    if not (ok and xp and xp ~= false) then return nil end
+    local boxes
+    pcall(function()
+        boxes = doc:getScreenBoxesFromPositions(xp, xp, true)
+    end)
+    if not boxes or #boxes == 0 then return nil end
+    local crop = Screen:getHeight() - (self._reserved_mini_bar_h or 0) - Screen:scaleBySize(12)
+    local parts = {}
+    local n_on = 0
+    for _, b in ipairs(boxes) do
+        if (b.y or 0) + (b.h or 0) * 0.4 < crop then
+            n_on = n_on + 1
+            local r
+            pcall(function()
+                r = doc:getTextFromPositions(
+                    {x = b.x or 0, y = (b.y or 0) + math.floor((b.h or 0) / 2)},
+                    {x = (b.x or 0) + math.max((b.w or 1) - 1, 0),
+                     y = (b.y or 0) + math.floor((b.h or 0) / 2)},
+                    true)
+            end)
+            if r and r.text then parts[#parts + 1] = r.text end
+        end
+    end
+    local on_text = self:_normalizeSearchText(table.concat(parts, " "))
+    local prefix = Utils.sentencePrefixOnPage(sent_words, on_text)
+    dlog("page-break-frag", "boxes", #boxes, "on", n_on, "on_n", #on_text, "prefix", prefix)
+    -- A single box is usually the id's first word, not the visible phrase.
+    if n_on <= 1 or prefix < 3 then return nil end
+    return prefix
+end
+
+-- Fraction of the sentence's text that is still on the current page (0..1),
+-- or nil when the tail is already visible (nothing to follow). Same idea as
+-- Readest's pageBreakFraction: layout/page-text decides the break, audio
+-- progress decides *when* to turn.
+function MediaSync:_sentencePageBreakFraction(sentence)
+    local raw = sentence and (sentence.text or "") or ""
+    if raw == "" and sentence and sentence.fragment_id then
+        raw = self:_lookupSentenceText(sentence.text_doc, sentence.fragment_id) or ""
+    end
+    local sent = self:_normalizeSearchText(raw)
+    if sent == "" then return nil end
+
+    local page = self:_normalizeSearchText(self:_visiblePageText() or "")
+    if page == "" then return nil end
+
+    local words = Utils.splitWords(sent)
+    if #words < 4 then return false end
+
+    local prefix = Utils.sentencePrefixOnPage(words, page)
+    if page:find(sent, 1, true) then
+        prefix = #words
+    end
+    local frag_prefix = self:_fragmentVisiblePrefix(sentence, words)
+    dlog("page-break", "n", #words, "prefix", prefix,
+        "frag_prefix", tostring(frag_prefix), "page_n", #page, "sent_n", #sent)
+
+    if type(frag_prefix) == "number" and frag_prefix > 0 then
+        if prefix <= 0 then
+            prefix = frag_prefix
+        else
+            prefix = math.min(prefix, frag_prefix)
+        end
+    end
+
+    if prefix <= 0 then
+        dlog("page-break-skip", "no-prefix")
+        return false
+    end
+    if prefix >= #words then
+        dlog("page-break-skip", "fully-visible", "n", #words)
+        return false
+    end
+    -- Turn at the first word that has left the page (end of the prefix).
+    local visible = table.concat(words, " ", 1, prefix)
+    if prefix < 3 and #visible < 20 then return false end
+    local brk = #visible / #sent
+    dlog("page-break-use", "prefix", prefix, "n", #words, "brk", string.format("%.3f", brk))
+    return brk
+end
+
+function MediaSync:_followSentenceAcrossPages(sentence, pos)
+    if not sentence or not pos then return end
+    if not self.plugin then return end
+    if self.plugin.getSetting and not self.plugin:getSetting("media_follow_page_turn", true) then
+        return
+    end
+    if self.plugin._readaloud_browsing_away then return end
+    -- Do not honor `_suppress_media_sync_auto_page_follow` here: that flag
+    -- blocks the fragment-crawl GotoViewRel(1) after "play from here", not
+    -- this mid-sentence turn which is driven by audio progress vs layout.
+
+    local dur = (sentence.end_time or 0) - (sentence.start_time or 0)
+    if dur <= 0.4 then return end
+    local progress = (pos - (sentence.start_time or 0)) / dur
+    if progress < 0 then progress = 0 end
+    if progress > 1 then progress = 1 end
+
+    local now = time.now()
+    if self._pf_cooldown_until and now < self._pf_cooldown_until then
+        return
+    end
+
+    local ui = self.plugin.ui
+    if not (ui and ui.rolling and ui.document) then return end
+    local page = ui.document:getCurrentPage()
+    local sent_idx = self._current_sentence_idx
+    if self._pf_sent_idx ~= sent_idx or self._pf_page ~= page or self._pf_break == nil then
+        self._pf_sent_idx = sent_idx
+        self._pf_page = page
+        self._pf_break = self:_sentencePageBreakFraction(sentence)
+    end
+    local brk = self._pf_break
+    if type(brk) ~= "number" then return end
+    if progress < brk then return end
+
+    logger.warn("MediaSync: mid-sentence page follow  progress=",
+        string.format("%.2f", progress), "break=", string.format("%.2f", brk),
+        "sent_idx=", sent_idx)
+    dlog("mid-sentence page follow", "progress", progress, "break", brk, "sent", sent_idx)
+
+    self._pf_break = nil
+    self._pf_page = nil
+    self._pf_cooldown_until = now + time.s(0.45)
+    -- Same sentence, new page: force the sync loop to retry the highlight
+    -- (otherwise _highlighted_sentence_idx still matches and the tail is skipped).
+    self._highlighted_sentence_idx = nil
+    self._hl_fail_count = 0
+    self:_markPageFollowAuto()
+    pcall(function()
+        ui:handleEvent(Event:new("GotoViewRel", 1))
+    end)
+    if self.highlight_manager then
+        self.highlight_manager._line_cache = nil
+    end
+    -- Re-draw the sentence highlight after the page settles.
+    local ms = self
+    local sent_idx_at_turn = sent_idx
+    local sent_obj = {
+        text = sentence.text or "",
+        start_pos = sentence.start_pos or 0,
+        end_pos = sentence.end_pos or #(sentence.text or ""),
+        fragment_id = sentence.fragment_id,
+        text_doc = sentence.text_doc,
+    }
+    UIManager:scheduleIn(0.5, function()
+        if ms.state ~= ms.STATE.PLAYING then
+            ms:_clearPageFollowAuto()
+            return
+        end
+        if ms.highlight_manager then
+            local ok_hl = false
+            pcall(function()
+                ok_hl = ms.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+            end)
+            if ok_hl then
+                ms._highlighted_sentence_idx = sent_idx_at_turn
+                ms._hl_fail_count = 0
+            end
+        end
+        UIManager:scheduleIn(1.5, function()
+            ms:_clearPageFollowAuto()
+        end)
+    end)
 end
 
 function MediaSync:_findSentenceAtTime(pos)
@@ -2196,6 +2473,7 @@ function MediaSync:showPlaybackBar()
         loop_active = self.loop_enabled,
         volume_pct = self:getVolume(),
         on_volume = function(pct) self:setVolume(pct) end,
+        playback_speed = self:getSpeed(),
         ui_widget = self.plugin and self.plugin.ui,
         on_play_pause = function()
             if self.state == self.STATE.PLAYING then
@@ -2231,6 +2509,9 @@ function MediaSync:showPlaybackBar()
                 else
                     self.state = self.STATE.STOPPED
                 end
+            elseif self.plugin and self.plugin.startMediaPlayback then
+                -- Pinned overlay bar before the first play of this session.
+                pcall(function() self.plugin:startMediaPlayback() end)
             end
         end,
         on_skip_back = function()
@@ -2246,6 +2527,11 @@ function MediaSync:showPlaybackBar()
             self:nextChapter()
         end,
         on_seek = function(pct)
+            if self.overlay_mode then
+                -- Chapter-local scrubber (may cross audio parts).
+                self:seekToOverlayProgress(pct)
+                return
+            end
             local dur = self.media_engine and self.media_engine:getDuration() or 0
             if dur > 0 then
                 self:seekToTime(pct * dur)
@@ -2817,28 +3103,75 @@ function MediaSync:seekToOverlayChapter(index)
     local chapters = self.plugin and self.plugin._smil_overlay_chapters
     if not chapters or not chapters[index] then return end
     local ch = chapters[index]
+    self:_seekToOverlayFileTime(ch.audio_path, ch.start_time or 0)
+end
+
+--- Scrubber pct is chapter-local (same scale as the overlay time display).
+function MediaSync:seekToOverlayProgress(pct)
+    pct = tonumber(pct) or 0
+    if pct < 0 then pct = 0 end
+    if pct > 1 then pct = 1 end
+    local pos = self.media_engine and self.media_engine:getPosition() or 0
+    local _, ch_dur = self:_overlayChapterProgress(pos)
+    if not ch_dur or ch_dur <= 0 then
+        local dur = self.media_engine and self.media_engine:getDuration() or 0
+        if dur > 0 then
+            self:seekToTime(pct * dur)
+        end
+        return
+    end
+    local ch = select(1, self:_resolveOverlayChapter())
+    local key = overlayChapterKey(ch)
+    local segments = self:_overlayChapterSegments(key)
+    if not segments or #segments == 0 then
+        local dur = self.media_engine and self.media_engine:getDuration() or 0
+        if dur > 0 then
+            self:seekToTime(pct * dur)
+        end
+        return
+    end
+    local target = pct * ch_dur
+    local acc = 0
+    local chosen
+    for i, s in ipairs(segments) do
+        local last = (i == #segments)
+        if last or target <= acc + s.dur then
+            local local_t = (s.start_time or 0) + (target - acc)
+            if local_t < (s.start_time or 0) then local_t = s.start_time or 0 end
+            if s.end_time and local_t > s.end_time then local_t = s.end_time end
+            chosen = { path = s.audio_path, time = local_t }
+            break
+        end
+        acc = acc + s.dur
+    end
+    if not chosen then return end
+    logger.warn("MediaSync: overlay seek pct=", pct, "chapter_t=", target,
+        "file=", chosen.path, "t=", chosen.time)
+    dlog("overlay seek", "pct=", pct, "target=", target, "t=", chosen.time)
+    self:_seekToOverlayFileTime(chosen.path, chosen.time)
+end
+
+function MediaSync:_seekToOverlayFileTime(audio_path, local_time)
+    local_time = tonumber(local_time) or 0
     local function after_audio_ready()
+        -- Let the new part settle before seeking (Kindle A2DP bridge needs it).
         UIManager:scheduleIn(0.2, function()
-            self:seekToTime(ch.start_time)
-            if self.overlay_mode and ch.fragment_id then
-                UIManager:scheduleIn(0.3, function()
-                    self:navigateToSentenceAtTime(ch.start_time)
-                end)
-            end
+            self:seekToTime(local_time)
         end)
     end
-    if ch.audio_path and self.media_engine
-        and self.media_engine.current_path ~= ch.audio_path then
-        -- Cross-file chapter jump: BT reconnect then load the new audio part.
+    if audio_path and self.media_engine
+        and self.media_engine.current_path ~= audio_path then
+        -- Cross-file jump: BT reconnect then load the new audio part.
         self:_bridgeKindleA2dpForTrackChange(function()
             if self.plugin and self.plugin._playAudioFile then
-                self.plugin:_playAudioFile(ch.audio_path, self.playlist_files)
+                self.plugin:_playAudioFile(audio_path, self.playlist_files)
             end
             after_audio_ready()
         end)
         return
     end
-    after_audio_ready()
+    -- Same file: seek immediately, no settle delay.
+    self:seekToTime(local_time)
 end
 
 function MediaSync:showPlaylist()
@@ -2882,6 +3215,10 @@ end
 function MediaSync:getTotalTime()
     local dur = self.media_engine and self.media_engine:getDuration() or 0
     return self:_formatTime(dur)
+end
+
+function MediaSync:getSpeed()
+    return self.media_engine and self.media_engine:getSpeed() or 1.0
 end
 
 function MediaSync:_formatTime(seconds)

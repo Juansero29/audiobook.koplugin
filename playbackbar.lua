@@ -26,6 +26,9 @@ local logger = require("logger")
 local _ = require("audiobook_gettext")
 
 local PlaybackBar = InputContainer:extend{
+    -- Plugin chrome: the media overlay bar must not count as a "menu/dialog"
+    -- for _isOverlayActive (and vice versa).
+    _plugin_chrome = true,
     width = nil,
     height = nil,
     plugin = nil,
@@ -595,7 +598,7 @@ function PlaybackBar:_isOverlayActive()
     local non_toast = 0
     for i = 1, #stack do
         local w = stack[i].widget
-        if w ~= self and not w.toast then
+        if w ~= self and not w.toast and not w._plugin_chrome then
             non_toast = non_toast + 1
             if non_toast > 1 then
                 return true

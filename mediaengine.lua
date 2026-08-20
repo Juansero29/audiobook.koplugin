@@ -57,6 +57,10 @@ function MediaEngine:new(o)
     o._pause_start_time = nil
     o._total_pause_ms = 0
     o._seek_offset = 0
+    -- Android live-seek health (session-only): set when the one-shot probe
+    -- finds MediaPlayer.seekTo is a no-op, switching seeks to seek-by-restart.
+    o._seek_probe_done = false
+    o._seek_to_broken = false
     -- Kindle-specific state
     o._gst_play_cmd = nil
     o._lipc_fallback_tried = false
@@ -1320,6 +1324,11 @@ function MediaEngine:_playAndroid(gen)
 
     pcall(function() player:stop() end)
 
+    -- Store rate on the player before play(); JNI applies it after prepare().
+    pcall(function()
+        player:setSpeed(self._playback_speed or 1.0)
+    end)
+
     local offset = self._seek_offset or 0
     local seek_ms = math.floor(offset * 1000)
     local ok = player:play(self.current_path, seek_ms)
@@ -1357,8 +1366,10 @@ function MediaEngine:_startAndroidCompletionWatcher(gen)
     local player = self._android_player
     if not player then return end
     local poll_count = 0
+    -- Slow playback needs proportionally more 0.1 s polls to reach the end.
     local max_polls = math.max(600,
-        math.floor((self.current_duration or 300) * 10))
+        math.floor((self.current_duration or 300) * 10
+            / math.min(1.0, math.max(0.25, self._playback_speed or 1.0))))
     local function poll()
         if self.play_generation ~= gen then return end
         if not self.is_playing then return end
@@ -3028,19 +3039,62 @@ function MediaEngine:seek(seconds, mode)
             target = self:getPosition() + seconds
         end
         target = math.max(0, target)
+        if self.current_duration and self.current_duration > 0 then
+            target = math.min(target, self.current_duration)
+        end
         self._seek_offset = target
-        if self.is_paused then
-            self._paused_position = target
-            return true
-        end
+        self._paused_position = target
         local player = self._android_player
-        if player then
-            player:seekToMs(math.floor(target * 1000))
-            self._play_start_time = UIManager:getTime()
-            self._total_pause_ms = 0
+        if self.is_paused then
+            -- Stay paused; resume() plays from _paused_position / _last_mp_pos_ms.
+            if player then
+                pcall(function()
+                    player._last_mp_pos_ms = math.floor(target * 1000)
+                    player:seekToMs(math.floor(target * 1000))
+                end)
+            end
+            logger.warn("MediaEngine: Android seek while paused", target)
             return true
         end
-        return false
+        if not player then
+            return false
+        end
+        if self._seek_to_broken then
+            -- Live MediaPlayer.seekTo is a no-op on this device (probe below
+            -- detected it).  play() seeks before start(), which does work —
+            -- same seek-by-restart as the GST backends.
+            logger.warn("MediaEngine: Android seek-by-restart", target)
+            local complete = self._on_complete
+            local fail = self._on_fail
+            return self:play(complete, fail)
+        end
+        local target_ms = math.floor(target * 1000)
+        player:seekToMs(target_ms)
+        self._play_start_time = UIManager:getTime()
+        self._total_pause_ms = 0
+        if not self._seek_probe_done then
+            -- One-shot probe: on some Boox HALs live seekTo is a no-op (UI
+            -- jumps, audio keeps the old timeline).  Verify the position
+            -- actually moved; if not, switch this session to seek-by-restart.
+            self._seek_probe_done = true
+            local gen = self.play_generation
+            UIManager:scheduleIn(0.35, function()
+                if self.play_generation ~= gen then return end
+                if not self.is_playing or self.is_paused then return end
+                if self._seek_to_broken then return end
+                local pos_ms = tonumber(player:getPositionMs()) or 0
+                if math.abs(pos_ms - target_ms) > 1000 then
+                    logger.warn("MediaEngine: Android live seek ignored",
+                        "wanted=", target_ms, "got=", pos_ms,
+                        "-- switching to seek-by-restart")
+                    self._seek_to_broken = true
+                    local complete = self._on_complete
+                    local fail = self._on_fail
+                    self:play(complete, fail)
+                end
+            end)
+        end
+        return true
     end
 
     if self.backend == self.BACKENDS.MPV then
@@ -3274,10 +3328,9 @@ function MediaEngine:getPosition()
     -- During a seek gap (after stop, before play restarts), return the seek
     -- offset so the UI doesn't flicker back to zero.
     if not self.is_playing then
-        if self._seek_offset and self._seek_offset > 0 then
-            return self._seek_offset
-        end
-        return 0
+        -- Hold the paused/seek target so the UI doesn't flicker back to zero.
+        local held = tonumber(self._paused_position) or tonumber(self._seek_offset) or 0
+        return math.max(0, held)
     end
 
     -- Kindle A2DP pause-halt: pipeline is gone; hold the saved pause position.
@@ -3400,7 +3453,7 @@ function MediaEngine:isPaused()
 end
 
 -- ---------------------------------------------------------------------------
--- Playback speed (mpv / mplayer only)
+-- Playback speed (mpv / mplayer / Android; pipeline backends restart)
 -- ---------------------------------------------------------------------------
 
 function MediaEngine:setSpeed(speed)
@@ -3409,6 +3462,15 @@ function MediaEngine:setSpeed(speed)
     if speed > 3.0 then speed = 3.0 end
     local old_speed = self._playback_speed or 1.0
     self._playback_speed = speed
+
+    if self.backend == self.BACKENDS.ANDROID then
+        -- MediaPlayer applies the rate live via PlaybackParams (also stored
+        -- for the next play(), which re-applies it after prepare()).
+        if self._android_player then
+            pcall(function() self._android_player:setSpeed(speed) end)
+        end
+        return
+    end
 
     if not self.is_playing then return end
 

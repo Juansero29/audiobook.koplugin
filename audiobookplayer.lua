@@ -50,6 +50,9 @@ local AudiobookPlayer = InputContainer:extend{
     output_name = "",
     cover_image_path = nil,
     playback_speed = 1.0,
+    -- Plugin chrome: the TTS PlaybackBar:_isOverlayActive must not treat this
+    -- mini bar as a menu/dialog (and vice versa).
+    _plugin_chrome = true,
     -- Time display mode: "book" = position-in-book, "chapter" = position-in-chapter
     _time_display_mode = "book",
     _current_chapter_start = 0,
@@ -1879,6 +1882,23 @@ end
 
 function AudiobookPlayer:onCloseWidget()
     -- Cleanup hook
+end
+
+--- Extra window-stack widgets (menus/dialogs) besides this chrome.
+function AudiobookPlayer:_isOverlayActive()
+    local stack = UIManager._window_stack
+    if not stack then return false end
+    local non_toast = 0
+    for i = 1, #stack do
+        local w = stack[i].widget
+        if w ~= self and not w.toast and not w._plugin_chrome then
+            non_toast = non_toast + 1
+            if non_toast > 1 then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 function AudiobookPlayer:paintTo(bb, x, y)
