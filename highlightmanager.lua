@@ -145,11 +145,14 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
         if sentence.fragment_id then
             local ok = self:_highlightByFragmentId(doc, sentence.fragment_id)
             if ok then return true end
-            -- The fragment id is not in the current DocFragment (sentence is
-            -- in the next content document).  A fuzzy text match against the
-            -- still-visible page would highlight the wrong sentence and, in
-            -- overlay mode, report success so the page-advance jump never
-            -- fires.  Return false so the caller navigates to the fragment.
+            -- Same content document: CRe's #id index often misses Storyteller
+            -- <span id> nested in Word-exported <p>/<h1>, so fall back to a
+            -- text match on this page. Other-document miss must still return
+            -- false (v0.1.17.34 / #64) so page-advance can run instead of
+            -- highlighting a look-alike sentence here.
+            if self:_fragmentOnCurrentDoc(sentence) then
+                return self:_highlightSentenceRolling(sentence, parsed_data, doc)
+            end
             return false
         end
         return self:_highlightSentenceRolling(sentence, parsed_data, doc)
@@ -159,18 +162,67 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
     end
 end
 
+function HighlightManager:_currentDocFragmentIndex(doc)
+    doc = doc or (self.ui and self.ui.document)
+    if not doc or not doc.getXPointer then return nil end
+    local xp
+    pcall(function() xp = doc:getXPointer() end)
+    return xp and tonumber((xp or ""):match("DocFragment%[(%d+)%]"))
+end
+
+--- True when the SMIL content document is the currently loaded DocFragment.
+function HighlightManager:_fragmentOnCurrentDoc(sentence)
+    if not sentence or not sentence.text_doc then return false end
+    local n = self:_currentDocFragmentIndex()
+    local parser = self.plugin and self.plugin._smil_parser
+    local spine = parser and parser._spine_hrefs or {}
+    if not n or not spine[n] then return false end
+    local base = sentence.text_doc:match("([^/]+)$") or sentence.text_doc
+    return spine[n] == base
+end
+
+--- Resolve a SMIL fragment id to a CRe xpointer.
+-- `#id` uses crengine's id index, which often omits inline Storyteller
+-- spans. Attribute-path probes still match `[@id=...]` on the current
+-- DocFragment (e.g. body/h1/span[@id='html28-s0']).
+function HighlightManager:_resolveFragmentXPointer(doc, fragment_id)
+    if not doc or not fragment_id then return nil end
+    local function try_xp(xp)
+        local ok, nx = pcall(function() return doc:getNormalizedXPointer(xp) end)
+        if ok and nx and nx ~= false then return nx end
+        return nil
+    end
+    local hit = try_xp("#" .. fragment_id)
+    if hit then return hit end
+    local n = self:_currentDocFragmentIndex(doc)
+    if not n then return nil end
+    local probes = {
+        "/body/DocFragment[%d]/body/h1/span[@id='%s']",
+        "/body/DocFragment[%d]/body/p/span[@id='%s']",
+        "/body/DocFragment[%d]/body/div/span[@id='%s']",
+        "/body/DocFragment[%d]/body/div/p/span[@id='%s']",
+        "/body/DocFragment[%d]/body/span[@id='%s']",
+        "/body/DocFragment[%d]/body/p[@id='%s']",
+        "/body/DocFragment[%d]/body/h1[@id='%s']",
+        "/body/DocFragment[%d]/body/id('%s')",
+        "/body/DocFragment[%d]/body.0/h1/span[@id='%s']",
+        "/body/DocFragment[%d]/body.0/p/span[@id='%s']",
+    }
+    for _, fmt in ipairs(probes) do
+        hit = try_xp(string.format(fmt, n, fragment_id))
+        if hit then return hit end
+    end
+    return nil
+end
+
 --- Highlight a SMIL sentence via its DOM id (e.g. "html39-s12").
 -- Works only when that content document is already the current CRe document.
 function HighlightManager:_highlightByFragmentId(doc, fragment_id)
     if not doc or not fragment_id then return false end
-    local xp0
-    local ok_xp, norm = pcall(function()
-        return doc:getNormalizedXPointer("#" .. fragment_id)
-    end)
-    if not (ok_xp and norm and norm ~= false) then
+    local xp0 = self:_resolveFragmentXPointer(doc, fragment_id)
+    if not xp0 then
         return false
     end
-    xp0 = norm
     local xp1 = xp0
 
     -- Expand to the full sentence/element when CRe supports it.

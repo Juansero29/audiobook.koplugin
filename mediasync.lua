@@ -437,11 +437,21 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
     local ui = self.plugin and self.plugin.ui
     if not ui or not ui.document or not docfrag_n or not fragment_id then return false end
     local doc = ui.document
+    -- Direct-child tag[@id] misses Storyteller spans nested in <h1>/<p>
+    -- (Word-exported AlexandriZ HTML). Nested paths first.
+    local nested = {
+        "h1/span", "p/span", "div/span", "div/p/span",
+        "h2/span", "h3/span", "blockquote/span",
+    }
     local tags = {"span", "p", "div", "h1", "h2", "h3", "h4", "li", "td", "em", "strong", "a"}
     local bodies = {"body", "body.0"}
     local probes = {}
     for _, body in ipairs(bodies) do
         table.insert(probes, string.format("/body/DocFragment[%d]/%s/id('%s')", docfrag_n, body, fragment_id))
+        for _, path in ipairs(nested) do
+            table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']",
+                docfrag_n, body, path, fragment_id))
+        end
         for _, tag in ipairs(tags) do
             table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", docfrag_n, body, tag, fragment_id))
         end
