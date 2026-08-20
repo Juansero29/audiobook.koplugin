@@ -129,7 +129,14 @@ local function detectStack()
                 local ah = io.popen("lipc-get-prop com.lab126.btfd isAudibleAvailable 2>/dev/null")
                 local ar = ah and ah:read("*a") or ""
                 if ah then ah:close() end
-                lipc_bt_audible_available = tonumber(ar:gsub("%s+$", ""))
+                local ar_trim = ar:gsub("%s+$", "")
+                -- tonumber() on a non-numeric or empty result would raise;
+                -- treat anything that does not start with a digit as unknown (nil).
+                if ar_trim:match("^%d") then
+                    lipc_bt_audible_available = tonumber(ar_trim)
+                else
+                    lipc_bt_audible_available = nil
+                end
                 logger.warn("BTManager: btfd isAudibleAvailable =", tostring(lipc_bt_audible_available))
             end
             if not has_lipc then

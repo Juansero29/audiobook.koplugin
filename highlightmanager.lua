@@ -152,9 +152,13 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
         if sentence.fragment_id then
             local frag_ok = self:_highlightByFragmentId(doc, sentence.fragment_id, sentence)
             if frag_ok then return true end
-            -- Id missed (other content doc, or CRe stub). Only a contiguous
-            -- phrase of THIS sentence is allowed — not first+last bookends.
-            return self:_highlightSentenceRolling(sentence, parsed_data, doc, nil, true)
+            -- The fragment id is not in the current DocFragment (often the
+            -- next content document). A fuzzy text match against the still-
+            -- visible page would highlight the wrong sentence and, in overlay
+            -- mode, report success so the page-advance jump never fires
+            -- (upstream v0.1.17.34 / #64). Return false so the caller
+            -- navigates to the fragment's real page.
+            return false
         end
         return self:_highlightSentenceRolling(sentence, parsed_data, doc)
     else
