@@ -17,8 +17,43 @@ local logger = require("logger")
 -- Shared utility module
 local _dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local Utils = dofile(_dir .. "utils.lua")
+local ElevenLabs = dofile(_dir .. "elevenlabs.lua")
 
 local MenuBuilder = {}
+
+--[[--
+Friendly name of Android's preferred TTS engine (SherpaTTS, Google, …).
+@return string|nil
+--]]
+function MenuBuilder.androidSystemEngineName(plugin)
+    local engine = plugin and plugin.tts_engine
+    if not engine or not engine.androidEngineDisplayName then
+        return nil
+    end
+    return engine:androidEngineDisplayName()
+end
+
+--[[--
+"System TTS" or "System TTS (SherpaTTS)" when the preferred engine is known.
+--]]
+function MenuBuilder.systemTtsMenuLabel(plugin)
+    local name = MenuBuilder.androidSystemEngineName(plugin)
+    if name and name ~= "" then
+        return T(_("System TTS (%1)"), name)
+    end
+    return _("System TTS")
+end
+
+--[[--
+Engine picker row: keep "(Android)" until the preferred engine is known.
+--]]
+function MenuBuilder.systemTtsAndroidChoiceLabel(plugin)
+    local name = MenuBuilder.androidSystemEngineName(plugin)
+    if name and name ~= "" then
+        return T(_("System TTS (Android) — %1"), name)
+    end
+    return _("System TTS (Android)")
+end
 
 function MenuBuilder.buildVoiceSettingsMenu(plugin)
     local menu = {}
@@ -33,7 +68,8 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 pico = _("Pico TTS"),
                 flite = _("Flite"),
                 festival = _("Festival"),
-                android = _("Android"),
+                android = MenuBuilder.systemTtsMenuLabel(plugin),
+                elevenlabs = _("ElevenLabs"),
                 ["platform-native"] = _("Platform-native helper"),
             }
             return T(_("TTS engine: %1"), labels[backend] or backend)
@@ -43,14 +79,29 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         end,
     })
 
+    local backend = plugin.tts_engine and plugin.tts_engine.backend
+    local BACKENDS = plugin.tts_engine and plugin.tts_engine.BACKENDS
+
     -- Platform-native helper settings (only visible when that backend is active).
-    if plugin.tts_engine and plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.NATIVE then
+    if BACKENDS and backend == BACKENDS.NATIVE then
         table.insert(menu, {
             text = _("Platform-native helper settings"),
             sub_item_table_func = function()
                 return MenuBuilder.buildNativeTtsSettingsMenu(plugin)
             end,
         })
+    end
+
+    -- Engine-specific settings: only the active backend. Switching engine
+    -- (buildEngineSelectMenu) closes the menu so the next open is rebuilt.
+    if BACKENDS and backend == BACKENDS.ELEVENLABS then
+        for _, item in ipairs(MenuBuilder.buildElevenLabsSettingsMenu(plugin)) do
+            table.insert(menu, item)
+        end
+    elseif BACKENDS and backend == BACKENDS.ANDROID then
+        for _, item in ipairs(MenuBuilder.buildSystemTtsSettingsMenu(plugin)) do
+            table.insert(menu, item)
+        end
     end
 
     -- MBROLA voice selection (espeak-ng backend only).
@@ -189,37 +240,6 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         })
     end
 
-    -- Android TTS: HuggingFace catalog languages + installed system voices.
-    -- (Piper ONNX models themselves cannot run on Android; they appear here
-    -- as languages, and as voices if the user installed SherpaTTS / similar.)
-    if plugin.tts_engine
-       and plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ANDROID then
-        table.insert(menu, {
-            text_func = function()
-                local label = plugin:getSetting("android_tts_voice_label", "")
-                if label ~= "" then
-                    return T(_("Voice: %1"), label)
-                end
-                local lang = plugin:getSetting("android_tts_language", "auto")
-                if lang == "auto" then
-                    return T(_("Voice: %1"), _("Auto-detect"))
-                end
-                return T(_("Voice: %1"), lang)
-            end,
-            callback = function(touchmenu_instance)
-                if touchmenu_instance then
-                    touchmenu_instance:closeMenu()
-                end
-                MenuBuilder.showVoicePicker(plugin)
-            end,
-            help_text = _(
-                "Pick a language from the HuggingFace catalog, or an installed "
-                .. "Android TTS voice. Neural voices on Android come from the "
-                .. "system TTS engine (Google, SherpaTTS, …)."
-            ),
-        })
-    end
-
     -- Speech rate submenu
     table.insert(menu, {
         text_func = function()
@@ -246,9 +266,10 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         sub_item_table = MenuBuilder.buildVolumeMenu(plugin),
     })
 
-    -- Pause between sentences / paragraphs (espeak-ng and Android TTS)
+    -- Pause between sentences / paragraphs (Lua chain delay)
     if plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK
-        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ANDROID then
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ANDROID
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ELEVENLABS then
         table.insert(menu, {
             text_func = function()
                 return T(_("Sentence pause (. ? !): %1s"), plugin:getSetting("sentence_pause", 0.1))
@@ -347,7 +368,10 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 end
             end,
         })
-    elseif plugin.tts_engine.backend ~= plugin.tts_engine.BACKENDS.ANDROID then
+    elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PICO
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.FLITE
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.FESTIVAL then
         table.insert(menu, {
             text_func = function()
                 if plugin:getSetting("tts_mbrola_voice", "") ~= "" then
@@ -811,9 +835,15 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
         or engine.backend == engine.BACKENDS.ANDROID then
         table.insert(available, {
             id = engine.BACKENDS.ANDROID,
-            label = _("Android (system TTS engine)"),
+            label = MenuBuilder.systemTtsAndroidChoiceLabel(plugin),
         })
     end
+
+    -- ElevenLabs: always listed. Needs an API key in TTS settings.
+    table.insert(available, {
+        id = engine.BACKENDS.ELEVENLABS,
+        label = _("ElevenLabs (cloud, high quality)"),
+    })
 
     -- espeak-ng: available if we detected it during init
     if engine.espeak_lib_path or Utils.commandExists("espeak-ng") or Utils.commandExists("espeak") then
@@ -871,7 +901,7 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
                 -- setting; otherwise the user's selection would be silently
                 -- overridden on the next page.
                 plugin:setSetting("espeak_only_mode", false)
-                -- Close the menu so the user reopens Voice Settings and sees
+                -- Close the menu so the user reopens TTS settings and sees
                 -- the correct engine-specific items (pitch, pauses, etc.).
                 if touchmenu_instance then
                     touchmenu_instance:closeMenu()
@@ -945,7 +975,7 @@ function MenuBuilder.buildPiperVoiceMenu(plugin)
                     if cores <= 1 or (mem_kb and mem_kb < 512 * 1024) then
                         plugin._piper_weak_device_warned = true
                         UIManager:show(InfoMessage:new{
-                            text = _("Note: this device has limited CPU/RAM. Piper voices may pause between sentences or fall back to espeak during playback. Enabling \"Low-resource mode\" in Voice settings can help."),
+                            text = _("Note: this device has limited CPU/RAM. Piper voices may pause between sentences or fall back to espeak during playback. Enabling \"Low-resource mode\" in TTS settings can help."),
                             timeout = 8,
                         })
                     end
@@ -1501,6 +1531,50 @@ function MenuBuilder._showNativePrestepDialog(plugin, touchmenu_instance)
 end
 
 --[[--
+Paste / replace the ElevenLabs API key (stored in KOReader settings only).
+--]]
+function MenuBuilder._showElevenLabsKeyDialog(plugin, touchmenu_instance)
+    local InputDialog = require("ui/widget/inputdialog")
+    local current = plugin:getSetting("elevenlabs_api_key", "")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("ElevenLabs API key"),
+        input = current,
+        input_hint = "sk_…",
+        text_type = "password",
+        description = _(
+            "Your key stays on this device in KOReader settings. "
+            .. "It is never written into the plugin folder or bug reports."
+        ),
+        buttons = {
+            {
+                { text = _("Cancel"), callback = function() UIManager:close(dialog) end },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local key = dialog:getInputText() or ""
+                        key = key:gsub("^%s+", ""):gsub("%s+$", "")
+                        plugin:setSetting("elevenlabs_api_key", key)
+                        UIManager:close(dialog)
+                        if key ~= "" then
+                            plugin:setSetting("tts_backend", plugin.tts_engine.BACKENDS.ELEVENLABS)
+                            if plugin.tts_engine then
+                                plugin.tts_engine:setBackend(plugin.tts_engine.BACKENDS.ELEVENLABS)
+                            end
+                        end
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+--[[--
 Languages from the bundled HuggingFace Piper catalog (voices.json), plus
 the CJK locales Android TTS already handled.  Used as Android TTS language
 shortcuts — the ONNX models themselves do not run on Android.
@@ -1887,11 +1961,886 @@ function MenuBuilder._espeakVoicePickerItems(plugin)
     return items, current
 end
 
+local function _elevenLabsLangStored(plugin)
+    local s = plugin:getSetting("elevenlabs_language", "auto")
+    if type(s) ~= "string" or s == "" then return "auto" end
+    return s
+end
+
+--- ISO code actually sent in ElevenLabs requests (auto resolved).
+local function _elevenLabsLangPrefix(plugin)
+    return ElevenLabs.resolvedRequestLanguage(plugin, plugin.tts_engine)
+end
+
+local function _elevenLabsLangLabel(prefix)
+    prefix = ElevenLabs.isoLang(prefix) or prefix or "en"
+    for _, choice in ipairs(MenuBuilder.huggingfaceLanguageChoices()) do
+        if _localePrefix(choice.id) == prefix then
+            return choice.label
+        end
+    end
+    return prefix
+end
+
+function MenuBuilder.elevenLabsRequestLanguageText(plugin)
+    local stored = _elevenLabsLangStored(plugin)
+    local iso, source = ElevenLabs.resolvedRequestLanguage(plugin, plugin.tts_engine)
+    local name = _elevenLabsLangLabel(iso)
+    if stored == "auto" then
+        if source == "book" then
+            return T(_("Request language: Auto (%1, book)"), name)
+        elseif source == "system" then
+            return T(_("Request language: Auto (%1, device)"), name)
+        end
+        return T(_("Request language: Auto (%1)"), name)
+    end
+    return T(_("Request language: %1 (forced)"), name)
+end
+
+function MenuBuilder.buildElevenLabsLanguageMenu(plugin)
+    local menu = {}
+    local function add(id, label)
+        table.insert(menu, {
+            text = label,
+            checked_func = function()
+                return _elevenLabsLangStored(plugin) == id
+            end,
+            callback = function()
+                plugin:setSetting("elevenlabs_language", id)
+                if plugin.tts_engine and plugin.tts_engine.invalidateQueuedAudio then
+                    pcall(function() plugin.tts_engine:invalidateQueuedAudio() end)
+                end
+            end,
+        })
+    end
+    add("auto", _("Auto (book language, then device)"))
+    local first = { "fr", "en", "es", "de", "it", "pt" }
+    local seen = { auto = true }
+    for _, prefix in ipairs(first) do
+        add(prefix, _elevenLabsLangLabel(prefix))
+        seen[prefix] = true
+    end
+    for _, choice in ipairs(MenuBuilder.huggingfaceLanguageChoices()) do
+        local prefix = _localePrefix(choice.id)
+        if prefix ~= "" and not seen[prefix] then
+            add(prefix, choice.label)
+            seen[prefix] = true
+        end
+    end
+    return menu
+end
+
+function MenuBuilder.buildElevenLabsSettingsMenu(plugin)
+    local menu = {}
+    table.insert(menu, {
+        text_func = function()
+            local key = plugin:getSetting("elevenlabs_api_key", "")
+            local masked = ElevenLabs.maskKey(key)
+            if masked == "" then
+                return _("ElevenLabs API key (not set)")
+            end
+            return T(_("ElevenLabs API key: %1"), masked)
+        end,
+        callback = function(touchmenu_instance)
+            MenuBuilder._showElevenLabsKeyDialog(plugin, touchmenu_instance)
+        end,
+        help_text = _(
+            "Paste your ElevenLabs API key (xi-api-key). "
+            .. "It is stored only in KOReader settings, never in the plugin files."
+        ),
+    })
+    table.insert(menu, {
+        text_func = function()
+            local label = plugin:getSetting("elevenlabs_voice_label", "")
+            if label == "" then
+                label = plugin:getSetting("elevenlabs_voice_id", "")
+            end
+            if label == "" then
+                return _("Voice: default")
+            end
+            return T(_("Voice: %1"), label)
+        end,
+        callback = function(touchmenu_instance)
+            if touchmenu_instance then
+                touchmenu_instance:closeMenu()
+            end
+            MenuBuilder.showVoicePicker(plugin, { engine = "elevenlabs" })
+        end,
+        help_text = _(
+            "The voice’s accent is separate from the request language. "
+            .. "A named English voice can still read French if the request language is French."
+        ),
+    })
+    table.insert(menu, {
+        text_func = function()
+            return MenuBuilder.elevenLabsRequestLanguageText(plugin)
+        end,
+        sub_item_table_func = function()
+            return MenuBuilder.buildElevenLabsLanguageMenu(plugin)
+        end,
+        help_text = _(
+            "Language sent to ElevenLabs with every sentence. "
+            .. "Auto uses the book language, or the device language if the book has none. "
+            .. "Force a language when the book is mis-tagged or mixed. "
+            .. "This is not the System TTS language."
+        ),
+    })
+    table.insert(menu, {
+        text_func = function()
+            local m = plugin:getSetting("elevenlabs_model", "eleven_multilingual_v2")
+            if m == "eleven_flash_v2_5" then
+                return _("Model: Flash v2.5 (faster)")
+            end
+            return _("Model: Multilingual v2 (quality)")
+        end,
+        checked_func = function()
+            return plugin:getSetting("elevenlabs_model", "eleven_multilingual_v2")
+                == "eleven_flash_v2_5"
+        end,
+        callback = function()
+            local cur = plugin:getSetting("elevenlabs_model", "eleven_multilingual_v2")
+            if cur == "eleven_flash_v2_5" then
+                plugin:setSetting("elevenlabs_model", "eleven_multilingual_v2")
+            else
+                plugin:setSetting("elevenlabs_model", "eleven_flash_v2_5")
+            end
+        end,
+        help_text = _(
+            "Multilingual v2 is best for French/English/Spanish books. "
+            .. "Flash v2.5 is cheaper and lower latency, slightly less natural."
+        ),
+    })
+    return menu
+end
+
+function MenuBuilder.buildSystemTtsSettingsMenu(plugin)
+    local menu = {}
+    local Device = require("device")
+    if not (Device.isAndroid and Device:isAndroid()) then
+        table.insert(menu, {
+            text = _("System TTS is available on Android devices."),
+            enabled = false,
+        })
+        return menu
+    end
+    -- Init the helper if System TTS is the active backend, so the
+    -- preferred-engine row can show SherpaTTS / Google / …  Do not start
+    -- Android TTS just because the user opened this submenu from ElevenLabs.
+    local engine = plugin.tts_engine
+    if engine and engine.BACKENDS and engine.backend == engine.BACKENDS.ANDROID
+        and engine._ensureAndroidTts then
+        pcall(function() engine:_ensureAndroidTts() end)
+    end
+    table.insert(menu, {
+        text_func = function()
+            local name = MenuBuilder.androidSystemEngineName(plugin)
+            return T(_("Engine: %1"), name or _("Not detected"))
+        end,
+        enabled = false,
+        help_text = _(
+            "This is Android's preferred TTS engine. "
+            .. "Change it in system Settings → Language & input → Text-to-speech."
+        ),
+    })
+    table.insert(menu, {
+        text_func = function()
+            local label = plugin:getSetting("android_tts_voice_label", "")
+            if label ~= "" then
+                return T(_("Voice: %1"), label)
+            end
+            local lang = plugin:getSetting("android_tts_language", "auto")
+            if lang == "auto" then
+                return T(_("Voice: %1"), _("Auto-detect"))
+            end
+            return T(_("Voice: %1"), lang)
+        end,
+        callback = function(touchmenu_instance)
+            if touchmenu_instance then
+                touchmenu_instance:closeMenu()
+            end
+            MenuBuilder.showVoicePicker(plugin, { engine = "android" })
+        end,
+        help_text = _(
+            "On-device engine (Google, SherpaTTS, …). "
+            .. "Independent from the language sent to ElevenLabs."
+        ),
+    })
+    return menu
+end
+
+function MenuBuilder._commitElevenLabsVoice(plugin, id, name)
+    if not id or id == "" then return end
+    plugin:setSetting("elevenlabs_voice_id", id)
+    plugin:setSetting("elevenlabs_voice_label", name or id)
+    if plugin.tts_engine and plugin.tts_engine.invalidateQueuedAudio then
+        pcall(function() plugin.tts_engine:invalidateQueuedAudio() end)
+    end
+    UIManager:show(InfoMessage:new{
+        text = T(_("Voice set to %1."), name or id),
+        timeout = 2,
+    })
+end
+
+function MenuBuilder._resolveElevenLabsVoiceId(plugin, voice, key, on_done)
+    if not voice or not voice.id then
+        if on_done then on_done(nil, "no voice") end
+        return
+    end
+    if voice.source ~= "library" or voice.added or voice.owner_id == "" then
+        if on_done then on_done(voice.id, voice.name) end
+        return
+    end
+    local info = InfoMessage:new{
+        text = _("Adding ElevenLabs voice…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+    UIManager:scheduleIn(0.05, function()
+        local id, err = ElevenLabs.addSharedVoice(key, voice.owner_id, voice.id, voice.name)
+        UIManager:close(info)
+        if not id then
+            if on_done then on_done(nil, err or "error") end
+            return
+        end
+        if on_done then on_done(id, voice.name) end
+    end)
+end
+
+function MenuBuilder._selectElevenLabsVoice(plugin, voice, key)
+    MenuBuilder._resolveElevenLabsVoiceId(plugin, voice, key, function(id, name_or_err)
+        if not id then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Could not add this library voice: %1"), tostring(name_or_err or "error")),
+                timeout = 6,
+            })
+            return
+        end
+        MenuBuilder._commitElevenLabsVoice(plugin, id, name_or_err)
+    end)
+end
+
+local function _elPreviewPath(plugin)
+    local engine = plugin and plugin.tts_engine
+    local atts = engine and engine._android_tts
+    local dir = "/tmp"
+    if atts and atts.getTempDir then
+        dir = atts:getTempDir() or dir
+    elseif plugin then
+        dir = "/sdcard/koreader/cache"
+    end
+    return dir .. "/audiobook_el_preview.mp3"
+end
+
+--- 2–3 sentences from the start of the current chapter (or this page).
+--- Never logs book text. Restores the view afterwards.
+function MenuBuilder._chapterPreviewSample(plugin)
+    local ui = plugin and plugin.ui
+    local doc = ui and ui.document
+    if not doc then return nil end
+    local parser = plugin.sync_controller and plugin.sync_controller.text_parser
+    if not parser or not parser.parse then return nil end
+
+    local saved_pos
+    if ui.rolling and doc.getCurrentPos then
+        local ok, pos = pcall(function() return doc:getCurrentPos() end)
+        if ok then saved_pos = pos end
+    end
+    plugin._peeking_adjacent_page = true
+    local function restore()
+        if saved_pos and doc.gotoPos then
+            pcall(function() doc:gotoPos(saved_pos) end)
+        end
+        plugin._peeking_adjacent_page = false
+    end
+
+    local toc
+    if doc.getToc then
+        local ok, t = pcall(function() return doc:getToc() end)
+        if ok and type(t) == "table" then toc = t end
+    end
+    local current_page
+    if doc.getCurrentPage then
+        local ok, p = pcall(function() return doc:getCurrentPage() end)
+        if ok then current_page = p end
+    end
+    local entry
+    if toc and current_page then
+        for _, e in ipairs(toc) do
+            if e.page and e.page <= current_page then
+                entry = e
+            end
+        end
+    end
+    if entry and entry.xpointer and ui.rolling and doc.gotoXPointer then
+        pcall(function() doc:gotoXPointer(entry.xpointer) end)
+    end
+
+    local Screen = require("device").screen
+    local chunks = {}
+    local sample
+    for _hop = 1, 4 do
+        local text = plugin.getCurrentPageText and plugin:getCurrentPageText()
+        if text and text ~= "" then
+            chunks[#chunks + 1] = text
+        end
+        local parsed = parser:parse(table.concat(chunks, "\n"))
+        local n = parsed and parsed.sentences and #parsed.sentences or 0
+        if n > 0 then
+            local take = math.min(3, n)
+            local parts = {}
+            for i = 1, take do
+                parts[i] = parsed.sentences[i].text
+            end
+            sample = table.concat(parts, " ")
+            if take >= 3 or #sample > 80 then
+                break
+            end
+        end
+        if not (ui.rolling and doc.gotoPos and doc.getCurrentPos) then
+            break
+        end
+        pcall(function()
+            doc:gotoPos(doc:getCurrentPos() + Screen:getHeight())
+        end)
+    end
+    restore()
+    if type(sample) ~= "string" or sample:match("^%s*$") then
+        return nil
+    end
+    if #sample > 900 then
+        sample = sample:sub(1, 900)
+    end
+    return sample
+end
+
+function MenuBuilder._stopElevenLabsPreview(plugin)
+    local sess = plugin and plugin._el_voice_sess
+    if sess then
+        sess.preview_gen = (sess.preview_gen or 0) + 1
+    end
+    local engine = plugin and plugin.tts_engine
+    if engine and engine.beginVoicePreview then
+        pcall(function() engine:beginVoicePreview() end)
+    elseif engine and engine._android_tts and engine._android_tts.stopPlayback then
+        pcall(function() engine._android_tts:stopPlayback() end)
+    end
+    local path = _elPreviewPath(plugin)
+    pcall(os.remove, path)
+    -- Previous builds wrote a .wav preview.
+    if type(path) == "string" then
+        pcall(os.remove, path:gsub("%.mp3$", ".wav"))
+    end
+end
+
+function MenuBuilder._restoreTtsAfterVoiceUi(plugin)
+    if not plugin or not plugin._el_preview_used then return end
+    plugin._el_preview_used = nil
+    local sc = plugin.sync_controller
+    if sc and sc.replayCurrentSentence then
+        pcall(function() sc:replayCurrentSentence() end)
+    end
+end
+
+function MenuBuilder._previewElevenLabsVoice(plugin, voice, key, on_ready)
+    local sess = plugin._el_voice_sess
+    if not sess then
+        sess = { preview_gen = 0, mode = "test" }
+        plugin._el_voice_sess = sess
+    end
+    sess.preview_gen = (sess.preview_gen or 0) + 1
+    local my_gen = sess.preview_gen
+    local sample = MenuBuilder._chapterPreviewSample(plugin)
+    if not sample then
+        UIManager:show(InfoMessage:new{
+            text = _("No text found to preview."),
+            timeout = 3,
+        })
+        if on_ready then on_ready(false) end
+        return
+    end
+    MenuBuilder._resolveElevenLabsVoiceId(plugin, voice, key, function(id, name_or_err)
+        if sess.preview_gen ~= my_gen then
+            if on_ready then on_ready(false) end
+            return
+        end
+        if not id then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Could not add this library voice: %1"), tostring(name_or_err or "error")),
+                timeout = 6,
+            })
+            if on_ready then on_ready(false) end
+            return
+        end
+        local engine = plugin.tts_engine
+        if not engine then
+            if on_ready then on_ready(false) end
+            return
+        end
+        local sc = plugin.sync_controller
+        if sc and sc.isPlaying and sc:isPlaying() then
+            plugin._el_preview_used = true
+            pcall(function() sc:pause() end)
+        elseif sc and sc.isPaused and sc:isPaused() then
+            plugin._el_preview_used = true
+        end
+        if engine.beginVoicePreview then
+            engine:beginVoicePreview()
+        end
+        sess.last_tested = {
+            id = id,
+            name = name_or_err or voice.name or id,
+            orig_id = voice.id,
+        }
+
+        local wait = InfoMessage:new{
+            text = T(_("Previewing %1…"), sess.last_tested.name),
+            timeout = 0,
+        }
+        UIManager:show(wait)
+
+        local dest = _elPreviewPath(plugin)
+        pcall(os.remove, dest)
+        local model = plugin:getSetting("elevenlabs_model", "")
+        if model == "" then model = ElevenLabs.DEFAULT_MODEL end
+        local lang = ElevenLabs.isoLang(_elevenLabsLangPrefix(plugin))
+        local url, body = ElevenLabs.buildPost(sample, {
+            voice_id = id,
+            model = model,
+            language_code = lang,
+        })
+        local atts = engine._android_tts or (engine._ensureAndroidTts and engine:_ensureAndroidTts())
+        local function playReady()
+            if not sess or sess.preview_gen ~= my_gen then
+                UIManager:close(wait)
+                return
+            end
+            ElevenLabs.ensureWav(dest)
+            UIManager:close(wait)
+            if engine.playClipFile then
+                engine:playClipFile(dest)
+            elseif atts and atts.playMediaFile then
+                atts:playMediaFile(dest)
+            elseif atts and atts.playFile then
+                atts:playFile(dest)
+            end
+            if on_ready then on_ready(true) end
+        end
+        if atts and atts.httpPostToFile then
+            local job = atts:httpPostToFile(url, key, body, dest)
+            if not job or job < 1 then
+                UIManager:close(wait)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Could not preview this voice: %1"), "http"),
+                    timeout = 4,
+                })
+                if on_ready then on_ready(false) end
+                return
+            end
+            local polls = 0
+            local function pollJob()
+                if not sess or sess.preview_gen ~= my_gen then
+                    UIManager:close(wait)
+                    return
+                end
+                local st = atts.getHttpJobStatus and atts:getHttpJobStatus(job) or -1
+                if st == 1 then
+                    playReady()
+                    return
+                elseif st == 2 then
+                    UIManager:close(wait)
+                    local err = atts.getHttpLastError and atts:getHttpLastError() or "error"
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Could not preview this voice: %1"), tostring(err)),
+                        timeout = 5,
+                    })
+                    if on_ready then on_ready(false) end
+                    return
+                end
+                polls = polls + 1
+                if polls > 200 then
+                    UIManager:close(wait)
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Could not preview this voice: %1"), "timeout"),
+                        timeout = 4,
+                    })
+                    if on_ready then on_ready(false) end
+                    return
+                end
+                UIManager:scheduleIn(0.15, pollJob)
+            end
+            UIManager:scheduleIn(0.15, pollJob)
+            return
+        end
+        local path, err = ElevenLabs.synthesize(key, dest, sample, {
+            voice_id = id,
+            model = model,
+            language_code = lang,
+        })
+        if not path then
+            UIManager:close(wait)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Could not preview this voice: %1"), tostring(err or "error")),
+                timeout = 5,
+            })
+            if on_ready then on_ready(false) end
+            return
+        end
+        playReady()
+    end)
+end
+
+function MenuBuilder._runElevenLabsVoiceDialog(plugin, opts)
+    local items = opts.items or {}
+    local key = opts.key
+    local current = tonumber(opts.current) or 1
+    local ok_bd, ButtonDialog = pcall(require, "ui/widget/buttondialog")
+    if not ok_bd or not ButtonDialog then
+        UIManager:show(InfoMessage:new{
+            text = _("Could not open voice list."),
+            timeout = 4,
+        })
+        return
+    end
+
+    plugin._el_voice_sess = plugin._el_voice_sess or {}
+    local sess = plugin._el_voice_sess
+    sess.mode = sess.mode or "select"
+    sess.preview_gen = sess.preview_gen or 0
+    if not opts.keep_restore then
+        sess.last_tested = nil
+        sess.mode = "select"
+    end
+
+    local PAGE_SIZE = 7
+    local page = math.floor((math.max(1, current) - 1) / PAGE_SIZE) + 1
+    local dialog
+    local dismissing = true
+
+    local function close_dialog()
+        if dialog then
+            pcall(function() UIManager:close(dialog) end)
+        end
+        dialog = nil
+    end
+
+    local function finish(restore)
+        MenuBuilder._stopElevenLabsPreview(plugin)
+        close_dialog()
+        if restore then
+            MenuBuilder._restoreTtsAfterVoiceUi(plugin)
+        else
+            plugin._el_preview_used = nil
+        end
+    end
+
+    local function show_page()
+        local total_pages = math.max(1, math.ceil(#items / PAGE_SIZE))
+        if page < 1 then page = 1 end
+        if page > total_pages then page = total_pages end
+        local first = (page - 1) * PAGE_SIZE + 1
+        local last = math.min(#items, page * PAGE_SIZE)
+        local current_id = plugin:getSetting("elevenlabs_voice_id", "")
+
+        local buttons = {}
+        for i = first, last do
+            local item = items[i]
+            if item then
+                local label = tostring(item.text or (_("Item") .. " " .. i))
+                if #label > 72 then
+                    label = label:sub(1, 69) .. "..."
+                end
+                if item.voice and item.voice.id == current_id then
+                    label = "> " .. label
+                elseif item.voice and sess.last_tested
+                    and (item.voice.id == sess.last_tested.id
+                        or item.voice.id == sess.last_tested.orig_id) then
+                    label = "~ " .. label
+                end
+                local enabled = item.enabled
+                if enabled == nil then enabled = true end
+                local voice = item.voice
+                local cb = item.callback
+                table.insert(buttons, {{
+                    text = label,
+                    enabled = enabled and (cb ~= nil or voice ~= nil),
+                    callback = function()
+                        if cb then
+                            dismissing = false
+                            MenuBuilder._stopElevenLabsPreview(plugin)
+                            close_dialog()
+                            UIManager:scheduleIn(0.1, function()
+                                pcall(cb)
+                            end)
+                            return
+                        end
+                        if not voice then return end
+                        if sess.mode == "test" then
+                            MenuBuilder._previewElevenLabsVoice(plugin, voice, key, function()
+                                close_dialog()
+                                UIManager:scheduleIn(0.05, show_page)
+                            end)
+                            return
+                        end
+                        dismissing = false
+                        MenuBuilder._stopElevenLabsPreview(plugin)
+                        close_dialog()
+                        MenuBuilder._resolveElevenLabsVoiceId(plugin, voice, key, function(id, name_or_err)
+                            if not id then
+                                UIManager:show(InfoMessage:new{
+                                    text = T(_("Could not add this library voice: %1"),
+                                        tostring(name_or_err or "error")),
+                                    timeout = 6,
+                                })
+                                MenuBuilder._restoreTtsAfterVoiceUi(plugin)
+                                return
+                            end
+                            MenuBuilder._commitElevenLabsVoice(plugin, id, name_or_err)
+                            if plugin._el_preview_used then
+                                MenuBuilder._restoreTtsAfterVoiceUi(plugin)
+                            end
+                        end)
+                    end,
+                }})
+            end
+        end
+
+        local test_label = _("Test voice")
+        local select_label = _("Select this voice")
+        if sess.mode == "test" then
+            test_label = "● " .. test_label
+        else
+            select_label = "● " .. select_label
+        end
+        table.insert(buttons, {
+            {
+                text = test_label,
+                callback = function()
+                    sess.mode = "test"
+                    close_dialog()
+                    UIManager:scheduleIn(0.05, show_page)
+                    UIManager:show(InfoMessage:new{
+                        text = _("Tap a voice to hear the start of this chapter."),
+                        timeout = 2,
+                    })
+                end,
+            },
+            {
+                text = select_label,
+                callback = function()
+                    if sess.mode == "test" and sess.last_tested then
+                        dismissing = false
+                        local picked = sess.last_tested
+                        MenuBuilder._stopElevenLabsPreview(plugin)
+                        close_dialog()
+                        MenuBuilder._commitElevenLabsVoice(plugin, picked.id, picked.name)
+                        if plugin._el_preview_used then
+                            MenuBuilder._restoreTtsAfterVoiceUi(plugin)
+                        end
+                        return
+                    end
+                    sess.mode = "select"
+                    close_dialog()
+                    UIManager:scheduleIn(0.05, show_page)
+                end,
+            },
+        })
+        table.insert(buttons, {
+            {
+                text = _("Prev"),
+                enabled = page > 1,
+                callback = function()
+                    page = page - 1
+                    close_dialog()
+                    UIManager:scheduleIn(0.05, show_page)
+                end,
+            },
+            {
+                text = _("Close"),
+                callback = function()
+                    finish(true)
+                end,
+            },
+            {
+                text = _("Next"),
+                enabled = page < total_pages,
+                callback = function()
+                    page = page + 1
+                    close_dialog()
+                    UIManager:scheduleIn(0.05, show_page)
+                end,
+            },
+        })
+
+        local lang_label = opts.lang_label or ""
+        local title
+        if sess.mode == "test" then
+            title = T(_("Test ElevenLabs voice (%1)"), lang_label)
+        else
+            title = T(_("Select ElevenLabs voice (%1)"), lang_label)
+        end
+        title = string.format("%s (%d/%d)", title, page, total_pages)
+        local ok, err = pcall(function()
+            dialog = ButtonDialog:new{
+                title = title,
+                buttons = buttons,
+            }
+            UIManager:show(dialog)
+        end)
+        if not ok then
+            logger.err("MenuBuilder: ElevenLabs voice dialog failed:", err)
+            UIManager:show(InfoMessage:new{
+                text = _("Could not open voice list.") .. "\n" .. tostring(err),
+                timeout = 6,
+            })
+        end
+    end
+
+    UIManager:scheduleIn(0.15, show_page)
+end
+
+function MenuBuilder._showElevenLabsVoicePicker(plugin, picker_opts)
+    picker_opts = picker_opts or {}
+    local key = plugin:getSetting("elevenlabs_api_key", "")
+    if key == "" then
+        MenuBuilder._showElevenLabsKeyDialog(plugin)
+        return
+    end
+    if not picker_opts.keep_restore then
+        plugin._el_preview_used = nil
+        if plugin._el_voice_sess then
+            plugin._el_voice_sess.last_tested = nil
+            plugin._el_voice_sess.mode = "select"
+        end
+    end
+    local lang = _elevenLabsLangPrefix(plugin)
+    local lang_label = _elevenLabsLangLabel(lang)
+    local info = InfoMessage:new{
+        text = _("Loading ElevenLabs voices…"),
+        timeout = 0,
+    }
+    UIManager:show(info)
+    UIManager:scheduleIn(0.05, function()
+        local account, err = ElevenLabs.listVoices(key)
+        local library, lib_err = ElevenLabs.listSharedVoices(key, lang)
+        UIManager:close(info)
+        if not account then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Could not list ElevenLabs voices: %1"), tostring(err or "empty")),
+                timeout = 5,
+            })
+            return
+        end
+        if type(library) ~= "table" then
+            logger.warn("ElevenLabs: shared voice list failed:", tostring(lib_err))
+            library = {}
+        end
+
+        local current_id = plugin:getSetting("elevenlabs_voice_id", "")
+        local items, current = {}, 1
+
+        local function addVoice(v)
+            table.insert(items, {
+                text = ElevenLabs.displayName(v),
+                voice = v,
+            })
+            if v.id == current_id then current = #items end
+        end
+
+        table.insert(items, {
+            text = MenuBuilder.elevenLabsRequestLanguageText(plugin),
+            callback = function()
+                MenuBuilder._showElevenLabsLangPicker(plugin, { after = "voice_picker" })
+            end,
+        })
+
+        local lib_matched = {}
+        for _, v in ipairs(library) do
+            lib_matched[#lib_matched + 1] = v
+        end
+        if #lib_matched > 0 then
+            table.insert(items, {
+                text = "— " .. T(_("Library (%1)"), lang_label) .. " —",
+                enabled = false,
+            })
+            for _, v in ipairs(lib_matched) do addVoice(v) end
+        elseif lang ~= "en" then
+            table.insert(items, {
+                text = "— " .. T(_("No library voices for %1"), lang_label) .. " —",
+                enabled = false,
+            })
+        end
+
+        table.sort(account, function(a, b)
+            local ma, mb = ElevenLabs.matchesLang(a, lang), ElevenLabs.matchesLang(b, lang)
+            if ma ~= mb then return ma end
+            return (a.name or "") < (b.name or "")
+        end)
+        table.insert(items, {
+            text = "— " .. _("Your voices (multilingual)") .. " —",
+            enabled = false,
+        })
+        for _, v in ipairs(account) do addVoice(v) end
+
+        MenuBuilder._runElevenLabsVoiceDialog(plugin, {
+            items = items,
+            current = current,
+            key = key,
+            lang_label = lang_label,
+            keep_restore = picker_opts.keep_restore,
+        })
+    end)
+end
+
+function MenuBuilder._showElevenLabsLangPicker(plugin, opts)
+    opts = opts or {}
+    local after = opts.after or "voice_picker"
+    local current_lang = _elevenLabsLangStored(plugin)
+    local items, current = {}, 1
+    local function addLang(id, label)
+        table.insert(items, {
+            text = label,
+            callback = function()
+                plugin:setSetting("elevenlabs_language", id)
+                if plugin.tts_engine and plugin.tts_engine.invalidateQueuedAudio then
+                    pcall(function() plugin.tts_engine:invalidateQueuedAudio() end)
+                end
+                if after == "voice_picker" then
+                    MenuBuilder._showElevenLabsVoicePicker(plugin, { keep_restore = true })
+                elseif after == "tts_settings" then
+                    MenuBuilder.showTtsSettingsPicker(plugin)
+                end
+            end,
+        })
+        if id == current_lang then current = #items end
+    end
+    addLang("auto", _("Auto (book language, then device)"))
+    -- Prefer the languages the user actually reads.
+    local first = { "fr", "en", "es", "de", "it", "pt" }
+    local seen = { auto = true }
+    for _, prefix in ipairs(first) do
+        addLang(prefix, _elevenLabsLangLabel(prefix))
+        seen[prefix] = true
+    end
+    for _, choice in ipairs(MenuBuilder.huggingfaceLanguageChoices()) do
+        local prefix = _localePrefix(choice.id)
+        if prefix ~= "" and not seen[prefix] then
+            addLang(prefix, choice.label)
+            seen[prefix] = true
+        end
+    end
+    MenuBuilder.showPagedPicker({
+        title = _("ElevenLabs language"),
+        items = items,
+        current = current,
+    })
+end
+
 --[[--
-Show a voice picker for the active TTS backend.  Safe to call from the
-playback overlay or from Voice settings.
+Show a voice picker for the given engine (`opts.engine`) or the active TTS
+backend.  Safe to call from the playback overlay or from TTS settings.
 --]]
-function MenuBuilder.showVoicePicker(plugin)
+function MenuBuilder.showVoicePicker(plugin, opts)
+    opts = opts or {}
     if not plugin or not plugin.tts_engine then
         UIManager:show(InfoMessage:new{
             text = _("TTS engine is not available."),
@@ -1900,7 +2849,13 @@ function MenuBuilder.showVoicePicker(plugin)
         return
     end
     local backend = plugin.tts_engine.backend
-    if backend == plugin.tts_engine.BACKENDS.ANDROID then
+    local force = opts.engine
+    if force == "elevenlabs"
+        or (not force and backend == plugin.tts_engine.BACKENDS.ELEVENLABS) then
+        MenuBuilder._showElevenLabsVoicePicker(plugin)
+        return
+    end
+    if force == "android" or backend == plugin.tts_engine.BACKENDS.ANDROID then
         local info = InfoMessage:new{
             text = _("Loading voices…"),
             timeout = 0,
@@ -1947,9 +2902,47 @@ local function _valuePicker(title, values, current, format_fn, apply_fn)
     })
 end
 
+function MenuBuilder._showTtsEnginePicker(plugin)
+    local engine = plugin.tts_engine
+    if not engine then return end
+    local items, current = {}, 1
+    local function add(id, label)
+        table.insert(items, {
+            text = label,
+            callback = function()
+                engine:setBackend(id)
+                plugin:setSetting("tts_backend", id)
+                plugin:setSetting("espeak_only_mode", false)
+                if engine.invalidateQueuedAudio then
+                    pcall(function() engine:invalidateQueuedAudio() end)
+                end
+                MenuBuilder.showTtsSettingsPicker(plugin)
+            end,
+        })
+        if engine.backend == id then current = #items end
+    end
+    if engine._android_tts
+        or engine._android_tts_deferred
+        or engine.backend == engine.BACKENDS.ANDROID then
+        add(engine.BACKENDS.ANDROID, MenuBuilder.systemTtsAndroidChoiceLabel(plugin))
+    end
+    add(engine.BACKENDS.ELEVENLABS, _("ElevenLabs (cloud, high quality)"))
+    if engine.espeak_lib_path or Utils.commandExists("espeak-ng") or Utils.commandExists("espeak") then
+        add(engine.BACKENDS.ESPEAK, _("espeak-ng (formant, fast, robotic)"))
+    end
+    if engine.piper_cmd or Utils.commandExists("piper") then
+        add(engine.BACKENDS.PIPER, _("Piper (neural, natural-sounding)"))
+    end
+    MenuBuilder.showPagedPicker({
+        title = _("TTS engine"),
+        items = items,
+        current = current,
+    })
+end
+
 --[[--
-Readest-style TTS settings from the playback overlay: voice, speed,
-sentence/paragraph pauses, volume.
+Show TTS settings from the playback overlay: engine, then only the
+active engine's settings, then speech rate, pauses, and volume.
 --]]
 function MenuBuilder.showTtsSettingsPicker(plugin)
     if not plugin or not plugin.tts_engine then
@@ -1961,14 +2954,97 @@ function MenuBuilder.showTtsSettingsPicker(plugin)
     end
     local backend = plugin.tts_engine.backend
     local items = {}
+
+    local engine_labels = {
+        espeak = _("espeak-ng"),
+        piper = _("Piper (neural)"),
+        pico = _("Pico TTS"),
+        flite = _("Flite"),
+        festival = _("Festival"),
+        android = MenuBuilder.systemTtsMenuLabel(plugin),
+        elevenlabs = _("ElevenLabs"),
+        ["platform-native"] = _("Platform-native helper"),
+    }
     table.insert(items, {
-        text = T(_("Voice: %1"), plugin:getSetting("android_tts_voice_label", "") ~= ""
-            and plugin:getSetting("android_tts_voice_label")
-            or plugin:getSetting("tts_voice_label", _("Auto-detect"))),
+        text = T(_("TTS engine: %1"), engine_labels[backend] or backend),
         callback = function()
-            MenuBuilder.showVoicePicker(plugin)
+            MenuBuilder._showTtsEnginePicker(plugin)
         end,
     })
+
+    local B = plugin.tts_engine.BACKENDS
+    if backend == B.ELEVENLABS then
+        local key = plugin:getSetting("elevenlabs_api_key", "")
+        if key == "" then
+            table.insert(items, {
+                text = _("ElevenLabs API key (not set)"),
+                callback = function()
+                    MenuBuilder._showElevenLabsKeyDialog(plugin)
+                end,
+            })
+        else
+            table.insert(items, {
+                text = T(_("ElevenLabs API key: %1"), ElevenLabs.maskKey(key)),
+                callback = function()
+                    MenuBuilder._showElevenLabsKeyDialog(plugin)
+                end,
+            })
+        end
+        local el_voice = plugin:getSetting("elevenlabs_voice_label", "")
+        if el_voice == "" then
+            el_voice = plugin:getSetting("elevenlabs_voice_id", "")
+        end
+        local el_voice_text
+        if el_voice == "" then
+            el_voice_text = _("Voice: default")
+        else
+            el_voice_text = T(_("Voice: %1"), el_voice)
+        end
+        table.insert(items, {
+            text = el_voice_text,
+            callback = function()
+                MenuBuilder.showVoicePicker(plugin, { engine = "elevenlabs" })
+            end,
+        })
+        table.insert(items, {
+            text = MenuBuilder.elevenLabsRequestLanguageText(plugin),
+            callback = function()
+                MenuBuilder._showElevenLabsLangPicker(plugin, { after = "tts_settings" })
+            end,
+        })
+        local m = plugin:getSetting("elevenlabs_model", "eleven_multilingual_v2")
+        local model_text = (m == "eleven_flash_v2_5")
+            and _("Model: Flash v2.5 (faster)")
+            or _("Model: Multilingual v2 (quality)")
+        table.insert(items, {
+            text = model_text,
+            callback = function()
+                if m == "eleven_flash_v2_5" then
+                    plugin:setSetting("elevenlabs_model", "eleven_multilingual_v2")
+                else
+                    plugin:setSetting("elevenlabs_model", "eleven_flash_v2_5")
+                end
+                MenuBuilder.showTtsSettingsPicker(plugin)
+            end,
+        })
+    elseif backend == B.ANDROID then
+        local sys_voice = plugin:getSetting("android_tts_voice_label", "")
+        if sys_voice == "" then
+            local lang = plugin:getSetting("android_tts_language", "auto")
+            if lang == "auto" then
+                sys_voice = _("Auto-detect")
+            else
+                sys_voice = lang
+            end
+        end
+        table.insert(items, {
+            text = T(_("Voice: %1"), sys_voice),
+            callback = function()
+                MenuBuilder.showVoicePicker(plugin, { engine = "android" })
+            end,
+        })
+    end
+
     table.insert(items, {
         text = T(_("Speech rate: %1x"), plugin:getSetting("speech_rate", 1.0)),
         callback = function()

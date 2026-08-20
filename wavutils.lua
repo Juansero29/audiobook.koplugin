@@ -429,9 +429,47 @@ function WavUtils.mergeFiles(main_file, concat_files)
 end
 
 --[[--
-Generate a WAV file containing silence of the given duration.
-Format: mono, 16-bit PCM.
+Write 16-bit PCM samples as a canonical RIFF WAV file.
+@param path string  Output file path
+@param pcm string  Interleaved little-endian PCM bytes
+@param sample_rate number
+@param channels number|nil  1 or 2 (default 1)
+@param bits number|nil  16 (default)
+@return boolean
+--]]
+function WavUtils.writePcmWav(path, pcm, sample_rate, channels, bits)
+    if not path or type(pcm) ~= "string" or #pcm == 0 then return false end
+    local sr = tonumber(sample_rate) or WavUtils.DEFAULT_SAMPLE_RATE
+    local ch = tonumber(channels) or WavUtils.DEFAULT_CHANNELS
+    local bps = tonumber(bits) or WavUtils.DEFAULT_BITS_PER_SAMPLE
+    if sr < 8000 or (ch ~= 1 and ch ~= 2) or bps ~= 16 then return false end
+    local data_size = #pcm
+    if data_size % 2 == 1 then
+        pcm = pcm .. "\0"
+        data_size = data_size + 1
+    end
+    local file_size = 36 + data_size
+    local byte_rate = sr * ch * (bps / 8)
+    local block_align = ch * (bps / 8)
+    local header = "RIFF" .. WavUtils.le32(file_size) .. "WAVE"
+                 .. "fmt " .. WavUtils.le32(16)
+                 .. WavUtils.le16(1)
+                 .. WavUtils.le16(ch)
+                 .. WavUtils.le32(sr)
+                 .. WavUtils.le32(byte_rate)
+                 .. WavUtils.le16(block_align)
+                 .. WavUtils.le16(bps)
+                 .. "data" .. WavUtils.le32(data_size)
+    local f = io.open(path, "wb")
+    if not f then return false end
+    f:write(header)
+    f:write(pcm)
+    f:close()
+    return true
+end
 
+--[[--
+Generate a silent WAV file.
 @param path string  Output file path
 @param duration_ms number  Duration in milliseconds
 @param sample_rate number  Sample rate (default 22050)

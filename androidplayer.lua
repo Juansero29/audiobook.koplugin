@@ -181,6 +181,41 @@ function AndroidPlayer:init()
             checkException(env)
         end
 
+        -- AudioManager: Android 15 / Boox mutes MediaPlayer with no focus.
+        -- Overlay gets focus via MediaSession; ElevenLabs must take it here
+        -- after TextToSpeech.speak() has stolen and abandoned it.
+        local ctx = android.app.activity.clazz
+        local ctx_class = env[0].GetObjectClass(env, ctx)
+        if ctx_class and not checkException(env) then
+            local get_svc = getMethod(env, ctx_class, "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;")
+            if get_svc then
+                local j_audio = env[0].NewStringUTF(env, "audio")
+                local am = env[0].CallObjectMethod(env, ctx, get_svc, j_audio)
+                env[0].DeleteLocalRef(env, j_audio)
+                if am and not checkException(env) then
+                    local am_class = env[0].GetObjectClass(env, am)
+                    self._method.requestFocusReq = getMethod(env, am_class,
+                        "requestAudioFocus",
+                        "(Landroid/media/AudioFocusRequest;)I")
+                    self._method.abandonFocusReq = getMethod(env, am_class,
+                        "abandonAudioFocusRequest",
+                        "(Landroid/media/AudioFocusRequest;)I")
+                    self._method.requestFocusLegacy = getMethod(env, am_class,
+                        "requestAudioFocus",
+                        "(Landroid/media/AudioManager$OnAudioFocusChangeListener;II)I")
+                    self._am_ref = env[0].NewGlobalRef(env, am)
+                    env[0].DeleteLocalRef(env, am_class)
+                    env[0].DeleteLocalRef(env, am)
+                else
+                    checkException(env)
+                end
+            end
+            env[0].DeleteLocalRef(env, ctx_class)
+        else
+            checkException(env)
+        end
+
         self._mp_class = env[0].NewGlobalRef(env, mp_class)
         env[0].DeleteLocalRef(env, mp_class)
         load_ok = true
@@ -188,8 +223,107 @@ function AndroidPlayer:init()
 
     if not load_ok then return false end
     self._initialized = true
+    self._has_focus = false
     logger.warn("AndroidPlayer: ready (direct MediaPlayer, no dex)")
     return true
+end
+
+--- AUDIOFOCUS_GAIN so MediaPlayer is not muted after TTS speak() on Android 15.
+function AndroidPlayer:_takeAudioFocus(env)
+    if not self._am_ref then
+        self._has_focus = false
+        return false
+    end
+    local granted = false
+    local args = ffi.new("jvalue[3]")
+
+    if self._method.requestFocusReq then
+        local bclass = env[0].FindClass(env, "android/media/AudioFocusRequest$Builder")
+        if bclass and not checkException(env) then
+            local b_init = getMethod(env, bclass, "<init>", "(I)V")
+            local set_aa = getMethod(env, bclass, "setAudioAttributes",
+                "(Landroid/media/AudioAttributes;)Landroid/media/AudioFocusRequest$Builder;")
+            local build = getMethod(env, bclass, "build",
+                "()Landroid/media/AudioFocusRequest;")
+            if b_init and build then
+                args[0].i = 1 -- AUDIOFOCUS_GAIN
+                local builder = env[0].NewObjectA(env, bclass, b_init, args)
+                if builder and not checkException(env) then
+                    if set_aa and self._attrs_ref then
+                        args[0].l = self._attrs_ref
+                        local updated = env[0].CallObjectMethodA(env, builder, set_aa, args)
+                        checkException(env)
+                        if updated and updated ~= builder then
+                            env[0].DeleteLocalRef(env, builder)
+                            builder = updated
+                        end
+                    end
+                    local req = env[0].CallObjectMethod(env, builder, build)
+                    env[0].DeleteLocalRef(env, builder)
+                    if req and not checkException(env) then
+                        args[0].l = req
+                        local result = env[0].CallIntMethodA(env,
+                            self._am_ref, self._method.requestFocusReq, args)
+                        if not checkException(env) and tonumber(result) == 1 then
+                            granted = true
+                            if self._focus_req_ref then
+                                env[0].DeleteGlobalRef(env, self._focus_req_ref)
+                            end
+                            self._focus_req_ref = env[0].NewGlobalRef(env, req)
+                        end
+                        env[0].DeleteLocalRef(env, req)
+                    else
+                        checkException(env)
+                    end
+                else
+                    checkException(env)
+                end
+            end
+            env[0].DeleteLocalRef(env, bclass)
+        else
+            checkException(env)
+        end
+    end
+
+    if not granted and self._method.requestFocusLegacy then
+        args[0].l = nil
+        args[1].i = 3 -- STREAM_MUSIC
+        args[2].i = 1 -- AUDIOFOCUS_GAIN
+        local result = env[0].CallIntMethodA(env,
+            self._am_ref, self._method.requestFocusLegacy, args)
+        if not checkException(env) and tonumber(result) == 1 then
+            granted = true
+        end
+    end
+
+    self._has_focus = granted
+    logger.warn("AndroidPlayer: audio focus granted=", granted and 1 or 0)
+    return granted
+end
+
+function AndroidPlayer:_dropAudioFocus()
+    if not self._am_ref or not self._has_focus then
+        self._has_focus = false
+        return
+    end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        pcall(function()
+            if self._method.abandonFocusReq and self._focus_req_ref then
+                local args = ffi.new("jvalue[1]")
+                args[0].l = self._focus_req_ref
+                env[0].CallIntMethodA(env, self._am_ref,
+                    self._method.abandonFocusReq, args)
+                checkException(env)
+            end
+        end)
+        if self._focus_req_ref then
+            env[0].DeleteGlobalRef(env, self._focus_req_ref)
+            self._focus_req_ref = nil
+        end
+    end)
+    self._has_focus = false
 end
 
 function AndroidPlayer:_releasePlayer()
@@ -279,6 +413,8 @@ function AndroidPlayer:play(path, seek_ms)
             checkException(env)
         end
 
+        pcall(function() self:_takeAudioFocus(env) end)
+
         env[0].CallVoidMethod(env, mp, self._method.start)
         if checkException(env) then
             logger.err("AndroidPlayer: start failed")
@@ -313,7 +449,8 @@ function AndroidPlayer:play(path, seek_ms)
         self:setVolume(self._volume or 1.0)
         logger.warn("AndroidPlayer: playing", path,
             "seek_ms=", seek_ms, "duration_ms=", self._duration_ms,
-            "volume=", self._volume, "speed=", self._speed)
+            "volume=", self._volume, "speed=", self._speed,
+            "focus=", self._has_focus and 1 or 0)
     end
     return ok
 end
@@ -564,6 +701,7 @@ end
 
 function AndroidPlayer:stop()
     self:_releasePlayer()
+    self:_dropAudioFocus()
     self._wall_start = nil
     self._ever_confirmed_playing = false
     self._audio_started = false

@@ -286,6 +286,23 @@ function AndroidTts:init()
             "playMediaFile", "(Ljava/lang/String;)I")
         self._method.setPcmMode = getMethod(env, helper_class,
             "setPcmMode", "(Z)V")
+        self._method.httpPostToFile = getMethod(env, helper_class,
+            "httpPostToFile",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I")
+        self._method.getHttpJobStatus = getMethod(env, helper_class,
+            "getHttpJobStatus", "(I)I")
+        self._method.getHttpLastError = getMethod(env, helper_class,
+            "getHttpLastError", "()Ljava/lang/String;")
+        self._method.setPlaybackSpeed = getMethod(env, helper_class,
+            "setPlaybackSpeed", "(F)V")
+        self._method.cancelSynth = getMethod(env, helper_class,
+            "cancelSynth", "()V")
+        self._method.speakText = getMethod(env, helper_class,
+            "speakText", "(Ljava/lang/String;)I")
+        self._method.getSpeakStatus = getMethod(env, helper_class,
+            "getSpeakStatus", "()I")
+        self._method.stopSpeak = getMethod(env, helper_class,
+            "stopSpeak", "()V")
 
         if not self._method.getInitStatus
             or not self._method.playFile
@@ -421,6 +438,74 @@ function AndroidTts:synthesizeToFile(text, output_path)
 end
 
 --[[--
+Invalidate the in-flight synthesizeToFile so a cancelled lookahead
+cannot complete or fail the next sentence. Optional on older dex files.
+--]]
+function AndroidTts:cancelSynth()
+    if not self._initialized or not self._helper_ref then return end
+    if not self._method.cancelSynth then return end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        jni.env[0].CallVoidMethod(jni.env,
+            self._helper_ref, self._method.cancelSynth)
+        checkException(jni.env)
+    end)
+end
+
+--[[--
+Speak text with the system engine (Readest-style). Optional on older dex.
+@return number  0 dispatched, -1 not ready / missing method
+--]]
+function AndroidTts:hasLiveSpeak()
+    return self._initialized and self._method and self._method.speakText ~= nil
+end
+
+function AndroidTts:speakText(text)
+    if not self._initialized or not self._helper_ref then return -1 end
+    if not self._method.speakText then return -1 end
+    if type(text) ~= "string" or text == "" then return -1 end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local j_text = env[0].NewStringUTF(env, text)
+        local result = env[0].CallIntMethod(env,
+            self._helper_ref, self._method.speakText, j_text)
+        env[0].DeleteLocalRef(env, j_text)
+        if checkException(env) then
+            logger.err("AndroidTts: speakText threw exception")
+            return -1
+        end
+        return result
+    end)
+end
+
+--- -1 idle, 0 speaking, 1 done, 2 error. -1 if method missing.
+function AndroidTts:getSpeakStatus()
+    if not self._initialized or not self._helper_ref then return -1 end
+    if not self._method.getSpeakStatus then return -1 end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local result = jni.env[0].CallIntMethod(jni.env,
+            self._helper_ref, self._method.getSpeakStatus)
+        if checkException(jni.env) then
+            return 2
+        end
+        return result
+    end)
+end
+
+function AndroidTts:stopSpeak()
+    if not self._initialized or not self._helper_ref then return end
+    if not self._method.stopSpeak then return end
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        jni.env[0].CallVoidMethod(jni.env,
+            self._helper_ref, self._method.stopSpeak)
+        checkException(jni.env)
+    end)
+end
+
+--[[--
 Poll the synthesis completion status.
 @return number  -1 idle, 0 in-progress, 1 done, 2 error
 --]]
@@ -451,6 +536,25 @@ function AndroidTts:setRate(rate)
         args[0].f = rate
         env[0].CallVoidMethodA(env,
             self._helper_ref, self._method.setRate, args)
+    end)
+end
+
+--[[--
+Local MediaPlayer playback rate for WAV clips (cloud TTS).  Optional on
+older dex files.  1.0 = file speed; pitch stays 1.0 (time-stretch).
+@param speed number  0.5 .. 3.0
+--]]
+function AndroidTts:setPlaybackSpeed(speed)
+    if not self._initialized or not self._helper_ref then return end
+    if not self._method.setPlaybackSpeed then return end
+    speed = tonumber(speed) or 1.0
+    local android = self._android
+    android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local args = ffi.new("jvalue[1]")
+        args[0].f = speed
+        env[0].CallVoidMethodA(env,
+            self._helper_ref, self._method.setPlaybackSpeed, args)
     end)
 end
 
@@ -689,6 +793,7 @@ function AndroidTts:stopPipeline()
     android.jni:context(android.app.activity.vm, function(jni)
         jni.env[0].CallVoidMethod(jni.env,
             self._helper_ref, self._method.stopPipeline)
+        checkException(jni.env)
     end)
 end
 
@@ -794,6 +899,73 @@ function AndroidTts:setPcmMode(enabled)
         args[0].z = enabled and 1 or 0
         env[0].CallVoidMethodA(env,
             self._helper_ref, self._method.setPcmMode, args)
+    end)
+end
+
+--[[--
+Background HTTPS POST (ElevenLabs). Returns a job id (>=1) or -1.
+The API key and JSON body are not logged.
+--]]
+function AndroidTts:httpPostToFile(url, api_key, body, dest_path)
+    if not self._initialized or not self._helper_ref then return -1 end
+    if not self._method.httpPostToFile then return -1 end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local j_url = env[0].NewStringUTF(env, url or "")
+        local j_key = env[0].NewStringUTF(env, api_key or "")
+        local j_body = env[0].NewStringUTF(env, body or "")
+        local j_path = env[0].NewStringUTF(env, dest_path or "")
+        local args = ffi.new("jvalue[4]")
+        args[0].l = j_url
+        args[1].l = j_key
+        args[2].l = j_body
+        args[3].l = j_path
+        local result = env[0].CallIntMethodA(env,
+            self._helper_ref, self._method.httpPostToFile, args)
+        env[0].DeleteLocalRef(env, j_url)
+        env[0].DeleteLocalRef(env, j_key)
+        env[0].DeleteLocalRef(env, j_body)
+        env[0].DeleteLocalRef(env, j_path)
+        if checkException(env) then
+            logger.err("AndroidTts: httpPostToFile threw exception")
+            return -1
+        end
+        return result
+    end)
+end
+
+function AndroidTts:getHttpJobStatus(job_id)
+    if not self._initialized or not self._helper_ref then return -1 end
+    if not self._method.getHttpJobStatus then return -1 end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local args = ffi.new("jvalue[1]")
+        args[0].i = tonumber(job_id) or -1
+        local result = env[0].CallIntMethodA(env,
+            self._helper_ref, self._method.getHttpJobStatus, args)
+        if checkException(env) then
+            logger.err("AndroidTts: getHttpJobStatus threw exception")
+            return 2
+        end
+        return result
+    end)
+end
+
+function AndroidTts:getHttpLastError()
+    if not self._initialized or not self._helper_ref then return "" end
+    if not self._method.getHttpLastError then return "" end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local j_str = jni.env[0].CallObjectMethod(jni.env,
+            self._helper_ref, self._method.getHttpLastError)
+        if checkException(jni.env) or j_str == nil then
+            return ""
+        end
+        local result = jni:to_string(j_str)
+        jni.env[0].DeleteLocalRef(jni.env, j_str)
+        return result or ""
     end)
 end
 

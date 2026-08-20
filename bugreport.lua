@@ -281,6 +281,10 @@ local function collectPluginInfo(plugin)
     if plugin.getSetting then
         info.settings = {
             tts_backend = plugin:getSetting("tts_backend", "auto"),
+            elevenlabs_configured = plugin:getSetting("elevenlabs_api_key", "") ~= "" and "yes" or "no",
+            elevenlabs_model = plugin:getSetting("elevenlabs_model", "eleven_multilingual_v2"),
+            elevenlabs_voice = plugin:getSetting("elevenlabs_voice_label", "") ~= ""
+                and plugin:getSetting("elevenlabs_voice_label") or "default",
             speech_rate = plugin:getSetting("speech_rate", 1.0),
             speech_pitch = plugin:getSetting("speech_pitch", 50),
             speech_volume = plugin:getSetting("speech_volume", 1.0),

@@ -43,3 +43,6 @@ tools/_msgids.json
 tools/_mt_cache.json
 tools/*.pyc
 
+# Local secrets — never commit
+tools/elevenlabs_api_key.txt
+

@@ -27,11 +27,11 @@ def fix_nbsp(s: str) -> str:
 
 # Exact overrides after MT
 FR_FIX: dict[str, str] = {
-    "Read aloud from here": "Lire à voix haute à partir d’ici",
+    "Read aloud from here (TTS)": "Lire à voix haute à partir d’ici (TTS)",
     "Play aligned audiobook from here": "Lire le livre audio aligné à partir d’ici",
     "Toggle Read-Along": "Activer/désactiver la lecture synchronisée",
     "Stop Read-Along": "Arrêter la lecture synchronisée",
-    "Start Text-to-Speech from current page": "Démarrer la synthèse vocale à la page actuelle",
+    "Start Text-to-Speech from current page (TTS)": "Démarrer la synthèse vocale à la page actuelle (TTS)",
     "Play aligned/enriched audiobook": "Lire un livre audio aligné/enrichi",
     "Start music playlist": "Démarrer une liste de lecture musicale",
     "Play unaligned audiobook": "Lire un livre audio non aligné",
@@ -199,11 +199,11 @@ FR_FIX: dict[str, str] = {
 }
 
 ES_FIX: dict[str, str] = {
-    "Read aloud from here": "Leer en voz alta desde aquí",
+    "Read aloud from here (TTS)": "Leer en voz alta desde aquí (TTS)",
     "Play aligned audiobook from here": "Reproducir audiolibro alineado desde aquí",
     "Toggle Read-Along": "Activar/desactivar lectura sincronizada",
     "Stop Read-Along": "Detener lectura sincronizada",
-    "Start Text-to-Speech from current page": "Iniciar texto a voz en la página actual",
+    "Start Text-to-Speech from current page (TTS)": "Iniciar texto a voz en la página actual (TTS)",
     "Play aligned/enriched audiobook": "Reproducir audiolibro alineado/enriquecido",
     "Start music playlist": "Iniciar lista de reproducción musical",
     "Play unaligned audiobook": "Reproducir audiolibro no alineado",
