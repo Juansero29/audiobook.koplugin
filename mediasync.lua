@@ -21,11 +21,10 @@ local PLUGIN_PATH = _utils_dir
 local Utils = dofile(_utils_dir .. "utils.lua")
 
 --- Append to plugin debug.log (included in bug reports). Never throws.
---- Do not pass the module as the first argument: DebugLog.log has no `self`.
 local function dlog(...)
     local DL = package.loaded["audiobook_debuglog"]
     if DL and DL.log then
-        pcall(DL.log, ...)
+        pcall(DL.log, DL, ...)
     end
 end
 
@@ -611,6 +610,7 @@ end
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
+--- @param opts table|nil  { prepare_only = true } arms SMIL + bar without audio
 function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position, opts)
     opts = opts or {}
     if self.state == self.STATE.PLAYING or self.state == self.STATE.PAUSED then
@@ -672,14 +672,7 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     self._current_sentence_idx = 0
     self._current_word_idx = 0
     self._last_hl_idx = nil
-    self._highlighted_sentence_idx = nil
-    self._hl_retry_at = nil
-    self._hl_fail_count = 0
     self._last_page_advance_idx = nil
-    self._pf_sent_idx = nil
-    self._pf_page = nil
-    self._pf_break = nil
-    self._pf_cooldown_until = nil
     self._chain_generation = self._chain_generation + 1
     self._last_progress_pct = -1
     self._last_ui_update_time = nil
@@ -709,11 +702,10 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
         return false
     end
 
-    -- If probing failed (e.g. no ffprobe on Android), use the last SMIL
-    -- clip end of this audio part — not the first sentence's end_time.
+    -- If probing failed (e.g., no ffprobe for m4b), use the timing data
+    -- end_time which was set from the known metadata duration.
     if not self.media_engine.current_duration or self.media_engine.current_duration == 0 then
-        local last = timing_data[#timing_data]
-        local known_dur = last and (tonumber(last.end_time) or tonumber(last.start_time))
+        local known_dur = timing_data[1] and timing_data[1].end_time
         if known_dur and known_dur > 0 then
             self.media_engine.current_duration = known_dur
         end
@@ -729,19 +721,22 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
         end)
     end
 
-    -- Apply persisted volume / speed BEFORE play() so the first spawn already
-    -- carries them (setVolume/setSpeed are no-op restarts when not playing).
+    -- Apply the persisted volume BEFORE play() so the initial decode spawn
+    -- already carries the gain (setVolume is a no-op restart when not playing).
     if self.plugin and self.plugin.getSetting then
         pcall(function()
             self.media_engine:setVolume(self.plugin:getSetting("media_volume_pct", 100))
         end)
-        pcall(function()
-            self.media_engine:setSpeed(self.plugin:getSetting("media_speed", 1.0))
-        end)
     end
 
-    -- Resume from saved position before showing the bar, so the first paint
-    -- can show current/total time instead of 0:00 / 0:00.
+    -- Show playback bar in scrubber mode
+    self:showPlaybackBar()
+    -- Reflow page so book text ends above the mini player (never covered).
+    self:_reserveMiniBarSpace()
+    self:_refreshPlaybackTimeUi()
+
+    -- Resume position before the first paint, so the bar shows current/total
+    -- instead of 0:00 / 0:00, and a prepare_only Play continues from the mark.
     local resume_pos = tonumber(self._start_position) or 0
     if resume_pos > 0 then
         self.media_engine._seek_offset = resume_pos
@@ -750,12 +745,6 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
         resume_pos = self.media_engine._seek_offset or 0
         self.media_engine._paused_position = resume_pos
     end
-
-    -- Show playback bar in scrubber mode
-    self:showPlaybackBar()
-    -- Reflow page so book text ends above the mini player (never covered).
-    self:_reserveMiniBarSpace()
-    self:_refreshPlaybackTimeUi()
 
     -- Arm SMIL + highlight without starting audio (book open / pinned overlay).
     -- Play then continues from _seek_offset instead of prompting.
@@ -787,9 +776,6 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     end
 
     self.state = self.STATE.PLAYING
-    if self.playback_bar and self.playback_bar.setPlaying then
-        pcall(function() self.playback_bar:setPlaying(true) end)
-    end
     self:_startSyncLoop(gen)
     self:_startPositionPoller(gen)
 
@@ -798,27 +784,120 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     return true
 end
 
+--- @param keep_chapter_menu boolean|nil
+--- @param opts table|nil  { track_transition = true } spares A2DP keepalive and player UI
+---                        { drop_chrome = true } hides the bar (document close, TTS takeover)
+function MediaSync:stop(keep_chapter_menu, opts)
+    opts = opts or {}
+    local track_transition = opts.track_transition and true or false
+    local drop_chrome = opts.drop_chrome and true or false
+    local was_playing = self.state ~= self.STATE.STOPPED
+    self.state = self.STATE.STOPPED
+    self._chain_generation = self._chain_generation + 1
+
+    if self._sync_timer then
+        UIManager:unschedule(self._sync_timer)
+        self._sync_timer = nil
+    end
+    if self._position_timer then
+        UIManager:unschedule(self._position_timer)
+        self._position_timer = nil
+    end
+
+    if self.media_engine then
+        pcall(function()
+            -- Hard stop (user close / end of book): tear down keepalive too.
+            -- Track transition: spare keepalive so AirPods A2DP stays armed.
+            self.media_engine._kill_keepalive_on_stop = not track_transition
+            self.media_engine:stop()
+        end)
+    end
+    if self.highlight_manager then
+        pcall(function() self.highlight_manager:clearHighlights() end)
+    end
+    if not track_transition then
+        local keep_bar = self:_shouldKeepOverlayBar() and not drop_chrome
+        if keep_bar then
+            -- Leave the mini player and reserved margins in place so CRE
+            -- does not reflow the book on the next play (Android ANR).
+            if self.playback_bar and self.playback_bar.setPlaying then
+                pcall(function() self.playback_bar:setPlaying(false) end)
+            end
+        else
+            if self.playback_bar then
+                pcall(function() self.playback_bar:hide() end)
+                self.playback_bar = nil
+            end
+            if self.plugin and self.plugin._hideReturnToReadAloudButton then
+                pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+            end
+            -- Document close with the locked layout keeps the sidecar inset
+            -- (restoring it would reflow on every KOReader exit); any other
+            -- hard stop restores margins as before.
+            if not (drop_chrome and self:_shouldKeepOverlayBar()) then
+                self:_releaseMiniBarSpace()
+            else
+                self._bar_space_reserved = false
+            end
+        end
+    end
+    if not keep_chapter_menu then
+        if self._chapter_menu_window then
+            pcall(function() UIManager:close(self._chapter_menu_window) end)
+            self._chapter_menu_window = nil
+        end
+        if self._chapter_menu then
+            self._chapter_menu = nil
+        end
+    end
+
+    if was_playing then
+        logger.warn("MediaSync: stopped", track_transition and "(track transition)" or "")
+    end
+end
+
+--- Footer height (status bar + progress) for positioning / margin math.
+function MediaSync:_readerFooterHeight()
+    local ui = self.plugin and self.plugin.ui
+    local view = ui and ui.view
+    if not view or not view.footer or not view.footer_visible then return 0 end
+    local ok, h = pcall(function() return view.footer:getHeight() end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    ok, h = pcall(function()
+        local d = view.footer.dimen
+        return d and d.h or 0
+    end)
+    if ok and type(h) == "number" and h > 0 then return h end
+    return 0
+end
+
+--- Keep the mini bar on screen after playback stops (device default: on).
 function MediaSync:_shouldKeepOverlayBar()
     if not self.overlay_mode then return false end
-    if not (self.plugin and self.plugin.getSetting) then return true end
+    if not (self.plugin and self.plugin.getSetting) then return false end
     return self.plugin:getSetting("keep_media_overlay_bar", true)
 end
 
--- Write the overlay inset into KOReader's own copt_b_page_margin so the
--- next open typesets with it (no SetPageMargins, no CRE reflow).
+--- Write the overlay inset into KOReader's own copt_b_page_margin so the
+--- next open typesets with it (no SetPageMargins, no CRE reflow). Device default: on.
 function MediaSync:_shouldLockKoreaderMargins()
-    if not (self.plugin and self.plugin.getSetting) then return true end
+    if not (self.plugin and self.plugin.getSetting) then return false end
     return self.plugin:getSetting("lock_koreader_page_margins", true)
         and self.plugin:getSetting("keep_media_overlay_bar", true)
 end
 
 --- Show the minimized overlay chrome and reserve bottom margin without
---- starting audio. Used so a SMIL book does not reflow on every play/stop.
+--- starting audio, so a SMIL book does not reflow on every play/stop.
 function MediaSync:pinOverlayChrome()
     self.overlay_mode = true
     self:showPlaybackBar()
     if self.playback_bar and self.playback_bar.setPlaying then
         pcall(function() self.playback_bar:setPlaying(false) end)
+    end
+    -- Without the sidecar lock, still reserve the strip for this session so
+    -- the pinned bar never covers book text.
+    if self:_shouldKeepOverlayBar() then
+        self:_reserveMiniBarSpace()
     end
     self:_refreshPlaybackTimeUi()
 end
@@ -864,107 +943,17 @@ function MediaSync:_refreshPlaybackTimeUi()
     dlog("overlay time ui", "pos=", bar_pos, "dur=", bar_dur, "file_pos=", pos)
 end
 
---- @param keep_chapter_menu boolean|nil
---- @param opts table|nil  { track_transition = true } spares A2DP keepalive and player UI
----                        { drop_chrome = true } hides the bar (document close)
-function MediaSync:stop(keep_chapter_menu, opts)
-    opts = opts or {}
-    local track_transition = opts.track_transition and true or false
-    local drop_chrome = opts.drop_chrome and true or false
-    local was_playing = self.state ~= self.STATE.STOPPED
-    if self.overlay_mode and was_playing and not track_transition
-        and self.plugin and self.plugin._saveCurrentAlignedProgress then
-        pcall(function() self.plugin:_saveCurrentAlignedProgress() end)
-    end
-    self.state = self.STATE.STOPPED
-    self._chain_generation = self._chain_generation + 1
-
-    if self._sync_timer then
-        UIManager:unschedule(self._sync_timer)
-        self._sync_timer = nil
-    end
-    if self._position_timer then
-        UIManager:unschedule(self._position_timer)
-        self._position_timer = nil
-    end
-
-    if self.media_engine then
-        pcall(function()
-            -- Hard stop (user close / end of book): tear down keepalive too.
-            -- Track transition: spare keepalive so AirPods A2DP stays armed.
-            self.media_engine._kill_keepalive_on_stop = not track_transition
-            self.media_engine:stop()
-        end)
-    end
-    if self.highlight_manager then
-        pcall(function() self.highlight_manager:clearHighlights() end)
-    end
-    if not track_transition then
-        local keep_bar = self:_shouldKeepOverlayBar() and not drop_chrome
-        if keep_bar then
-            -- Leave the mini player and reserved margins in place so CRE
-            -- does not reflow the book on the next play (Android ANR).
-            if self.playback_bar and self.playback_bar.setPlaying then
-                pcall(function() self.playback_bar:setPlaying(false) end)
-            end
-        else
-            if self.playback_bar then
-                pcall(function() self.playback_bar:hide() end)
-                self.playback_bar = nil
-            end
-            if self.plugin and self.plugin._hideReturnToReadAloudButton then
-                pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
-            end
-            -- Document close with pinned layout: drop the widget only.
-            -- Restoring margins here would reflow on every KOReader exit.
-            if not (drop_chrome and self:_shouldKeepOverlayBar()) then
-                self:_releaseMiniBarSpace()
-            else
-                self._bar_space_reserved = false
-            end
-        end
-    end
-    if not keep_chapter_menu then
-        if self._chapter_menu_window then
-            pcall(function() UIManager:close(self._chapter_menu_window) end)
-            self._chapter_menu_window = nil
-        end
-        if self._chapter_menu then
-            self._chapter_menu = nil
-        end
-    end
-
-    if was_playing then
-        logger.warn("MediaSync: stopped", track_transition and "(track transition)" or "")
-    end
-end
-
---- Footer height (status bar + progress) for positioning / margin math.
-function MediaSync:_readerFooterHeight()
-    local ui = self.plugin and self.plugin.ui
-    local view = ui and ui.view
-    if not view or not view.footer or not view.footer_visible then return 0 end
-    local ok, h = pcall(function() return view.footer:getHeight() end)
-    if ok and type(h) == "number" and h > 0 then return h end
-    ok, h = pcall(function()
-        local d = view.footer.dimen
-        return d and d.h or 0
-    end)
-    if ok and type(h) == "number" and h > 0 then return h end
-    return 0
-end
-
---- KOReader "Overlap status bar" (FR: Superposer la barre d'état).
---- When true, CRE does not add footer height to the bottom margin.
+--- KOReader "Overlap status bar": when true, CRE does not add the footer
+--- height to the bottom margin itself.
 function MediaSync:_footerReclaimsHeight()
     local ui = self.plugin and self.plugin.ui
     local footer = ui and ui.view and ui.view.footer
     return footer and footer.reclaim_height and true or false
 end
 
---- Sit the mini player above KOReader's footer so neither overlays book text.
---- True when the user asked to keep status bars, or when Overlap status bar
---- is off (the footer is a real page footer, not a temporary overlay).
+--- Sit the mini player above KOReader's footer so neither covers book text.
+--- True when the user keeps status bars, or when Overlap status bar is off
+--- (the footer is a real page footer, not a temporary overlay).
 function MediaSync:_miniBarAboveFooter()
     if self.plugin and self.plugin.getSetting
         and self.plugin:getSetting("keep_reader_status_bars", false) then
@@ -996,22 +985,13 @@ function MediaSync:_miniBarPixelHeight()
     return bar_h
 end
 
---[[--
-Reserve the mini player's height in the document bottom margin so book text
-reflows above it (same approach as SyncController:_reserveBarSpace for TTS).
-The always-visible media overlay must not cover readable text.
-
-When KOReader's "Overlap status bar" is off, ReaderTypeset already adds the
-footer height to the bottom margin; the mini player sits *above* that footer
-and we only add the player height (not the user's original bottom margin —
-that empty band sat between the last line and the overlay).  Persist the extra
-in configurable.b_page_margin so the next open typesets with the inset already
-applied (no CRE hitch).
---]]
+--- Bottom inset (unscaled units) that keeps CRE text above the mini player:
+--- the bar height plus, when we sit above a reclaiming footer, the footer
+--- height ReaderTypeset will not add itself. The user's original bottom
+--- margin is deliberately not carried over (that empty band sat between the
+--- last line and the overlay).
 function MediaSync:_overlayBarExtraUnscaled(bar_h)
     local extra = self:_unscalePx(bar_h)
-    -- Sitting above the footer while reclaim/overlap is ON: ReaderTypeset will
-    -- not add footer_h, so the mini-bar + footer stack must both be reserved.
     if self:_miniBarAboveFooter() and self:_footerReclaimsHeight() then
         extra = extra + self:_unscalePx(self:_readerFooterHeight())
     end
@@ -1053,7 +1033,9 @@ function MediaSync:_persistBottomMargin(unscaled_bottom, overlay_inset)
     end
 end
 
--- Locked-bar reopen: re-assert the inset before KOReader writes the sidecar.
+-- Locked-bar reopen: re-assert the inset into the sidecar on document close.
+-- KOReader's SaveSettings fires before CloseDocument, so the copt_* value it
+-- persists already carries the inset; this covers any path that bypasses it.
 function MediaSync:_persistLockedOverlayMargin()
     if not self:_shouldLockKoreaderMargins() then return end
     local ui = self.plugin and self.plugin.ui
@@ -1071,6 +1053,18 @@ function MediaSync:_persistLockedOverlayMargin()
     end
 end
 
+--[[--
+Reserve the mini player's height in the document bottom margin so book text
+reflows above it (same approach as SyncController:_reserveBarSpace for TTS).
+Never leave the mini bar covering readable text — including when the user
+keeps KOReader's status / progress bars visible under the mini player.
+
+Keep-bar + lock: persist copt_b_page_margin instead of SetPageMargins.
+Changing margins after the page is on screen partial-rerenders the current
+DocFragment and ANRs Android, so there the inset is applied on the next open
+via onDocSettingsLoad (before the first CRE typeset). Off Android a live
+reflow is safe, so the first locked session gets it immediately.
+--]]
 function MediaSync:_reserveMiniBarSpace()
     -- Full-screen (non-overlay) player intentionally covers the book.
     if not self.overlay_mode then return end
@@ -1082,38 +1076,45 @@ function MediaSync:_reserveMiniBarSpace()
     end
     local bar_h = self:_miniBarPixelHeight()
     local ds = ui.doc_settings
-    local keep = self:_shouldKeepOverlayBar()
-    local lock = self:_shouldLockKoreaderMargins()
     local m = tp.unscaled_margins
-    local extra = self:_overlayBarExtraUnscaled(bar_h)
 
-    -- Keep-bar + lock: persist copt_b_page_margin, never SetPageMargins here.
-    -- Changing margins after the page is on screen partial-rerenders the
-    -- current DocFragment and ANRs Android. The inset is applied on the
-    -- next open via onDocSettingsLoad (before the first CRE typeset).
-    if keep and lock and ds then
-        local needed = extra + 2
+    if self:_shouldKeepOverlayBar() and self:_shouldLockKoreaderMargins() and ds then
+        local needed = self:_overlayBarExtraUnscaled(bar_h) + 2
         local orig = ds:readSetting("audiobook_overlay_orig_bottom")
         if orig == nil and math.abs((m[4] or 0) - needed) > 1 then
             orig = m[4]
             ds:saveSetting("audiobook_overlay_orig_bottom", orig)
         end
         ds:saveSetting("audiobook_overlay_margin_locked", true)
+        local live_bottom = m[4]
         self:_persistBottomMargin(needed, true)
         self._bar_space_reserved = true
         self._reserved_mini_bar_h = bar_h
         logger.warn("MediaSync: overlay margin saved for next typeset",
-            "bottom=", m[4], "needed=", needed,
+            "bottom=", live_bottom, "needed=", needed,
             "copt=", ds:readSetting("copt_b_page_margin"))
         dlog("overlay-margin", "locked-persist-copt", "bar_h", bar_h,
-            "bottom", m[4], "needed", needed,
+            "bottom", live_bottom, "needed", needed,
             "copt", ds:readSetting("copt_b_page_margin"))
+        if Device:isAndroid() then
+            return
+        end
+        if math.abs((live_bottom or 0) - needed) <= 1 then
+            return  -- already typeset with the inset (reopen after persist)
+        end
+        -- Off Android: reflow now so the bar does not cover text this session.
+        local ok = pcall(ui.document.setPageMargins, ui.document,
+            Screen:scaleBySize(m[1]), Screen:scaleBySize(m[2]),
+            Screen:scaleBySize(m[3]), Screen:scaleBySize(needed))
+        if ok then
+            ui:handleEvent(Event:new("UpdatePos"))
+        end
         return
     end
 
     if self._bar_space_reserved then return end
 
-    -- Session-only reservation (keep-bar off): scaled inset, restore on stop.
+    -- Session-only reservation: scaled inset, restored on stop.
     -- Mirror ReaderTypeset:onSetPageMargins so reclaim-off includes footer.
     local bottom = Screen:scaleBySize(m[4]) + bar_h
     if not self:_footerReclaimsHeight() or self:_miniBarAboveFooter() then
@@ -1146,8 +1147,6 @@ function MediaSync:_releaseMiniBarSpace()
     local orig = ds and ds:readSetting("audiobook_overlay_orig_bottom")
     if orig ~= nil then
         self:_persistBottomMargin(orig)
-        -- Do not SetPageMargins here: restoring 15 after a 78 typeset is the
-        -- same CRE hit that ANRs Android on this book.
         if ds then
             ds:delSetting("audiobook_overlay_margin_locked")
             ds:delSetting("audiobook_overlay_orig_bottom")
@@ -1156,6 +1155,11 @@ function MediaSync:_releaseMiniBarSpace()
         end
         logger.warn("MediaSync: restored original bottom margin setting", orig)
         dlog("overlay-margin", "restored-settings", orig)
+        -- On Android the live restore is the same ANR-prone reflow; it takes
+        -- effect on next open. Off Android, restore immediately.
+        if not Device:isAndroid() and tp and tp.unscaled_margins then
+            ui:handleEvent(Event:new("SetPageMargins", tp.unscaled_margins))
+        end
         return
     end
     if tp and tp.unscaled_margins then
@@ -1199,9 +1203,6 @@ function MediaSync:pause(auto)
     end
     -- Pin the SMIL highlight to the pause time immediately.
     pcall(function() self:_updateHighlightAtTime(pos) end)
-    if self.overlay_mode and self.plugin and self.plugin._saveCurrentAlignedProgress then
-        pcall(function() self.plugin:_saveCurrentAlignedProgress(pos) end)
-    end
     if self.playback_bar then
         pcall(function() self.playback_bar:setPlaying(false) end)
     end
@@ -1270,9 +1271,6 @@ end
 function MediaSync:setSpeed(speed)
     if self.media_engine then
         pcall(function() self.media_engine:setSpeed(speed) end)
-    end
-    if self.plugin and self.plugin.setSetting then
-        self.plugin:setSetting("media_speed", speed)
     end
     if self.playback_bar then
         pcall(function() self.playback_bar:updateSpeed(speed) end)
@@ -1373,6 +1371,7 @@ function MediaSync:skipForward(seconds)
 end
 
 --- Skip within the SMIL chapter timeline (may cross ~4 min audio parts).
+
 function MediaSync:_skipOverlayBy(delta_s)
     local pos = self.media_engine and self.media_engine:getPosition() or 0
     local ch_pos, ch_dur = self:_overlayChapterProgress(pos)
@@ -1934,160 +1933,6 @@ function MediaSync:_updateHighlightAtTime(pos)
     end
 end
 
-function MediaSync:_ensureSentenceHighlighted(sentence, sent_idx)
-    if not self.highlight_manager then return end
-    if not (sentence and (sentence.text or sentence.fragment_id)) then return end
-    if self.plugin and self.plugin._readaloud_browsing_away then return end
-    local fails = self._hl_fail_count or 0
-    if fails >= 10 then return end
-    local now = time.now()
-    if self._hl_retry_at and now < self._hl_retry_at then return end
-    self._hl_retry_at = now + time.s(0.35)
-
-    local sent_obj = {
-        text = sentence.text or "",
-        start_pos = sentence.start_pos or 0,
-        end_pos = sentence.end_pos or #(sentence.text or ""),
-        fragment_id = sentence.fragment_id,
-        text_doc = sentence.text_doc,
-    }
-    local hl_ok = false
-    pcall(function()
-        hl_ok = self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
-    end)
-    if hl_ok then
-        self._highlighted_sentence_idx = sent_idx
-        self._hl_fail_count = 0
-        self._hl_retry_at = nil
-        if sentence.fragment_id then
-            self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
-        end
-        logger.warn("MediaSync: first-sentence highlight ok idx=", sent_idx)
-    else
-        self._hl_fail_count = fails + 1
-    end
-end
-
--- Page text used to decide a mid-sentence turn. Crops the mini-player and
--- a partial last line so words the reader cannot see do not inflate the
--- break fraction (that turned the page late).
-function MediaSync:_visiblePageText()
-    local ui = self.plugin and self.plugin.ui
-    local doc = ui and ui.document
-    if not (ui and ui.rolling and doc) then
-        if self.plugin and self.plugin.getCurrentPageText then
-            local ok, txt = pcall(function() return self.plugin:getCurrentPageText() end)
-            if ok then return txt end
-        end
-        return nil
-    end
-    local w, h = Screen:getWidth(), Screen:getHeight()
-    local crop = Screen:scaleBySize(18)
-    if self._reserved_mini_bar_h and self._reserved_mini_bar_h > 0 then
-        crop = crop + self._reserved_mini_bar_h
-    end
-    local y1 = math.max(1, h - crop)
-    local ok, res = pcall(doc.getTextFromPositions, doc,
-        {x = 0, y = 0}, {x = w, y = y1}, true)
-    if ok and res and res.text and res.text ~= "" then
-        return res.text
-    end
-    return nil
-end
-
--- How much of the SMIL phrase is still on this page, from the start.
--- Uses the prefix only: a later one-word coincidence must not inflate the
--- break (that turned the page at 82–95% of the clip).
-function MediaSync:_fragmentVisiblePrefix(sentence, sent_words)
-    local ui = self.plugin and self.plugin.ui
-    local doc = ui and ui.document
-    local fid = sentence and sentence.fragment_id
-    if not (doc and fid and sent_words and #sent_words > 0) then return nil end
-    local ok, xp = pcall(function()
-        return doc:getNormalizedXPointer("#" .. fid)
-    end)
-    if not (ok and xp and xp ~= false) then return nil end
-    local boxes
-    pcall(function()
-        boxes = doc:getScreenBoxesFromPositions(xp, xp, true)
-    end)
-    if not boxes or #boxes == 0 then return nil end
-    local crop = Screen:getHeight() - (self._reserved_mini_bar_h or 0) - Screen:scaleBySize(12)
-    local parts = {}
-    local n_on = 0
-    for _, b in ipairs(boxes) do
-        if (b.y or 0) + (b.h or 0) * 0.4 < crop then
-            n_on = n_on + 1
-            local r
-            pcall(function()
-                r = doc:getTextFromPositions(
-                    {x = b.x or 0, y = (b.y or 0) + math.floor((b.h or 0) / 2)},
-                    {x = (b.x or 0) + math.max((b.w or 1) - 1, 0),
-                     y = (b.y or 0) + math.floor((b.h or 0) / 2)},
-                    true)
-            end)
-            if r and r.text then parts[#parts + 1] = r.text end
-        end
-    end
-    local on_text = self:_normalizeSearchText(table.concat(parts, " "))
-    local prefix = Utils.sentencePrefixOnPage(sent_words, on_text)
-    dlog("page-break-frag", "boxes", #boxes, "on", n_on, "on_n", #on_text, "prefix", prefix)
-    -- A single box is usually the id's first word, not the visible phrase.
-    if n_on <= 1 or prefix < 3 then return nil end
-    return prefix
-end
-
--- Fraction of the sentence's text that is still on the current page (0..1),
--- or nil when the tail is already visible (nothing to follow). Same idea as
--- Readest's pageBreakFraction: layout/page-text decides the break, audio
--- progress decides *when* to turn.
-function MediaSync:_sentencePageBreakFraction(sentence)
-    local raw = sentence and (sentence.text or "") or ""
-    if raw == "" and sentence and sentence.fragment_id then
-        raw = self:_lookupSentenceText(sentence.text_doc, sentence.fragment_id) or ""
-    end
-    local sent = self:_normalizeSearchText(raw)
-    if sent == "" then return nil end
-
-    local page = self:_normalizeSearchText(self:_visiblePageText() or "")
-    if page == "" then return nil end
-
-    local words = Utils.splitWords(sent)
-    if #words < 4 then return false end
-
-    local prefix = Utils.sentencePrefixOnPage(words, page)
-    if page:find(sent, 1, true) then
-        prefix = #words
-    end
-    local range_i, range_j = Utils.visibleSentenceWordRange(words, page)
-    local frag_prefix = self:_fragmentVisiblePrefix(sentence, words)
-    dlog("page-break", "n", #words, "prefix", prefix, "range", tostring(range_i), tostring(range_j),
-        "frag_prefix", tostring(frag_prefix), "page_n", #page, "sent_n", #sent)
-
-    if type(frag_prefix) == "number" and frag_prefix > 0 then
-        if prefix <= 0 then
-            prefix = frag_prefix
-        else
-            prefix = math.min(prefix, frag_prefix)
-        end
-    end
-
-    if prefix <= 0 then
-        dlog("page-break-skip", "no-prefix")
-        return false
-    end
-    if prefix >= #words then
-        dlog("page-break-skip", "fully-visible", "n", #words)
-        return false
-    end
-    -- Turn at the first word that has left the page (end of the prefix).
-    local visible = table.concat(words, " ", 1, prefix)
-    if prefix < 3 and #visible < 20 then return false end
-    local brk = #visible / #sent
-    dlog("page-break-use", "prefix", prefix, "n", #words, "brk", string.format("%.3f", brk))
-    return brk
-end
-
 function MediaSync:_followSentenceAcrossPages(sentence, pos)
     if not sentence or not pos then return end
     if not self.plugin then return end
@@ -2172,6 +2017,163 @@ function MediaSync:_followSentenceAcrossPages(sentence, pos)
         end)
     end)
 end
+
+function MediaSync:_sentencePageBreakFraction(sentence)
+    local raw = sentence and (sentence.text or "") or ""
+    if raw == "" and sentence and sentence.fragment_id then
+        raw = self:_lookupSentenceText(sentence.text_doc, sentence.fragment_id) or ""
+    end
+    local sent = self:_normalizeSearchText(raw)
+    if sent == "" then return nil end
+
+    local page = self:_normalizeSearchText(self:_visiblePageText() or "")
+    if page == "" then return nil end
+
+    local words = Utils.splitWords(sent)
+    if #words < 4 then return false end
+
+    local prefix = Utils.sentencePrefixOnPage(words, page)
+    if page:find(sent, 1, true) then
+        prefix = #words
+    end
+    local range_i, range_j = Utils.visibleSentenceWordRange(words, page)
+    local frag_prefix = self:_fragmentVisiblePrefix(sentence, words)
+    dlog("page-break", "n", #words, "prefix", prefix, "range", tostring(range_i), tostring(range_j),
+        "frag_prefix", tostring(frag_prefix), "page_n", #page, "sent_n", #sent)
+
+    if type(frag_prefix) == "number" and frag_prefix > 0 then
+        if prefix <= 0 then
+            prefix = frag_prefix
+        else
+            prefix = math.min(prefix, frag_prefix)
+        end
+    end
+
+    if prefix <= 0 then
+        dlog("page-break-skip", "no-prefix")
+        return false
+    end
+    if prefix >= #words then
+        dlog("page-break-skip", "fully-visible", "n", #words)
+        return false
+    end
+    -- Turn at the first word that has left the page (end of the prefix).
+    local visible = table.concat(words, " ", 1, prefix)
+    if prefix < 3 and #visible < 20 then return false end
+    local brk = #visible / #sent
+    dlog("page-break-use", "prefix", prefix, "n", #words, "brk", string.format("%.3f", brk))
+    return brk
+end
+
+function MediaSync:_fragmentVisiblePrefix(sentence, sent_words)
+    local ui = self.plugin and self.plugin.ui
+    local doc = ui and ui.document
+    local fid = sentence and sentence.fragment_id
+    if not (doc and fid and sent_words and #sent_words > 0) then return nil end
+    local ok, xp = pcall(function()
+        return doc:getNormalizedXPointer("#" .. fid)
+    end)
+    if not (ok and xp and xp ~= false) then return nil end
+    local boxes
+    pcall(function()
+        boxes = doc:getScreenBoxesFromPositions(xp, xp, true)
+    end)
+    if not boxes or #boxes == 0 then return nil end
+    local crop = Screen:getHeight() - (self._reserved_mini_bar_h or 0) - Screen:scaleBySize(12)
+    local parts = {}
+    local n_on = 0
+    for _, b in ipairs(boxes) do
+        if (b.y or 0) + (b.h or 0) * 0.4 < crop then
+            n_on = n_on + 1
+            local r
+            pcall(function()
+                r = doc:getTextFromPositions(
+                    {x = b.x or 0, y = (b.y or 0) + math.floor((b.h or 0) / 2)},
+                    {x = (b.x or 0) + math.max((b.w or 1) - 1, 0),
+                     y = (b.y or 0) + math.floor((b.h or 0) / 2)},
+                    true)
+            end)
+            if r and r.text then parts[#parts + 1] = r.text end
+        end
+    end
+    local on_text = self:_normalizeSearchText(table.concat(parts, " "))
+    local prefix = Utils.sentencePrefixOnPage(sent_words, on_text)
+    dlog("page-break-frag", "boxes", #boxes, "on", n_on, "on_n", #on_text, "prefix", prefix)
+    -- A single box is usually the id's first word, not the visible phrase.
+    if n_on <= 1 or prefix < 3 then return nil end
+    return prefix
+end
+
+-- Fraction of the sentence's text that is still on the current page (0..1),
+-- or nil when the tail is already visible (nothing to follow). Same idea as
+-- Readest's pageBreakFraction: layout/page-text decides the break, audio
+-- progress decides *when* to turn.
+
+function MediaSync:_visiblePageText()
+    local ui = self.plugin and self.plugin.ui
+    local doc = ui and ui.document
+    if not (ui and ui.rolling and doc) then
+        if self.plugin and self.plugin.getCurrentPageText then
+            local ok, txt = pcall(function() return self.plugin:getCurrentPageText() end)
+            if ok then return txt end
+        end
+        return nil
+    end
+    local w, h = Screen:getWidth(), Screen:getHeight()
+    local crop = Screen:scaleBySize(18)
+    if self._reserved_mini_bar_h and self._reserved_mini_bar_h > 0 then
+        crop = crop + self._reserved_mini_bar_h
+    end
+    local y1 = math.max(1, h - crop)
+    local ok, res = pcall(doc.getTextFromPositions, doc,
+        {x = 0, y = 0}, {x = w, y = y1}, true)
+    if ok and res and res.text and res.text ~= "" then
+        return res.text
+    end
+    return nil
+end
+
+-- How much of the SMIL phrase is still on this page, from the start.
+-- Uses the prefix only: a later one-word coincidence must not inflate the
+-- break (that turned the page at 82–95% of the clip).
+
+function MediaSync:_ensureSentenceHighlighted(sentence, sent_idx)
+    if not self.highlight_manager then return end
+    if not (sentence and (sentence.text or sentence.fragment_id)) then return end
+    if self.plugin and self.plugin._readaloud_browsing_away then return end
+    local fails = self._hl_fail_count or 0
+    if fails >= 10 then return end
+    local now = time.now()
+    if self._hl_retry_at and now < self._hl_retry_at then return end
+    self._hl_retry_at = now + time.s(0.35)
+
+    local sent_obj = {
+        text = sentence.text or "",
+        start_pos = sentence.start_pos or 0,
+        end_pos = sentence.end_pos or #(sentence.text or ""),
+        fragment_id = sentence.fragment_id,
+        text_doc = sentence.text_doc,
+    }
+    local hl_ok = false
+    pcall(function()
+        hl_ok = self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
+    end)
+    if hl_ok then
+        self._highlighted_sentence_idx = sent_idx
+        self._hl_fail_count = 0
+        self._hl_retry_at = nil
+        if sentence.fragment_id then
+            self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
+        end
+        logger.warn("MediaSync: first-sentence highlight ok idx=", sent_idx)
+    else
+        self._hl_fail_count = fails + 1
+    end
+end
+
+-- Page text used to decide a mid-sentence turn. Crops the mini-player and
+-- a partial last line so words the reader cannot see do not inflate the
+-- break fraction (that turned the page late).
 
 function MediaSync:_findSentenceAtTime(pos)
     local data = self.timing_data
@@ -2282,17 +2284,6 @@ function MediaSync:_startPositionPoller(gen)
             logger.err("MediaSync: getDuration() error in poller:", dur)
             self._position_timer = UIManager:scheduleIn(1.0, poll)
             return
-        end
-
-        -- Persist overlay resume point while playing so a force-stop still
-        -- reopens on the last sentence.
-        if self.overlay_mode and self.state == self.STATE.PLAYING
-            and self.plugin and self.plugin._saveCurrentAlignedProgress then
-            local now = os.time()
-            if not self._last_aligned_save_at or (now - self._last_aligned_save_at) >= 15 then
-                self._last_aligned_save_at = now
-                pcall(function() self.plugin:_saveCurrentAlignedProgress(pos) end)
-            end
         end
 
         -- Update progress bar
@@ -2414,10 +2405,6 @@ function MediaSync:showPlaybackBar()
     if self.playback_bar and self.playback_bar:isVisible() then
         -- Track transitions soft-stop and reuse the same player UI — refresh
         -- the chapter label so we don't keep the first playlist entry forever.
-        self.playback_bar.keep_reader_status_bars = self:_miniBarAboveFooter()
-        if self.playback_bar._minimized and self.playback_bar._applyMinimizedGeometry then
-            pcall(function() self.playback_bar:_applyMinimizedGeometry() end)
-        end
         self:_refreshPlaybackBarTitles()
         self:_reserveMiniBarSpace()
         return
@@ -2497,7 +2484,6 @@ function MediaSync:showPlaybackBar()
         loop_active = self.loop_enabled,
         volume_pct = self:getVolume(),
         on_volume = function(pct) self:setVolume(pct) end,
-        playback_speed = self:getSpeed(),
         ui_widget = self.plugin and self.plugin.ui,
         on_play_pause = function()
             if self.state == self.STATE.PLAYING then
@@ -2522,7 +2508,8 @@ function MediaSync:showPlaybackBar()
                 self.state = self.STATE.PLAYING
                 local ok = self.media_engine:play(
                     function() self:_onPlaybackComplete(gen) end,
-                    function(err) self:_onPlaybackFail(gen, err) end)
+                    function(err) self:_onPlaybackFail(gen, err) end
+                )
                 if ok then
                     self:_startSyncLoop(gen)
                     self:_startPositionPoller(gen)
@@ -2532,9 +2519,6 @@ function MediaSync:showPlaybackBar()
                 else
                     self.state = self.STATE.STOPPED
                 end
-            elseif self.plugin and self.plugin.startMediaPlayback then
-                -- Pinned overlay bar before the first play of this session.
-                pcall(function() self.plugin:startMediaPlayback() end)
             end
         end,
         on_skip_back = function()
@@ -2550,10 +2534,6 @@ function MediaSync:showPlaybackBar()
             self:nextChapter()
         end,
         on_seek = function(pct)
-            if self.overlay_mode then
-                self:seekToOverlayProgress(pct)
-                return
-            end
             local dur = self.media_engine and self.media_engine:getDuration() or 0
             if dur > 0 then
                 self:seekToTime(pct * dur)
@@ -2610,7 +2590,10 @@ function MediaSync:showPlaybackBar()
         -- BT reconnect lives in plugin settings (Reconnect BT on track change)
         -- and the Bluetooth menu — no overlay "BT" button.
         show_fix_audio = false,
-        keep_reader_status_bars = self:_miniBarAboveFooter(),
+        keep_reader_status_bars = self.plugin
+            and self.plugin.getSetting
+            and self.plugin:getSetting("keep_reader_status_bars", false)
+            or false,
     }
     player:show()
     if self.plugin then
@@ -2653,8 +2636,6 @@ function MediaSync:navigateToSentenceEntry(entry)
 
     self._current_sentence_idx = sent_idx
     self._last_hl_idx = sent_idx
-    self._highlighted_sentence_idx = nil
-    self._hl_fail_count = 0
     logger.warn("MediaSync: navigating to entry", sent_idx, sentence.text_doc, sentence.fragment_id)
 
     if self.plugin and time then
@@ -2686,8 +2667,6 @@ function MediaSync:navigateToSentenceEntry(entry)
             pcall(function()
                 local ok = ms.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
                 if ok then
-                    ms._highlighted_sentence_idx = sent_idx
-                    ms._hl_fail_count = 0
                     ms:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
                 end
             end)
@@ -2723,13 +2702,6 @@ function MediaSync:refocusToCurrentSentence()
         return
     end
 
-    if self.plugin then
-        self.plugin._readaloud_browsing_away = false
-        if self.plugin._hideReturnToReadAloudButton then
-            pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
-        end
-    end
-
     local sent_idx = self._current_sentence_idx
     if not sent_idx or not self.timing_data[sent_idx] then
         local pos = self.media_engine and self.media_engine:getPosition() or 0
@@ -2741,10 +2713,7 @@ function MediaSync:refocusToCurrentSentence()
         return
     end
     self._current_sentence_idx = sent_idx
-    self._highlighted_sentence_idx = nil
-    self._hl_fail_count = 0
     logger.warn("MediaSync: refocusing to sentence", sent_idx, sentence.text_doc, sentence.fragment_id)
-    dlog("refocus", "idx", sent_idx, "id", tostring(sentence.fragment_id))
 
     local text_doc = sentence.text_doc or ""
     local xp = (text_doc ~= "" and text_doc .. "#" .. sentence.fragment_id)
@@ -2757,9 +2726,6 @@ function MediaSync:refocusToCurrentSentence()
         logger.warn("MediaSync: refocus cannot navigate to", xp)
         self:_clearPageFollowAuto()
         return
-    end
-    if self.highlight_manager then
-        self.highlight_manager._line_cache = nil
     end
     UIManager:scheduleIn(1.5, function()
         ms:_clearPageFollowAuto()
@@ -2774,13 +2740,9 @@ function MediaSync:refocusToCurrentSentence()
             fragment_id = sentence.fragment_id,
             text_doc = sentence.text_doc,
         }
-        UIManager:scheduleIn(0.5, function()
+        UIManager:scheduleIn(0.3, function()
             pcall(function()
-                local ok_hl = ms.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
-                if ok_hl then
-                    ms._highlighted_sentence_idx = sent_idx
-                    ms._hl_fail_count = 0
-                end
+                self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
             end)
         end)
     end
@@ -3143,10 +3105,30 @@ function MediaSync:seekToOverlayChapter(index)
     local chapters = self.plugin and self.plugin._smil_overlay_chapters
     if not chapters or not chapters[index] then return end
     local ch = chapters[index]
-    self:_seekToOverlayFileTime(ch.audio_path, ch.start_time or 0)
+    local function after_audio_ready()
+        UIManager:scheduleIn(0.2, function()
+            self:seekToTime(ch.start_time)
+            if self.overlay_mode and ch.fragment_id then
+                UIManager:scheduleIn(0.3, function()
+                    self:navigateToSentenceAtTime(ch.start_time)
+                end)
+            end
+        end)
+    end
+    if ch.audio_path and self.media_engine
+        and self.media_engine.current_path ~= ch.audio_path then
+        -- Cross-file chapter jump: BT reconnect then load the new audio part.
+        self:_bridgeKindleA2dpForTrackChange(function()
+            if self.plugin and self.plugin._playAudioFile then
+                self.plugin:_playAudioFile(ch.audio_path, self.playlist_files)
+            end
+            after_audio_ready()
+        end)
+        return
+    end
+    after_audio_ready()
 end
 
---- Scrubber pct is chapter-local (same scale as the overlay time display).
 function MediaSync:seekToOverlayProgress(pct)
     pct = tonumber(pct) or 0
     if pct < 0 then pct = 0 end

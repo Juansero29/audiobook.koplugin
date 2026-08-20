@@ -147,16 +147,16 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
     -- Returns true when the sentence was found and highlighted on the
     -- visible page (callers use this for read-along page advancement).
     if self.ui.rolling then
-        -- Readest: getElementById(smil textId) → Range over that element's
-        -- text. Never invent a highlight by matching words on the page.
+        -- Storyteller / EPUB3 Media Overlays: prefer the SMIL fragment id
+        -- (Readest-style) over fuzzy on-screen text matching.
         if sentence.fragment_id then
             local frag_ok = self:_highlightByFragmentId(doc, sentence.fragment_id, sentence)
             if frag_ok then return true end
             -- Same content document: CRe's #id index often misses Storyteller
-            -- <span id> inside Word-exported <p>/<h1>, so fall back to a
-            -- contiguous text match on this page. Other-document miss must
-            -- still return false (upstream v0.1.17.34 / #64) so page-advance
-            -- can run instead of highlighting a look-alike sentence here.
+            -- <span id> nested inside Word-exported <p>/<h1>, so fall back to
+            -- a contiguous text match on this page. An other-document miss
+            -- must still return false (#64) so page-advance can run instead
+            -- of highlighting a look-alike sentence here.
             if self:_fragmentOnCurrentDoc(sentence) then
                 dlog("hl-frag-roll", "id", tostring(sentence.fragment_id))
                 return self:_highlightSentenceRolling(sentence, parsed_data, doc, nil, true)
@@ -200,7 +200,6 @@ end
 --- Next SMIL fragment in the same content document (exclusive end clamp).
 function HighlightManager:_nextSmilFragmentId(sentence)
     if not sentence or not sentence.fragment_id then return nil end
-    if sentence.next_fragment_id then return sentence.next_fragment_id end
     local ms = self.plugin and self.plugin.media_sync
     local data = ms and ms.timing_data
     if not data then return nil end
@@ -236,17 +235,17 @@ end
 function HighlightManager:_fragmentOnCurrentDoc(sentence)
     if not sentence or not sentence.text_doc then return false end
     local n = self:_currentDocFragmentIndex()
-    local parser = self.plugin and self.plugin._smil_parser
-    local spine = parser and parser._spine_hrefs or {}
-    if not n or not spine[n] then return false end
-    local base = sentence.text_doc:match("([^/]+)$") or sentence.text_doc
-    return spine[n] == base
+    if not n then return false end
+    local ms = self.plugin and self.plugin.media_sync
+    local expected = ms and ms:_getExpectedDocFragmentIndex(sentence.text_doc)
+    return expected ~= nil and expected == n
 end
 
 --- Resolve a SMIL fragment id to a CRe xpointer.
 -- `#id` uses crengine's id index, which often omits inline Storyteller
 -- spans. Attribute-path probes still match `[@id=...]` on the current
--- DocFragment (e.g. body/h1/span[@id='html28-s0']).
+-- DocFragment (e.g. body/h1/span[@id='html28-s0']). Same probe list as
+-- MediaSync:_tryGotoDocFragment.
 function HighlightManager:_resolveFragmentXPointer(doc, fragment_id)
     if not doc or not fragment_id then return nil end
     local function try_xp(xp)
@@ -258,26 +257,30 @@ function HighlightManager:_resolveFragmentXPointer(doc, fragment_id)
     if hit then return hit end
     local n = self:_currentDocFragmentIndex(doc)
     if not n then return nil end
-    local probes = {
-        "/body/DocFragment[%d]/body/h1/span[@id='%s']",
-        "/body/DocFragment[%d]/body/p/span[@id='%s']",
-        "/body/DocFragment[%d]/body/div/span[@id='%s']",
-        "/body/DocFragment[%d]/body/div/p/span[@id='%s']",
-        "/body/DocFragment[%d]/body/span[@id='%s']",
-        "/body/DocFragment[%d]/body/p[@id='%s']",
-        "/body/DocFragment[%d]/body/h1[@id='%s']",
-        "/body/DocFragment[%d]/body/id('%s')",
-        "/body/DocFragment[%d]/body.0/h1/span[@id='%s']",
-        "/body/DocFragment[%d]/body.0/p/span[@id='%s']",
+    local nested = {
+        "h1/span", "p/span", "div/span", "div/p/span",
+        "h2/span", "h3/span", "blockquote/span",
     }
-    for _, fmt in ipairs(probes) do
-        hit = try_xp(string.format(fmt, n, fragment_id))
-        if hit then
-            dlog("hl-frag-xp", "id", tostring(fragment_id), "n", n)
-            return hit
+    local tags = {"span", "p", "div", "h1", "h2", "h3", "h4", "li", "td", "em", "strong", "a"}
+    local bodies = {"body", "body.0"}
+    for _, body in ipairs(bodies) do
+        hit = try_xp(string.format("/body/DocFragment[%d]/%s/id('%s')", n, body, fragment_id))
+        if hit then break end
+        for _, path in ipairs(nested) do
+            hit = try_xp(string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", n, body, path, fragment_id))
+            if hit then break end
         end
+        if hit then break end
+        for _, tag in ipairs(tags) do
+            hit = try_xp(string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", n, body, tag, fragment_id))
+            if hit then break end
+        end
+        if hit then break end
     end
-    return nil
+    if hit then
+        dlog("hl-frag-xp", "id", tostring(fragment_id), "n", n)
+    end
+    return hit
 end
 
 --- Expand `#id` to the element's full text range (Readest `textRangeOf`).
@@ -294,6 +297,15 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
         node_text = Utils.normalizeForMatching(sentence.text)
     end
     local want = foldedWords(node_text)
+
+    if #want == 0 then
+        -- No reference text to walk against: the word-walk below would run
+        -- away to the document end. Use CRe's sentence-segment expansion.
+        local a, b
+        pcall(function() a, b = doc:extendXPointersToSentenceSegment(xp0, xp0) end)
+        if a and b then return a, b, node_text end
+        return xp0, xp0, node_text
+    end
 
     local xp_limit = nil
     local next_id = self:_nextSmilFragmentId(sentence)
@@ -314,8 +326,7 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
         local drawn = ""
         pcall(function() drawn = doc:getTextFromXPointers(xp0, xp_limit) or "" end)
         drawn = Utils.normalizeForMatching(drawn)
-        if (node_text ~= "" and drawnBelongsToNode(drawn, node_text))
-            or (node_text == "" and drawn ~= "") then
+        if drawnBelongsToNode(drawn, node_text) then
             return xp0, xp_limit, node_text
         end
     end
@@ -337,21 +348,19 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
             pcall(function() drawn = doc:getTextFromXPointers(xp0, nxt) or "" end)
             drawn = Utils.normalizeForMatching(drawn)
             local dw = foldedWords(drawn)
-            if #want > 0 then
-                if #dw > #want then break end
-                local n = math.min(#dw, #want)
-                local prefix_ok = n > 0
-                for i = 1, n do
-                    if dw[i] ~= want[i] then
-                        prefix_ok = false
-                        break
-                    end
+            if #dw > #want then break end
+            local n = math.min(#dw, #want)
+            local prefix_ok = n > 0
+            for i = 1, n do
+                if dw[i] ~= want[i] then
+                    prefix_ok = false
+                    break
                 end
-                if not prefix_ok then break end
             end
+            if not prefix_ok then break end
             xp1 = nxt
             last = nxt
-            if #want > 0 and #dw >= #want then break end
+            if #dw >= #want then break end
         end
     elseif xp_limit then
         xp1 = xp_limit
@@ -391,6 +400,9 @@ function HighlightManager:_highlightByFragmentId(doc, fragment_id, sentence)
         return false
     end
 
+    -- Master used to report success whenever anything was drawn, even with
+    -- no on-screen boxes; that suppressed page advance while painting
+    -- nothing. Only a range with at least one visible box counts.
     local boxes
     pcall(function()
         boxes = doc:getScreenBoxesFromPositions(xp0, xp1, true)
@@ -457,6 +469,8 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
     -- the cached text/geometry; otherwise highlights can be drawn at stale
     -- x,y coordinates after the view changes.
     local cur_page = self.ui.document:getCurrentPage() or 0
+    -- Crop the mini-player strip so words hidden under it are not treated
+    -- as on-screen (that clipped the visible last word and delayed page follow).
     local bar_h = self.plugin and self.plugin.media_sync
         and self.plugin.media_sync._reserved_mini_bar_h or 0
     local crop_h = cur_h
@@ -473,9 +487,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         sboxes     = cache.sboxes
         n          = cache.n
     else
-        -- Build fresh line map (expensive path — N document calls).
-        -- Crop the mini-player strip so words hidden under it are not treated
-        -- as on-screen (that clipped the visible last word and delayed page follow).
+        -- Build fresh line map (expensive path — N document calls)
         local full_res = doc:getTextFromPositions(
             {x = 0, y = 0},
             {x = cur_w, y = crop_h},
@@ -548,16 +560,25 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         }
     end
 
-    -- Bookend the first and last matching words so a hyphenation / elision
-    -- hole does not drop the start or end of the visible phrase.
-    -- Overlay fallback: NEVER do that — first+last independent matches paint
-    -- fragments like "à l'hôtel du roi. La" that are not a SMIL sentence.
-    -- TTS (no fragment_id) also passes contiguous_only so the underline is
-    -- the spoken sentence, not a coincidental first/last word span.
+    -- Find the sentence in our built text. Exact substring first (tightest
+    -- boxes when it hits), then a word-level aligner that bookends the first
+    -- and last matching words so a hyphenation/elision hole does not drop
+    -- the start or end of the visible phrase, then prefix/suffix or
+    -- word-range fallbacks.
+    -- TTS (no fragment_id) passes contiguous_only so the underline is the
+    -- spoken sentence, not a coincidental first/last word span.
     local sent_words = Utils.splitWords(sent_text)
     local vis_start, vis_end, matched_len
-    local first_w, last_w, a, b
-    if not contiguous_only then
+    local first_w, last_w
+
+    vis_start = built_text:find(sent_text, 1, true)
+    if vis_start then
+        matched_len = #sent_text
+        vis_end = vis_start + matched_len - 1
+    end
+
+    if not vis_start and not contiguous_only then
+        local a, b
         first_w, last_w, a, b = Utils.alignSentenceOnPage(sent_words, built_text)
         local span = (first_w and last_w) and (last_w - first_w + 1) or 0
         if span <= 1 and #sent_words > 3 then
@@ -569,21 +590,18 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
             matched_len = vis_end - vis_start + 1
         end
     end
+
     if not vis_start then
-        vis_start = built_text:find(sent_text, 1, true)
-        matched_len = vis_start and #sent_text or nil
-        if vis_start then
-            vis_end = vis_start + matched_len - 1
-        end
-    end
-    if not vis_start then
-        -- Overlay: only a real prefix (this page has the start) or suffix
-        -- (page-wrap tail). A middle coincidence paints a random phrase
-        -- on a page the user flipped to.
         local i, j
         if contiguous_only then
+            -- Overlay same-document fallback: only a real prefix (this page
+            -- has the sentence start) or a suffix (page-wrap tail). A middle
+            -- coincidence paints a random phrase on a page the user flipped
+            -- to. Require 3 words on the prefix side: a one-word match
+            -- ("The", "Il") would otherwise suppress page advance while
+            -- narration walks off the page (#64 within one content document).
             local prefix_n = Utils.sentencePrefixOnPage(sent_words, built_text)
-            if prefix_n > 0 then
+            if prefix_n >= math.min(3, #sent_words) then
                 i, j = 1, prefix_n
             else
                 local suffix_n = Utils.sentenceSuffixOnPage(sent_words, built_text)
@@ -672,7 +690,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
 
     -- Visible slice only: using the full SMIL string here dropped the last
     -- on-page word (undershoot) or grabbed the next sentence (overshoot).
-    local want_text = Utils.ws(built_text:sub(vis_start, vis_end))
+    local want_text = built_text:sub(vis_start, vis_end)
     if want_text == "" then want_text = sent_text end
     local want_len = #want_text
 
@@ -683,7 +701,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         local function scoreOf(text)
             local len = #text
             if text == want_text then return 0 end
-            if len >= want_len and len <= want_len + 12 then
+            if len >= want_len and len <= want_len + 6 then
                 return 1 + (len - want_len)
             end
             if len < want_len then
@@ -709,8 +727,10 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
             if mid_text == want_text then
                 return mid
             elseif #mid_text > want_len then
+                -- Still overshooting, pull left
                 hi = mid
             else
+                -- Undershooting, push right
                 lo = mid
             end
         end
@@ -737,13 +757,16 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
                 local mid_start = mid_text:sub(1, math.min(20, #mid_text))
                 if mid_start == want_start then
                     best_x = mid
-                    -- Leftmost pixel that still selects the correct first word.
+                    -- Leftmost pixel that still selects the correct first
+                    -- word, so the highlight box covers the full first word.
                     hi = mid
                 else
+                    -- Went too far left (includes previous word) — go right
                     lo = mid
                 end
             end
             start_x = best_x
+            -- Re-refine end_x with corrected start_x
             end_x = refineEndX(start_x, start_y, end_y)
         end
     end
@@ -763,11 +786,11 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         -- Guard: only use CRe boxes if the selected text matches the
         -- sentence length.  If CRe snapped to a wider word boundary
         -- the boxes would visually overflow into the next sentence.
+        -- Cover the visible slice; reject a dropped last word and a grab
+        -- of the next sentence.
         local cre_text = final_res.text and Utils.normalizeForMatching(final_res.text) or ""
         cre_len = #cre_text
-        -- Cover the visible slice; reject a dropped last word and a grab of
-        -- the next sentence.
-        local len_ok = #cre_text >= want_len - 2 and #cre_text <= want_len + 12
+        local len_ok = #cre_text >= want_len - 2 and #cre_text <= want_len + 6
         if len_ok then
             local cre_boxes = doc:getScreenBoxesFromPositions(
                 final_res.pos0, final_res.pos1, true)

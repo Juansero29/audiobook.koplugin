@@ -19,6 +19,68 @@ local Geom = require("ui/geometry")
 
 local ABSBrowse = {}
 
+--- Wrap a Menu in a full-screen, tap-outside-to-dismiss InputContainer window.
+-- Centralises the boilerplate that was previously triplicated across the
+-- library, detail, and search views.  Returns the window (whose menu is
+-- `menu`) already sized; the caller shows it with UIManager:show().
+-- @param menu Menu   the menu widget to embed
+-- @param menu_h_ratio number  window height as a fraction of screen height
+-- @return InputContainer
+function ABSBrowse._wrapMenu(menu, menu_h_ratio)
+    menu_h_ratio = menu_h_ratio or 0.75
+    local menu_w = Screen:getWidth() * 0.85
+    local menu_h = Screen:getHeight() * menu_h_ratio
+
+    local centered = CenterContainer:new{
+        dimen = Screen:getSize(),
+        menu,
+    }
+    local window = InputContainer:new{
+        dimen = Screen:getSize(),
+        centered,
+    }
+    local menu_rect = Geom:new{
+        x = math.floor((Screen:getWidth() - menu_w) / 2),
+        y = math.floor((Screen:getHeight() - menu_h) / 2),
+        w = menu_w,
+        h = menu_h,
+    }
+
+    function window:onTap(arg, ges_ev)
+        if ges_ev.pos:notIntersectWith(menu_rect) then
+            UIManager:close(self)
+            return true
+        end
+        return false
+    end
+
+    function window:onSwipe(arg, ges_ev)
+        if ges_ev.pos:notIntersectWith(menu_rect) then
+            UIManager:close(self)
+            return true
+        end
+        -- Drive Menu pagination explicitly and force a full-screen refresh.
+        -- Letting the event propagate sometimes leaves the new page invisible
+        -- on e-ink until the next suspend/resume cycle.
+        local direction = ges_ev.direction
+        if direction == "west" then
+            menu:onNextPage()
+        elseif direction == "east" then
+            menu:onPrevPage()
+        else
+            return false
+        end
+        UIManager:setDirty(nil, "ui")
+        return true
+    end
+
+    menu.close_callback = function()
+        UIManager:close(window)
+    end
+
+    return window
+end
+
 -- ---------------------------------------------------------------------------
 -- Main menu builder
 -- ---------------------------------------------------------------------------
@@ -145,6 +207,9 @@ function ABSBrowse.buildMainMenu(plugin)
             callback = function()
                 plugin:setSetting("abs_api_token", "")
                 plugin:setSetting("abs_user_id", "")
+                plugin:setSetting("abs_browse_library_id", "")
+                plugin:setSetting("abs_browse_page", "0")
+                plugin._abs_page_cache = nil
                 UIManager:show(InfoMessage:new{
                     text = _("Logged out from Audiobookshelf."),
                     timeout = 2,
@@ -378,10 +443,17 @@ function ABSBrowse._browseLibraries(plugin)
         -- Build menu items
         local menu_items = {}
         for idx, lib in ipairs(libraries) do
+            local lib_id, lib_name = lib.id, lib.name
             table.insert(menu_items, {
                 text = lib.name or _("Unnamed Library"),
                 callback = function()
-                    ABSBrowse._showLibraryItems(plugin, client, lib.id, lib.name)
+                    -- Restore the remembered page for this library so a
+                    -- re-entry returns to where the user was, not page 0.
+                    local page = 0
+                    if plugin:getSetting("abs_browse_library_id", "") == lib_id then
+                        page = tonumber(plugin:getSetting("abs_browse_page", "0")) or 0
+                    end
+                    ABSBrowse._showLibraryItems(plugin, client, lib_id, lib_name, page)
                 end,
             })
         end
@@ -454,16 +526,30 @@ end
 
 function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
     page = page or 0
-    local page_size = 50
-    local busy = InfoMessage:new{
-        text = _("Loading items…"),
-        timeout = 0,
-    }
-    UIManager:show(busy)
+    local page_size = 100
+
+    -- In-memory page cache (per session) so page turns and the post-download
+    -- refresh re-render without a network round-trip.  Invalidated on logout.
+    plugin._abs_page_cache = plugin._abs_page_cache or {}
+    local cache_key = library_id .. ":" .. page
+
+    local cached = plugin._abs_page_cache[cache_key]
+    local busy
+    if not cached then
+        busy = InfoMessage:new{
+            text = _("Loading items…"),
+            timeout = 0,
+        }
+        UIManager:show(busy)
+    end
 
     UIManager:scheduleIn(0.1, function()
-        local data, err = client:getLibraryItems(library_id, page_size, page)
-        UIManager:close(busy)
+        local data, err = cached
+        if not data then
+            data, err = client:getLibraryItems(library_id, page_size, page)
+            if busy then UIManager:close(busy) end
+            if data then plugin._abs_page_cache[cache_key] = data end
+        end
 
         if not data then
             UIManager:show(InfoMessage:new{
@@ -482,6 +568,11 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, p
             return
         end
 
+        -- Remember where the user is so re-entering the library (and the
+        -- post-download refresh) returns here instead of page 0.
+        plugin:setSetting("abs_browse_library_id", library_id)
+        plugin:setSetting("abs_browse_page", tostring(page))
+
         -- Load cache to check download status
         local ABSCache
         local pp = plugin.path and (plugin.path .. "/") or "./"
@@ -493,6 +584,25 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, p
         -- Forward declaration so page-turn closures can close over the window.
         local window
         local menu_items = {}
+
+        -- Search entry
+        table.insert(menu_items, {
+            text = _("Search library…"),
+            callback = function()
+                UIManager:close(window)
+                ABSBrowse._showSearchDialog(plugin, client, library_id, library_name, page)
+            end,
+        })
+
+        -- Refresh entry: drop cached pages and reload the current one.
+        table.insert(menu_items, {
+            text = _("Refresh list"),
+            callback = function()
+                plugin._abs_page_cache = {}
+                UIManager:close(window)
+                ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+            end,
+        })
 
         -- Previous page entry
         if page > 0 then
@@ -515,10 +625,15 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, p
             local is_downloaded = cache and cache:isDownloaded(item.id)
             local status_str = is_downloaded and _(" ✓") or ""
 
-            -- Capture item in a factory to avoid Lua 5.1 closure reuse bug
+            -- Capture item in a factory to avoid Lua 5.1 closure reuse bug.
+            -- The refresh callback returns to THIS page after a download so
+            -- the user keeps their place instead of being sent back to page 0.
             local function make_callback(it, downloaded)
                 return function()
-                    ABSBrowse._showItemDetail(plugin, client, it, cache, downloaded)
+                    ABSBrowse._showItemDetail(plugin, client, it, cache, downloaded, function()
+                        UIManager:close(window)
+                        ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+                    end)
                 end
             end
 
@@ -547,66 +662,138 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, p
             height = Screen:getHeight() * 0.75,
         }
 
-        local centered = CenterContainer:new{
-            dimen = Screen:getSize(),
-            menu,
-        }
-
-        window = InputContainer:new{
-            dimen = Screen:getSize(),
-            centered,
-        }
-
-        local menu_w = Screen:getWidth() * 0.85
-        local menu_h = Screen:getHeight() * 0.75
-        local menu_rect = Geom:new{
-            x = math.floor((Screen:getWidth() - menu_w) / 2),
-            y = math.floor((Screen:getHeight() - menu_h) / 2),
-            w = menu_w,
-            h = menu_h,
-        }
-
-        function window:onTap(arg, ges_ev)
-            if ges_ev.pos:notIntersectWith(menu_rect) then
-                UIManager:close(self)
-                return true
-            end
-            return false
-        end
-
-        function window:onSwipe(arg, ges_ev)
-            if ges_ev.pos:notIntersectWith(menu_rect) then
-                UIManager:close(self)
-                return true
-            end
-            -- Drive Menu pagination explicitly and force a full-screen refresh.
-            -- Letting the event propagate sometimes leaves the new page invisible
-            -- on e-ink until the next suspend/resume cycle.
-            local direction = ges_ev.direction
-            if direction == "west" then
-                menu:onNextPage()
-            elseif direction == "east" then
-                menu:onPrevPage()
-            else
-                return false
-            end
-            UIManager:setDirty(nil, "ui")
-            return true
-        end
-
-        menu.close_callback = function()
-            UIManager:close(window)
-        end
-
+        window = ABSBrowse._wrapMenu(menu, 0.75)
         UIManager:show(window)
     end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Library search
+-- ---------------------------------------------------------------------------
+
+--- Prompt for a free-text query and search the library (server-side).
+function ABSBrowse._showSearchDialog(plugin, client, library_id, library_name, page)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = T(_("Search %1"), library_name or _("Library")),
+        input_hint = _("Title, author, or series"),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+                    end,
+                },
+                {
+                    text = _("Search"),
+                    is_enter_default = true,
+                    callback = function()
+                        local query = dialog:getInputText()
+                        UIManager:close(dialog)
+                        if not query or query == "" then
+                            ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+                            return
+                        end
+                        local busy = InfoMessage:new{
+                            text = T(_("Searching for %1…"), query),
+                            timeout = 0,
+                        }
+                        UIManager:show(busy)
+                        UIManager:scheduleIn(0.1, function()
+                            local results, err = client:searchLibrary(library_id, query)
+                            UIManager:close(busy)
+                            if not results or #results == 0 then
+                                UIManager:show(InfoMessage:new{
+                                    text = results and T(_("No results for: %1"), query)
+                                        or (_("Search failed: ") .. (err or _("unknown error"))),
+                                    timeout = 3,
+                                })
+                                ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+                                return
+                            end
+                            ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page)
+                        end)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+--- Render search results (already fetched) as an item list, no network call.
+-- Downloading from here re-renders from the in-memory results, and
+-- "Back to library" returns to the page the search was launched from.
+function ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page)
+    -- Load cache to check download status
+    local ABSCache
+    local pp = plugin.path and (plugin.path .. "/") or "./"
+    pcall(function()
+        ABSCache = dofile(pp .. "abscache.lua")
+    end)
+    local cache = ABSCache and ABSCache:new{ plugin_dir = pp:sub(1, -2) }
+
+    local window
+    local menu_items = {}
+
+    table.insert(menu_items, {
+        text = _("← Back to library"),
+        callback = function()
+            UIManager:close(window)
+            ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+        end,
+    })
+
+    for idx, item in ipairs(results) do
+        local meta = item.media and item.media.metadata or {}
+        local title = meta.title or _("Untitled")
+        local author = meta.authorName or ""
+        local duration = item.media and item.media.duration or 0
+        local dur_str = ABSBrowse._formatDuration(duration)
+
+        local is_downloaded = cache and cache:isDownloaded(item.id)
+        local status_str = is_downloaded and _(" ✓") or ""
+
+        -- Capture item in a factory to avoid Lua 5.1 closure reuse bug.
+        -- The refresh callback re-renders from the in-memory results, so the
+        -- ✓ appears without any network traffic.
+        local function make_callback(it, downloaded)
+            return function()
+                ABSBrowse._showItemDetail(plugin, client, it, cache, downloaded, function()
+                    UIManager:close(window)
+                    ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page)
+                end)
+            end
+        end
+
+        table.insert(menu_items, {
+            text = title .. (author ~= "" and "  — " .. author or "") .. "  (" .. dur_str .. ")" .. status_str,
+            callback = make_callback(item, is_downloaded),
+        })
+    end
+
+    local menu = Menu:new{
+        title = T(_("Search: %1 (%2)"), query, #results),
+        item_table = menu_items,
+        width = Screen:getWidth() * 0.85,
+        height = Screen:getHeight() * 0.75,
+    }
+
+    window = ABSBrowse._wrapMenu(menu, 0.75)
+    UIManager:show(window)
 end
 
 -- ---------------------------------------------------------------------------
 -- Item detail view
 -- ---------------------------------------------------------------------------
 
-function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded)
+function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded, refresh_callback)
+    -- Forward declaration so callbacks can close over the window (closed on
+    -- download so the refreshed library list isn't stacked underneath).
+    local window
     local meta = item.media and item.media.metadata or {}
     local title = meta.title or _("Untitled")
     local author = meta.authorName or ""
@@ -653,11 +840,17 @@ function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded)
             text = btn_text,
             enabled = has_audio_files,
             callback = function()
+                -- Close the detail window before the refresh so the re-opened
+                -- library list isn't stacked underneath a zombie window.
+                local function after_download()
+                    UIManager:close(window)
+                    if refresh_callback then refresh_callback() end
+                end
                 if has_audio_files then
-                    ABSBrowse._downloadItem(plugin, client, item, cache)
+                    ABSBrowse._downloadItem(plugin, client, item, cache, after_download)
                 else
                     -- Fetch full details then try download
-                    ABSBrowse._fetchAndDownload(plugin, client, item, cache)
+                    ABSBrowse._fetchAndDownload(plugin, client, item, cache, after_download)
                 end
             end,
         })
@@ -677,57 +870,7 @@ function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded)
         height = Screen:getHeight() * 0.5,
     }
 
-    local centered = CenterContainer:new{
-        dimen = Screen:getSize(),
-        menu,
-    }
-
-    local window = InputContainer:new{
-        dimen = Screen:getSize(),
-        centered,
-    }
-
-    local menu_w = Screen:getWidth() * 0.85
-    local menu_h = Screen:getHeight() * 0.75
-    local menu_rect = Geom:new{
-        x = math.floor((Screen:getWidth() - menu_w) / 2),
-        y = math.floor((Screen:getHeight() - menu_h) / 2),
-        w = menu_w,
-        h = menu_h,
-    }
-
-    function window:onTap(arg, ges_ev)
-        if ges_ev.pos:notIntersectWith(menu_rect) then
-            UIManager:close(self)
-            return true
-        end
-        return false
-    end
-
-    function window:onSwipe(arg, ges_ev)
-        if ges_ev.pos:notIntersectWith(menu_rect) then
-            UIManager:close(self)
-            return true
-        end
-        -- Drive Menu pagination explicitly and force a full-screen refresh.
-        -- Letting the event propagate sometimes leaves the new page invisible
-        -- on e-ink until the next suspend/resume cycle.
-        local direction = ges_ev.direction
-        if direction == "west" then
-            menu:onNextPage()
-        elseif direction == "east" then
-            menu:onPrevPage()
-        else
-            return false
-        end
-        UIManager:setDirty(nil, "ui")
-        return true
-    end
-
-    menu.close_callback = function()
-        UIManager:close(window)
-    end
-
+    window = ABSBrowse._wrapMenu(menu, 0.5)
     UIManager:show(window)
 end
 
@@ -888,7 +1031,7 @@ end
 Fetch full item details from ABS then start download.
 Used when the lightweight list view does not include audioFiles.
 --]]
-function ABSBrowse._fetchAndDownload(plugin, client, item, cache)
+function ABSBrowse._fetchAndDownload(plugin, client, item, cache, refresh_callback)
     local busy = InfoMessage:new{
         text = T(_("Fetching details for %1…"), item.media and item.media.metadata and item.media.metadata.title or _("item")),
         timeout = 0,
@@ -909,11 +1052,11 @@ function ABSBrowse._fetchAndDownload(plugin, client, item, cache)
 
         -- Merge full details into the lightweight item
         item.media = full_item.media or item.media
-        ABSBrowse._downloadItem(plugin, client, item, cache)
+        ABSBrowse._downloadItem(plugin, client, item, cache, refresh_callback)
     end)
 end
 
-function ABSBrowse._downloadItem(plugin, client, item, cache)
+function ABSBrowse._downloadItem(plugin, client, item, cache, refresh_callback)
     if not cache then
         UIManager:show(InfoMessage:new{
             text = _("Cache manager not available."),
@@ -995,6 +1138,8 @@ function ABSBrowse._downloadItem(plugin, client, item, cache)
                         text = T(_("Downloaded: %1"), item.media.metadata.title or _("item")),
                         timeout = 3,
                     })
+                    -- Return to the page the user came from (not page 0).
+                    if refresh_callback then refresh_callback() end
                 end)
             end)
             return
