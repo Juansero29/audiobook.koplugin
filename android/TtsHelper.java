@@ -104,7 +104,9 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     public void onInit(int status) {
         initStatus = status;
         if (status == TextToSpeech.SUCCESS) {
-            tts.setLanguage(Locale.US);
+            // Do not force Locale.US here: that fights SherpaTTS / other
+            // neural engines until Lua's setLanguage() runs, and can leave
+            // the engine on a mismatched voice.  Lua picks the book locale.
             tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {                @Override
                 public void onStart(String utteranceId) {}
 
@@ -323,10 +325,13 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     // --- Audio focus ---
 
-    /** Speech attributes for short TTS clips (synth-then-play pipeline). */
+    /** Speech attributes for short TTS clips (synth-then-play pipeline).
+     *  USAGE_MEDIA matches SherpaTTS / in-app neural playback.  The
+     *  accessibility stream on some e-readers (Boox) applies extra EQ
+     *  and noise that the engine's own preview does not. */
     private static AudioAttributes speechAttributes() {
         return new AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+            .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build();
     }
@@ -1136,7 +1141,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build();
                 } else {
-                    track = new AudioTrack(AudioManager.STREAM_ACCESSIBILITY,
+                    track = new AudioTrack(AudioManager.STREAM_MUSIC,
                         fmtRate, cfg, AudioFormat.ENCODING_PCM_16BIT,
                         bufSize, AudioTrack.MODE_STREAM);
                 }

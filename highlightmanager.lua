@@ -295,91 +295,45 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         }
     end
 
-    -- Find the sentence in our built text.
-    -- Try exact match first, then progressively shorter prefixes (the
-    -- sentence may wrap across a page boundary so only the tail is
-    -- visible), then try matching from the sentence end (only the
-    -- beginning is visible on the current page).
-    local vis_start = built_text:find(sent_text, 1, true)
-    local matched_len = vis_start and #sent_text
-    if not vis_start then
-        -- Try shorter prefixes: 40, 20, 10 chars
-        for _, plen in ipairs({40, 20, 10}) do
-            if plen < #sent_text then
-                local prefix = sent_text:sub(1, plen)
-                vis_start = built_text:find(prefix, 1, true)
-                if vis_start then
-                    matched_len = #sent_text
+    -- Find the sentence as a contiguous phrase.  Short character prefixes
+    -- (10/20/40) and independent 2-word matches used to paint a span that
+    -- was not the spoken sentence — especially on French pages where "Le "
+    -- / "de la" appear many times.  When only a prefix/suffix is visible
+    -- (page wrap), highlight that phrase, not #sent_text characters from
+    -- a coincidental hit.
+    local vis_start, matched_len
+    do
+        local hit = built_text:find(sent_text, 1, true)
+        if hit then
+            vis_start, matched_len = hit, #sent_text
+        else
+            local words = {}
+            for w in sent_text:gmatch("%S+") do
+                words[#words + 1] = w
+            end
+            local min_words = math.min(4, #words)
+            if min_words < 1 then min_words = #words end
+            -- Longest whole-word prefix still on this page.
+            for n = #words, min_words, -1 do
+                local phrase = table.concat(words, " ", 1, n)
+                hit = built_text:find(phrase, 1, true)
+                if hit then
+                    vis_start, matched_len = hit, #phrase
+                    logger.dbg("HighlightManager: contiguous prefix", n, "words")
                     break
                 end
             end
-        end
-    end
-    if not vis_start then
-        -- Sentence may start on the previous page.  Try matching the
-        -- tail end of the sentence that is visible on this page.
-        for _, slen in ipairs({40, 20, 10}) do
-            if slen < #sent_text then
-                local suffix = sent_text:sub(-slen)
-                local pos = built_text:find(suffix, 1, true)
-                if pos then
-                    -- The visible portion starts at pos, but the sentence
-                    -- logically started earlier.  Highlight from built_text
-                    -- start of that line.
-                    vis_start = pos
-                    matched_len = slen
-                    break
-                end
-            end
-        end
-    end
-    if not vis_start then
-        -- Last resort: word-by-word matching with tolerance.
-        -- On some e-ink readers (especially PW5 at 300dpi), the text
-        -- from getTextFromPositions() may differ from parsed sentence
-        -- text due to hyphenation, font ligatures, or spacing peculiarities.
-        -- Try to find the sentence by matching its first few words.
-        local words = {}
-        for w in sent_text:gmatch("%S+") do
-            table.insert(words, w)
-        end
-        if #words >= 3 then
-            -- Try matching first 3, then 2 words
-            for _, nwords in ipairs({3, 2}) do
-                local prefix = table.concat(words, " ", 1, nwords)
-                local pp = built_text:find(prefix, 1, true)
-                if pp then
-                    vis_start = pp
-                    matched_len = #sent_text
-                    logger.dbg("HighlightManager: found by word prefix (", nwords, "words)")
-                    break
-                end
-            end
-        end
-        if not vis_start and #words >= 3 then
-            -- Try matching last 3, then 2 words
-            for _, nwords in ipairs({3, 2}) do
-                local suffix = table.concat(words, " ", #words - nwords + 1, #words)
-                local pp = built_text:find(suffix, 1, true)
-                if pp then
-                    vis_start = pp
-                    matched_len = nwords > 0 and #built_text - pp + 1 or #sent_text
-                    -- But we need to bound it. Since we only matched the tail,
-                    -- set vis_start to beginning of that line.
-                    if vis_start then
-                        local found_line = 1
-                        for i = 1, n do
-                            if cum[i] >= vis_start then
-                                found_line = i
-                                break
-                            end
-                        end
-                        -- Highlight from start of found line
-                        vis_start = cum[found_line - 1] + 1
-                        matched_len = cum[found_line] - cum[found_line - 1]
-                        logger.dbg("HighlightManager: found by word suffix (", nwords, "words), line", found_line)
+            -- Page-wrap tail: longest whole-word suffix.
+            if not vis_start then
+                local min_suf = (#words <= 3) and 1 or 2
+                for n = #words, min_suf, -1 do
+                    local phrase = table.concat(words, " ", #words - n + 1, #words)
+                    hit = built_text:find(phrase, 1, true)
+                    if hit then
+                        vis_start, matched_len = hit, #phrase
+                        logger.dbg("HighlightManager: contiguous suffix", n, "words")
+                        break
                     end
-                    break
                 end
             end
         end

@@ -1362,13 +1362,61 @@ function TTSEngine:_androidChunkLanguage(text)
 end
 
 --[[--
+Map espeak-ng pitch (0–99, default 50) to Android's setPitch() multiplier.
+50 must be 1.0 (the engine's natural pitch).  The previous linear map
+`0.5 + (p/99)*1.5` sent 50 as ~1.26, which made neural voices (SherpaTTS)
+sound thin, high, and off-gender.
+@param espeak_pitch number|nil
+@return number multiplier in 0.5–2.0
+--]]
+function TTSEngine:_androidPitchMultiplier(espeak_pitch)
+    local p = tonumber(espeak_pitch) or 50
+    return math.max(0.5, math.min(2.0, p / 50))
+end
+
+--[[--
+Package name of the active Android TTS engine, or nil if unknown.
+@return string|nil
+--]]
+function TTSEngine:_androidEnginePackage()
+    local atts = self._android_tts
+    if not atts or not atts.getDefaultEngine then return nil end
+    local ok, pkg = pcall(function() return atts:getDefaultEngine() end)
+    if not ok or type(pkg) ~= "string" then return nil end
+    if pkg == "" or pkg == "pending" or pkg == "not_ready" or pkg == "unknown" then
+        return nil
+    end
+    return pkg
+end
+
+--[[--
+True for neural / ONNX system engines.  Their WAVs are already the voice;
+feeding them through the PCM keep-alive track (issue #44) adds hiss and
+pitch artifacts.  Match known packages rather than treating every
+non-Google engine as neural.
+@return boolean
+--]]
+function TTSEngine:_androidEngineIsNeural()
+    local pkg = (self:_androidEnginePackage() or ""):lower()
+    if pkg == "" then return false end
+    return pkg:find("woheller69", 1, true)
+        or pkg:find("sherpa", 1, true)
+        or pkg:find("rhvoice", 1, true)
+        or pkg:find("piper", 1, true)
+        or pkg:find("k2fsa", 1, true)
+        or pkg:find("k2-fsa", 1, true)
+end
+
+--[[--
 Whether Android playback uses the persistent PCM streamer: the menu
 setting (persisted, default off) or the session-only stall auto-degrade
-(issue #44).  Applied at every pipeline dispatch so mid-session toggles
-and the auto-degrade both take effect from the next sentence.
+(issue #44).  Neural engines never use it — MediaPlayer preserves the
+WAV as synthesized.  Applied at every pipeline dispatch so mid-session
+toggles and the auto-degrade both take effect from the next sentence.
 @return boolean
 --]]
 function TTSEngine:_androidPcmActive()
+    if self:_androidEngineIsNeural() then return false end
     if self._android_pcm_auto then return true end
     return self.plugin and self.plugin:getSetting("android_pcm_stream", false) or false
 end
@@ -1414,17 +1462,16 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     -- Forward rate/pitch settings to the Android engine
     atts:setRate(self.rate or 1.0)
     -- espeak-ng pitch is 0-99 (default 50); Android pitch is a multiplier
-    -- around 1.0.  Map 0-99 to 0.5-2.0 range.
-    local android_pitch = 0.5 + ((self.pitch or 50) / 99) * 1.5
+    -- around 1.0.  Map so 50 → 1.0 (engine default), not ~1.26.
+    local android_pitch = self:_androidPitchMultiplier(self.pitch)
     atts:setPitch(android_pitch)
     -- Playback path: per-sentence MediaPlayer by default, persistent PCM
     -- stream when the user enabled it or a stall was auto-detected (#44).
     atts:setPcmMode(self:_androidPcmActive())
-    -- Language: the Java helper initializes with Locale.US and nothing ever
-    -- changed it, so non-English books were read with the en-US voice or
-    -- stayed silent (issue #45).  Resolve per chunk (manual override > CJK
-    -- script detection > book metadata) and only cross JNI when the
-    -- language actually changes.
+    -- Language: resolve per chunk (manual override > CJK script detection >
+    -- book metadata) and only cross JNI when the language actually changes.
+    -- The Java helper no longer forces Locale.US on init (that fought
+    -- SherpaTTS French / Spanish voices until the first setLanguage).
     -- Time the JNI calls: on some devices the TTS engine's binder calls can
     -- block (issue #44); the timings pinpoint the culprit in logcat.
     local jni_t0 = UIManager:getTime()
@@ -1509,7 +1556,8 @@ function TTSEngine:generateTimingEstimates(text)
     self.timing_data = {}
     local current_time = 0
     local pos = 1
-    local is_piper = self.backend == self.BACKENDS.PIPER
+    local is_neural = self.backend == self.BACKENDS.PIPER
+        or self.backend == self.BACKENDS.ANDROID
     while pos <= #text do
         -- Skip whitespace
         while pos <= #text and text:sub(pos, pos):match("%s") do
@@ -1527,15 +1575,12 @@ function TTSEngine:generateTimingEstimates(text)
         local clean_word = word:gsub("[%p]", "")
         if clean_word ~= "" then
             local duration
-            if is_piper then
-                -- Neural TTS: character-length proportional estimation.
-                -- Piper synthesizes at a fairly uniform rate per character,
-                -- so character count gives better proportional distribution
-                -- than syllable count.  These raw values are later scaled to
-                -- match the real WAV duration — only the ratios matter.
+            if is_neural then
+                -- Neural TTS (Piper, Android/SherpaTTS): character-length
+                -- proportional estimation.  These engines are not syllable-
+                -- timed; character count gives better ratios.  Raw values
+                -- are later scaled to the real WAV duration.
                 duration = math.floor(#clean_word * 80)
-                -- Punctuation after a word causes Piper to insert a natural
-                -- pause — model that for better within-sentence proportions.
                 if word:match("[,;:]$") then
                     duration = duration + 150
                 elseif word:match("[%.%?!]$") then
@@ -1552,7 +1597,7 @@ function TTSEngine:generateTimingEstimates(text)
                 start_time = current_time,
                 end_time = current_time + duration,
             })
-            current_time = current_time + duration + (is_piper and 30 or 50)
+            current_time = current_time + duration + (is_neural and 30 or 50)
         end
     end
     logger.dbg("TTSEngine: Generated timing for", #self.timing_data, "words")
@@ -3064,13 +3109,17 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             poll_count = poll_count + 1
             played_ms = played_ms + 100  -- 0.1 s poll cadence
             local status = atts:getPipelineStatus()
-            if status == 1 and played_ms > dur_ms + 1500 and not pcm_active then
+            local allow_pcm_degrade = not engine:_androidEngineIsNeural()
+            if status == 1 and played_ms > dur_ms + 1500 and not pcm_active
+                and allow_pcm_degrade then
                 -- Stall signature from issue #44: the clip should have
                 -- finished long ago but no completion ever arrives (the
                 -- HAL tore down the MediaPlayer track mid-sentence).
                 -- Switch to the persistent PCM stream for the rest of the
                 -- session and flag the sentence for a replay: the audio
                 -- died with the track, not just its tail.
+                -- Skip for SherpaTTS / other neural engines: PCM keep-alive
+                -- hiss and pitch artifacts are worse than a stalled clip.
                 logger.warn("TTSEngine: Android playback stalled", played_ms,
                     "ms into a", dur_ms, "ms clip with no completion; switching to PCM stream playback for this session (issue #44)")
                 engine._android_pcm_auto = true
@@ -3081,6 +3130,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 return
             end
             if (status == 2 or status == 3) and not pcm_active
+                and allow_pcm_degrade
                 and played_ms >= 100 and played_ms < dur_ms - 800 then
                 -- Mid-clip teardown signature from issue #44: the pipeline
                 -- reported completion (or an error) far before the WAV
