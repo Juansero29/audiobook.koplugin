@@ -163,7 +163,9 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
             end
             return false
         end
-        return self:_highlightSentenceRolling(sentence, parsed_data, doc)
+        -- TTS has no SMIL id. First+last independent word alignment paints
+        -- a span that is not the spoken sentence. Require a contiguous phrase.
+        return self:_highlightSentenceRolling(sentence, parsed_data, doc, nil, true)
     else
         -- PDF / paged mode: use view.highlight.temp
         return self:_highlightSentencePaging(sentence, parsed_data, doc)
@@ -550,6 +552,8 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
     -- hole does not drop the start or end of the visible phrase.
     -- Overlay fallback: NEVER do that — first+last independent matches paint
     -- fragments like "à l'hôtel du roi. La" that are not a SMIL sentence.
+    -- TTS (no fragment_id) also passes contiguous_only so the underline is
+    -- the spoken sentence, not a coincidental first/last word span.
     local sent_words = Utils.splitWords(sent_text)
     local vis_start, vis_end, matched_len
     local first_w, last_w, a, b
