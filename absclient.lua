@@ -244,6 +244,42 @@ function ABSClient:getLibraryItems(library_id, limit, page)
 end
 
 --[[--
+Free-text search within a library (title, author, series).
+Uses GET /api/libraries/{id}/search?q=... — a single request, no pagination.
+@param library_id string
+@param query string
+@return table|nil, string|nil  flat array of library items, error_message
+--]]
+function ABSClient:searchLibrary(library_id, query)
+    if not query or query == "" then
+        return nil, _("Empty search query.")
+    end
+    -- URL-encode the query. Prefer luasocket's socket.url.escape when present;
+    -- fall back to a manual percent-encoder so a missing module never breaks it.
+    local esc = query
+    local ok, urlmod = pcall(require, "socket/url")
+    if ok and urlmod and urlmod.escape then
+        esc = urlmod.escape(query)
+    else
+        esc = query:gsub("([^%w%-_%.~ ])", function(c)
+            return string.format("%%%02X", string.byte(c))
+        end):gsub(" ", "%%20")
+    end
+    local endpoint = string.format("/api/libraries/%s/search?q=%s", library_id, esc)
+    local data, err = self:_request(endpoint)
+    if not data then return nil, err end
+    -- Book libraries key matches under "book", podcast libraries under "podcast".
+    local matches = data.book or data.podcast or {}
+    local items = {}
+    for _, m in ipairs(matches) do
+        if m.libraryItem then
+            table.insert(items, m.libraryItem)
+        end
+    end
+    return items, nil
+end
+
+--[[--
 Get detailed item information.
 @param item_id string
 @return table|nil, string|nil  item_details, error_message
