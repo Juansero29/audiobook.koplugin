@@ -1,0 +1,14 @@
+---
+description: How stradichenko consumes PRs; fork branch roles (master vs master-juan).
+alwaysApply: true
+---
+
+# Fork vs official (audiobook.koplugin)
+
+- `origin` = Juan's fork. `upstream` = `stradichenko/audiobook.koplugin`.
+- `origin/master` tracks official `upstream/master` (fast-forward only).
+- `master-juan` is the Boox + Kindle device branch: official master plus Juan's in-flight work. It is not a PR source onto official master.
+- Gary does not merge large PRs. He cherry-picks/rewrites **one slice** per tag (`refs #N, v0.1.17.xx`), often leaving the PR open. From #62 he already landed highlight fallback (v0.1.17.37) and pin-bar / no live `SetPageMargins` (v0.1.17.38, lock-margins **default off**).
+- PRs to `stradichenko/master` must start from **latest upstream**, contain **only the unpicked slice**, and use opt-in settings default off.
+- After he lands a rewrite, drop that slice from remaining PRs. Do not restack ElevenLabs or TTS chrome on overlay code he already rewrote.
+- Full workflow: `.cursor/skills/stradichenko-upstream-prs/SKILL.md`
