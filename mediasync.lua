@@ -1069,7 +1069,20 @@ function MediaSync:_reserveMiniBarSpace()
     -- Full-screen (non-overlay) player intentionally covers the book.
     if not self.overlay_mode then return end
     if not (self.plugin and self.plugin.ui and self.plugin.ui.rolling) then return end
-    local ui = self.plugin.ui
+    local plugin = self.plugin
+    if plugin._ensureAudiobookChromeMargins then
+        plugin:_ensureAudiobookChromeMargins()
+        self._bar_space_reserved = true
+        -- `obj:_method` without () is a Lua call, not a method lookup.
+        if plugin._audiobookMiniBarPixelHeight then
+            self._reserved_mini_bar_h = plugin:_audiobookMiniBarPixelHeight()
+        else
+            self._reserved_mini_bar_h = self:_miniBarPixelHeight()
+        end
+        return
+    end
+    if self._bar_space_reserved then return end
+    local ui = plugin.ui
     local tp = ui.typeset
     if not (tp and tp.unscaled_margins and ui.document and ui.document.setPageMargins) then
         return
@@ -1132,6 +1145,12 @@ function MediaSync:_reserveMiniBarSpace()
 end
 
 function MediaSync:_releaseMiniBarSpace()
+    if self.plugin and self.plugin._releaseAudiobookChromeMargins then
+        self.plugin:_releaseAudiobookChromeMargins()
+        self._bar_space_reserved = false
+        self._reserved_mini_bar_h = nil
+        return
+    end
     if not self._bar_space_reserved and not (
         self.plugin and self.plugin.ui and self.plugin.ui.doc_settings
         and self.plugin.ui.doc_settings:readSetting("audiobook_overlay_margin_locked")

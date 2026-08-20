@@ -244,7 +244,7 @@ GLOSSARY_FR: list[tuple[str, str]] = [
     ("Audiobook Read-Along", "Audiolivre synchronisé"),
     ("read-along", "lecture synchronisée"),
     ("Read-Along", "Lecture synchronisée"),
-    ("Read aloud from here", "Lire à voix haute à partir d’ici"),
+    ("Read aloud from here (TTS)", "Lire à voix haute à partir d’ici (TTS)"),
     ("read aloud", "lire à voix haute"),
     ("Text-to-Speech", "Synthèse vocale"),
     ("speech rate", "débit de parole"),
@@ -269,7 +269,7 @@ GLOSSARY_ES: list[tuple[str, str]] = [
     ("Audiobook Read-Along", "Audiolibro sincronizado"),
     ("read-along", "lectura sincronizada"),
     ("Read-Along", "Lectura sincronizada"),
-    ("Read aloud from here", "Leer en voz alta desde aquí"),
+    ("Read aloud from here (TTS)", "Leer en voz alta desde aquí (TTS)"),
     ("read aloud", "leer en voz alta"),
     ("Text-to-Speech", "Texto a voz"),
     ("speech rate", "velocidad de habla"),
@@ -441,7 +441,7 @@ def main() -> None:
             "• Génération locale d’alignement phrase/mot à partir d’un EPUB + livre audio\n\n"
             "Utilisation :\n"
             "1. Appui long sur un mot pour ouvrir le dictionnaire\n"
-            "2. Toucher « Lire à voix haute à partir d’ici »\n"
+            "2. Toucher « Lire à voix haute à partir d’ici (TTS) »\n"
             "3. Ou menu Outils → Audiolivre synchronisé\n"
             "4. Pour les fichiers audio : menu Outils → Ouvrir un fichier audio…"
         )
@@ -463,7 +463,7 @@ def main() -> None:
             "• Generación local de alineación de oraciones/palabras a partir de EPUB + audiolibro\n\n"
             "Uso:\n"
             "1. Mantén pulsada una palabra para abrir el diccionario\n"
-            "2. Toca «Leer en voz alta desde aquí»\n"
+            "2. Toca «Leer en voz alta desde aquí (TTS)»\n"
             "3. O menú Herramientas → Audiolibro sincronizado\n"
             "4. Para archivos de audio: menú Herramientas → Abrir archivo de audio…"
         )

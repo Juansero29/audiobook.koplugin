@@ -49,6 +49,7 @@ local PlaybackBar = InputContainer:extend{
     on_close = nil,
     on_realign = nil,
     on_voice = nil,
+    on_tts_settings = nil,
     -- Scrubber mode for audio file playback
     scrubber_mode = false,
     on_seek = nil,
@@ -142,11 +143,11 @@ function PlaybackBar:setupUI()
 
     -- Voice picker (installed TTS voices / HuggingFace languages)
     self.voice_button = Button:new{
-        text = "♪",
+        text = _("TTS"),
         width = button_width,
         max_width = button_width,
         height = button_height,
-        text_font_size = button_font_size,
+        text_font_size = 14,
         callback = function()
             self:onVoice()
         end,
@@ -168,17 +169,20 @@ function PlaybackBar:setupUI()
         show_parent = self,
     }
     
-    -- Current word display (time in scrubber mode, word in TTS mode)
-    local display_text = self.current_word or _("Starting...")
+    -- Time display in scrubber/audiobook mode only.  TTS read-along used
+    -- to paint the current word here on every highlight tick; that raced
+    -- the e-ink refresh, hid a line of the book, and did not help — the
+    -- sentence is already underlined in the page.
+    self.word_display = nil
     if self.scrubber_mode then
-        display_text = self.current_time_str ~= "" and self.current_time_str or "0:00 / 0:00"
+        local display_text = self.current_time_str ~= "" and self.current_time_str or "0:00 / 0:00"
+        self.word_display = TextWidget:new{
+            text = display_text,
+            face = Font:getFace("cfont", 16),
+            max_width = self.width - button_width * 6 - spacing * 8,
+            truncate_left = true,
+        }
     end
-    self.word_display = TextWidget:new{
-        text = display_text,
-        face = Font:getFace("cfont", 16),
-        max_width = self.width - button_width * 6 - spacing * 8,
-        truncate_left = true,
-    }
     
     -- Progress bar — tall enough to be clearly visible on e-ink
     -- In scrubber mode we enlarge the touch target vertically
@@ -231,11 +235,13 @@ function PlaybackBar:setupUI()
     local content = VerticalGroup:new{
         align = "center",
         VerticalSpan:new{ width = Size.padding.small },
-        CenterContainer:new{
+    }
+    if self.word_display then
+        table.insert(content, CenterContainer:new{
             dimen = Geom:new{ w = self.width, h = self.word_display:getSize().h },
             self.word_display,
-        },
-    }
+        })
+    end
     if self._progress_shown then
         table.insert(content, VerticalSpan:new{ width = Size.padding.default })
         table.insert(content, CenterContainer:new{
@@ -314,6 +320,10 @@ function PlaybackBar:onRealign()
 end
 
 function PlaybackBar:onVoice()
+    if self.on_tts_settings then
+        self.on_tts_settings()
+        return
+    end
     if self.on_voice then
         self.on_voice()
         return
@@ -323,7 +333,9 @@ function PlaybackBar:onVoice()
     if not plugin then return end
     local dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
     local ok, MenuBuilder = pcall(dofile, dir .. "menubuilder.lua")
-    if ok and MenuBuilder and MenuBuilder.showVoicePicker then
+    if ok and MenuBuilder and MenuBuilder.showTtsSettingsPicker then
+        MenuBuilder.showTtsSettingsPicker(plugin)
+    elseif ok and MenuBuilder and MenuBuilder.showVoicePicker then
         MenuBuilder.showVoicePicker(plugin)
     end
 end
@@ -345,6 +357,10 @@ function PlaybackBar:updatePlayPauseButton()
 end
 
 function PlaybackBar:updateCurrentWord(word)
+    -- TTS bar does not show live word/sentence text (see setupUI).
+    if not self.word_display or not self.scrubber_mode then
+        return
+    end
     if word and word ~= self.current_word then
         self.current_word = word
         self.word_display:setText(word)
@@ -377,7 +393,7 @@ function PlaybackBar:_formatTime(seconds)
 end
 
 function PlaybackBar:updateTimeDisplay(current_sec, total_sec)
-    if not self.scrubber_mode then return end
+    if not self.scrubber_mode or not self.word_display then return end
     local text = self:_formatTime(current_sec) .. " / " .. self:_formatTime(total_sec)
     if text ~= self.current_time_str then
         self.current_time_str = text
@@ -413,14 +429,13 @@ function PlaybackBar:setScrubberMode(enabled)
     enabled = enabled and true or false
     if self.scrubber_mode == enabled then return end
     self.scrubber_mode = enabled
-    if enabled then
-        self.word_display:setText(self.current_time_str)
-    else
-        self.word_display:setText(self.current_word or _("Starting..."))
+    -- Layout differs (time row vs no text row); rebuild rather than
+    -- painting words into a TTS bar that should stay quiet.
+    if self.visible then
+        self:onSetDimensions()
+        return
     end
-    UIManager:setDirty(self, function()
-        return "ui", self.word_display.dimen
-    end)
+    self:setupUI()
 end
 
 function PlaybackBar:setPlaying(is_playing)
@@ -510,7 +525,9 @@ function PlaybackBar:onSetDimensions()
     self.current_word = word
     self.progress = progress
     self:updatePlayPauseButton()
-    if word and word ~= "" then self.word_display:setText(word) end
+    if self.word_display and word and word ~= "" then
+        self.word_display:setText(word)
+    end
     self.progress_bar:setPercentage(progress / 100)
     -- Re-show at the correct position — this registers the new x,y
     -- with UIManager so paintTo receives the right coordinates.

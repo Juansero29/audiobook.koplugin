@@ -49,7 +49,17 @@ local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
 local Utils = dofile(_utils_dir .. "utils.lua")
 local WavUtils = dofile(_utils_dir .. "wavutils.lua")
 local PiperQueue = dofile(_utils_dir .. "piperqueue.lua")
+local WavQueue = dofile(_utils_dir .. "wavqueue.lua")
 local AndroidTts = dofile(_utils_dir .. "androidtts.lua")
+local ElevenLabs = dofile(_utils_dir .. "elevenlabs.lua")
+
+local function dlog(...)
+    local DL = package.loaded["audiobook_debuglog"]
+    if DL and DL.log then
+        pcall(DL.log, ...)
+    end
+end
+
 local TTSEngine = {
     -- Supported TTS backends
     BACKENDS = {
@@ -58,6 +68,7 @@ local TTSEngine = {
         FLITE = "flite",
         FESTIVAL = "festival",
         ANDROID = "android",
+        ELEVENLABS = "elevenlabs",
         PIPER = "piper",
         KINDLE_NATIVE = "kindle-native",
         NATIVE = "platform-native",
@@ -131,6 +142,7 @@ function TTSEngine:new(o)
     o._prefetch_text = nil
     -- Piper async prefetch queue (extracted module)
     o._piper = PiperQueue:new{engine = o}
+    o._wavq = WavQueue:new{engine = o}
     -- Android TTS wrapper (initialized lazily in detectBackend)
     o._android_tts = nil
     -- Platform-native TTS daemon PID (only used in daemon/FIFO mode)
@@ -475,8 +487,50 @@ Set speech rate.
 @param rate number Rate multiplier (0.5 to 2.0)
 --]]
 function TTSEngine:setRate(rate)
+    local old = self.rate or 1.0
     self.rate = math.max(0.25, math.min(2.0, rate))
     logger.dbg("TTSEngine: Rate set to", self.rate)
+    if self:_usesLocalPlaybackRate() then
+        self:_applyLocalPlaybackSpeed(old)
+    end
+end
+
+--- Cloud / file TTS: synthesize at 1.0×, stretch on the player.
+--- Add new text→WAV services here so they inherit local speech_rate.
+function TTSEngine:_usesLocalPlaybackRate()
+    return self.backend == self.BACKENDS.ELEVENLABS
+end
+
+function TTSEngine:_localPlaybackRate()
+    if not self:_usesLocalPlaybackRate() then return 1.0 end
+    local r = tonumber(self.rate) or 1.0
+    if r < 0.5 then r = 0.5 end
+    if r > 3.0 then r = 3.0 end
+    return r
+end
+
+function TTSEngine:_applyLocalPlaybackSpeed(old_rate)
+    local rate = self:_localPlaybackRate()
+    if self._el_player and self._el_player.setSpeed then
+        pcall(function() self._el_player:setSpeed(rate) end)
+    end
+    local atts = self._android_tts
+    if atts and atts.setPlaybackSpeed then
+        atts:setPlaybackSpeed(rate)
+        -- OEM MediaPlayer can drop isPlaying() for a moment; the WAV
+        -- poller must not treat that as end-of-sentence (page-skip storm).
+        if time.from_ms then
+            self._playback_speed_grace_until = UIManager:getTime() + time.from_ms(800)
+        else
+            self._playback_speed_grace_until = UIManager:getTime() + 0.8
+        end
+    end
+    if self.plugin and self.plugin.sync_controller
+        and self.plugin.sync_controller._reanchorTtsRate then
+        pcall(function()
+            self.plugin.sync_controller:_reanchorTtsRate(old_rate or 1.0, self:_localPlaybackRate())
+        end)
+    end
 end
 --[[--
 Set speech pitch.
@@ -493,6 +547,9 @@ Set speech volume.
 function TTSEngine:setVolume(volume)
     self.volume = math.max(0.0, math.min(1.0, volume))
     logger.dbg("TTSEngine: Volume set to", self.volume)
+    if self._el_player and self._el_player.setVolume then
+        pcall(function() self._el_player:setVolume(self.volume) end)
+    end
 end
 --[[--
 Set the espeak-ng voice/language.
@@ -942,9 +999,18 @@ Synthesize using command-line TTS.
 --]]
 function TTSEngine:synthesizeCommand(text, callback)
     -- Use Android cache dir when running on Android (no /tmp); otherwise /tmp
-    local temp_dir = self._android_tts and self._android_tts:getTempDir() or "/tmp"
+    local temp_dir = "/tmp"
+    if Device:isAndroid() then
+        local atts = self._android_tts or self:_ensureAndroidTts()
+        if atts and atts.getTempDir then
+            temp_dir = atts:getTempDir()
+        else
+            temp_dir = "/sdcard/koreader/cache"
+        end
+    end
     self.file_counter = (self.file_counter or 0) + 1
-    local audio_file = temp_dir .. "/audiobook_tts_" .. os.time() .. "_" .. self.file_counter .. ".wav"
+    local audio_ext = (self.backend == self.BACKENDS.ELEVENLABS) and ".mp3" or ".wav"
+    local audio_file = temp_dir .. "/audiobook_tts_" .. os.time() .. "_" .. self.file_counter .. audio_ext
     local timing_file = temp_dir .. "/audiobook_timing_" .. os.time() .. ".txt"
     local cmd
     -- Limit text length to avoid command line issues and MBROLA phoneme
@@ -1097,6 +1163,8 @@ function TTSEngine:synthesizeCommand(text, callback)
     elseif self.backend == self.BACKENDS.ANDROID then
         -- Android TTS via JNI: synthesize to WAV file asynchronously
         return self:synthesizeAndroid(text, audio_file, callback)
+    elseif self.backend == self.BACKENDS.ELEVENLABS then
+        return self:synthesizeElevenLabs(text, audio_file, callback)
     elseif self.backend == self.BACKENDS.NATIVE then
         -- Platform-native TTS via user-supplied helper binary/script.
         return self:_synthesizeNative(text, audio_file, callback)
@@ -1383,6 +1451,48 @@ function TTSEngine:_androidPitchMultiplier(espeak_pitch)
 end
 
 --[[--
+Friendly label for an Android TTS engine package name.
+@return string|nil
+--]]
+function TTSEngine.androidEngineLabelForPackage(pkg)
+    if type(pkg) ~= "string" or pkg == "" then return nil end
+    if pkg == "pending" then return _("Detecting…") end
+    if pkg == "not_ready" or pkg == "unknown" then return _("Not detected") end
+    local p = pkg:lower()
+    -- VoxSherpa contains "sherpa"; match it before the generic SherpaTTS apps.
+    if p:find("woheller69", 1, true) then return _("SherpaTTS") end
+    if p:find("voxsherpa", 1, true) or p:find("codebysonu", 1, true) then
+        return _("VoxSherpa TTS")
+    end
+    if p:find("k2fsa", 1, true) or p:find("k2-fsa", 1, true)
+        or p:find("sherpa", 1, true) then
+        return _("SherpaTTS")
+    end
+    if p:find("google", 1, true) then return _("Google") end
+    if p:find("samsung", 1, true) then return _("Samsung") end
+    if p:find("pico", 1, true) or p:find("svox", 1, true) then
+        return _("Pico TTS")
+    end
+    if p:find("rhvoice", 1, true) then return _("RHVoice") end
+    if p:find("piper", 1, true) then return _("Piper") end
+    local short = pkg:match("([^.]+)$") or pkg
+    return T(_("Unknown (%1)"), short)
+end
+
+--[[--
+Android's preferred TTS engine, as shown in TTS settings.
+Returns nil when the helper is not initialized yet.
+@return string|nil
+--]]
+function TTSEngine:androidEngineDisplayName()
+    local atts = self._android_tts
+    if not atts or not atts.getDefaultEngine then return nil end
+    local ok, pkg = pcall(function() return atts:getDefaultEngine() end)
+    if not ok or type(pkg) ~= "string" or pkg == "" then return nil end
+    return TTSEngine.androidEngineLabelForPackage(pkg)
+end
+
+--[[--
 Package name of the active Android TTS engine, or nil if unknown.
 @return string|nil
 --]]
@@ -1409,6 +1519,8 @@ function TTSEngine:_androidEngineIsNeural()
     if pkg == "" then return false end
     return pkg:find("woheller69", 1, true)
         or pkg:find("sherpa", 1, true)
+        or pkg:find("voxsherpa", 1, true)
+        or pkg:find("codebysonu", 1, true)
         or pkg:find("rhvoice", 1, true)
         or pkg:find("piper", 1, true)
         or pkg:find("k2fsa", 1, true)
@@ -1460,29 +1572,16 @@ function TTSEngine:_ensureAndroidTts()
     return atts
 end
 
-function TTSEngine:synthesizeAndroid(text, audio_file, callback)
+--- Rate, pitch, voice/language for one Android TTS chunk. Safe to call
+--- before every synthesizeToFile: language/voice JNI only on change.
+function TTSEngine:_androidPrepareEngine(text)
     local atts = self:_ensureAndroidTts()
-    if not atts then
-        logger.err("TTSEngine: Android TTS not initialized")
-        if callback then callback(false, nil) end
-        return false
-    end
-    -- Forward rate/pitch settings to the Android engine
+    if not atts then return nil end
     atts:setRate(self.rate or 1.0)
-    -- espeak-ng pitch is 0-99 (default 50); Android pitch is a multiplier
-    -- around 1.0.  Map so 50 → 1.0 (engine default), not ~1.26.
-    local android_pitch = self:_androidPitchMultiplier(self.pitch)
-    atts:setPitch(android_pitch)
-    -- Playback path: per-sentence MediaPlayer by default, persistent PCM
-    -- stream when the user enabled it or a stall was auto-detected (#44).
+    atts:setPitch(self:_androidPitchMultiplier(self.pitch))
+    -- Neural WAVs play through MediaPlayer; PCM keep-alive hiss/pitch
+    -- artifacts are worse than a stall on SherpaTTS / VoxSherpa.
     atts:setPcmMode(self:_androidPcmActive())
-    -- Language: resolve per chunk (manual override > CJK script detection >
-    -- book metadata) and only cross JNI when the language actually changes.
-    -- The Java helper no longer forces Locale.US on init (that fought
-    -- SherpaTTS French / Spanish voices until the first setLanguage).
-    -- Time the JNI calls: on some devices the TTS engine's binder calls can
-    -- block (issue #44); the timings pinpoint the culprit in logcat.
-    local jni_t0 = UIManager:getTime()
     local chunk_lang = self:_androidChunkLanguage(text)
     local voice_name = self.plugin
         and self.plugin:getSetting("android_tts_voice", "")
@@ -1495,7 +1594,6 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
                 self._android_tts_voice = voice_name
                 self._android_tts_lang = "voice:" .. voice_name
             else
-                -- Voice name unknown to this engine; fall back to language.
                 self._android_tts_voice = false
                 logger.warn("TTSEngine: Android TTS setVoice failed for", voice_name)
             end
@@ -1506,82 +1604,486 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
         self._android_tts_voice = nil
         logger.dbg("TTSEngine: Android TTS language =", chunk_lang, "result:", res)
         if res and res < 0 and not self._android_lang_warned then
-            -- LANG_MISSING_DATA / LANG_NOT_SUPPORTED: voice data not
-            -- installed for this language in the system TTS engine.
             self._android_lang_warned = true
             logger.err("TTSEngine: Android TTS setLanguage(", chunk_lang,
                 ") failed, code:", res)
             UIManager:show(InfoMessage:new{
-                text = T(_("Android TTS: no voice available for %1.\nInstall the matching voice data in Android's Text-to-speech settings, or pick a different language in Voice settings."), chunk_lang),
+                text = T(_("Android TTS: no voice available for %1.\nInstall the matching voice data in Android's Text-to-speech settings, or pick a different language in TTS settings."), chunk_lang),
                 timeout = 8,
             })
         end
     end
-    logger.dbg("TTSEngine: Android TTS pipeline for:", text:sub(1, 60))
-    -- Dispatch synth-then-play pipeline.  The Java side synthesizes the
-    -- WAV and starts MediaPlayer automatically, without needing a Lua
-    -- round-trip between synthesis and playback.  This keeps audio going
-    -- even when the Lua event loop is throttled (app backgrounded).
-    local dispatch = atts:synthesizeAndPlay(text, audio_file)
-    -- Right after lazy init / setLanguage the engine can still report
-    -- not-ready (-1).  Brief retries beat skipping the first sentences.
-    if dispatch == -1 then
-        for _ = 1, 8 do
-            os.execute("usleep 50000")
-            dispatch = atts:synthesizeAndPlay(text, audio_file)
-            if dispatch == 0 then break end
-        end
-    end
-    local jni_ms = time.to_ms(UIManager:getTime() - jni_t0)
-    if jni_ms > 300 then
-        logger.warn("TTSEngine: Android TTS JNI calls blocked for", jni_ms, "ms")
-    else
-        logger.dbg("TTSEngine: Android TTS JNI calls took", jni_ms, "ms")
-    end
-    if dispatch ~= 0 then
-        logger.err("TTSEngine: Android TTS pipeline dispatch failed, code:", dispatch)
+    return atts
+end
+
+function TTSEngine:synthesizeAndroid(text, audio_file, callback)
+    local atts = self:_androidPrepareEngine(text)
+    if not atts then
+        logger.err("TTSEngine: Android TTS not initialized")
         if callback then callback(false, nil) end
         return false
     end
-    -- Poll for the pipeline to reach "playing" status.
-    -- The synth-to-play transition happens in Java, so even if these polls
-    -- are delayed (backgrounded), playback will have started on its own.
-    local engine = self
-    self._android_synth_gen = (self._android_synth_gen or 0) + 1
-    local my_gen = self._android_synth_gen
-    local poll_count = 0
-    local max_polls = 120  -- 60 seconds max (120 x 0.5s)
-    local function pollPipelineReady()
-        -- Stale poll guard: another synthesis was dispatched
-        if (engine._android_synth_gen or 0) ~= my_gen then return end
-        poll_count = poll_count + 1
-        local status = atts:getPipelineStatus()
-        if status == 1 or status == 2 then
-            -- Pipeline is playing (or already finished if Lua was slow).
-            -- Get the real duration from the pipeline.
-            local dur_ms = atts:getPipelineDurationMs()
-            engine._android_pipeline_duration_ms = dur_ms
-            engine.current_audio_file = audio_file
-            engine:generateTimingEstimates(text)
-            logger.dbg("TTSEngine: Android pipeline playing, duration:", dur_ms, "ms")
-            if callback then
-                callback(true, engine.timing_data)
-            end
-        elseif status == 3 then
-            logger.err("TTSEngine: Android TTS pipeline error")
-            if callback then callback(false, nil) end
-        elseif poll_count < max_polls then
-            UIManager:scheduleIn(0.5, pollPipelineReady)
-        else
-            logger.err("TTSEngine: Android TTS pipeline timed out after", max_polls * 0.5, "s")
-            atts:stopPipeline()
-            if callback then callback(false, nil) end
-        end
+    -- System TTS: speak() like Readest / TalkBack. WAV+MediaPlayer plus
+    -- lookahead synthesizeToFile used the same engine and skipped sentences.
+    if atts.hasLiveSpeak and atts:hasLiveSpeak() then
+        self:generateTimingEstimates(text)
+        self._android_speak_text = text
+        self._android_live_pending = true
+        self.current_audio_file = "android-live-speak"
+        self._play_existing_wav = false
+        dlog("tts-android", "live-speak-prep")
+        if callback then callback(true, self.timing_data) end
+        return true
     end
-    UIManager:scheduleIn(0.3, pollPipelineReady)
-    -- Return nil to signal async (same convention as Piper)
+    -- Synth-to-file + MediaPlayer, same lookahead as ElevenLabs.
+    -- synthesizeAndPlay used to share onDone/synthStatus with prefetch,
+    -- so the next sentence was marked ready with an empty WAV (loops /
+    -- skipped sentences on VoxSherpa).
+    -- Front of the queue: never wait behind 4–5 lookahead sentences.
+    self._wavq:enqueue(text, audio_file, { front = true })
+    local engine = self
+    local polls = 0
+    local missing = 0
+    -- Kokoro / other neural engines can take well over a minute on e-ink.
+    local max_polls = self:_androidEngineIsNeural() and 800 or 200
+    dlog("tts-android", "wait", "neural", self:_androidEngineIsNeural() and 1 or 0)
+    local function waitReady()
+        local st = engine._wavq:status(text)
+        if st == "ready" then
+            local path, timing, dur = engine._wavq:useReady(text)
+            engine.current_audio_file = path
+            engine.timing_data = timing
+            engine._current_audio_duration_ms = dur
+            engine._play_existing_wav = true
+            dlog("tts-android", "ready", "dur_ms", dur or 0, "wait_s",
+                math.floor(polls * 0.15))
+            if callback then callback(true, engine.timing_data) end
+            return
+        elseif st == "failed" then
+            logger.err("TTSEngine: Android TTS synthesis failed")
+            dlog("tts-android", "error")
+            if callback then callback(false, nil) end
+            return
+        elseif not st then
+            -- Page-turn clean() can briefly wipe the queue around enqueue.
+            missing = missing + 1
+            if missing > 8 then
+                logger.err("TTSEngine: Android TTS synthesis failed")
+                dlog("tts-android", "error")
+                if callback then callback(false, nil) end
+                return
+            end
+        else
+            missing = 0
+        end
+        polls = polls + 1
+        if polls > max_polls then
+            logger.err("TTSEngine: Android TTS synthesis timed out")
+            dlog("tts-android", "timeout")
+            engine._android_synth_timeout = true
+            if callback then callback(false, nil) end
+            return
+        end
+        UIManager:scheduleIn(0.15, waitReady)
+    end
+    UIManager:scheduleIn(0.05, waitReady)
     return nil
 end
+
+--[[--
+ElevenLabs cloud TTS: HTTPS POST → MP3, then AndroidPlayer (same JNI
+MediaPlayer as Storyteller overlay).  Runs after a short delay so a
+"please wait" toast can paint; the request itself is blocking on the Lua thread.
+--]]
+function TTSEngine:synthesizeElevenLabs(text, audio_file, callback)
+    local key = self.plugin and self.plugin:getSetting("elevenlabs_api_key", "") or ""
+    if key == "" then
+        logger.err("TTSEngine: ElevenLabs API key is not set")
+        UIManager:show(InfoMessage:new{
+            text = _("ElevenLabs API key is not set.\nOpen Tools → Audiobook → TTS settings to paste it."),
+            timeout = 8,
+        })
+        if callback then callback(false, nil) end
+        return false
+    end
+    -- Enqueue on the background WAV queue (Java HTTPS, up to 3 in parallel)
+    -- and wait for this sentence.  Lookahead sentences are filled by prefetch().
+    self._wavq:enqueue(text, audio_file, { front = true })
+    local engine = self
+    local polls = 0
+    local missing = 0
+    local function waitReady()
+        local st = engine._wavq:status(text)
+        if st == "ready" then
+            local path, timing, dur = engine._wavq:useReady(text)
+            engine.current_audio_file = path
+            engine.timing_data = timing
+            engine._current_audio_duration_ms = dur
+            if type(text) == "string" and #text > 0 then
+                engine._eleven_prev_text = text:sub(math.max(1, #text - 400))
+            end
+            dlog("tts-elevenlabs", "ok", "bytes", engine:getFileSize(path) or 0)
+            if callback then callback(true, engine.timing_data) end
+            return
+        elseif st == "failed" then
+            local err = ""
+            local atts = engine._android_tts
+            if atts and atts.getHttpLastError then
+                err = atts:getHttpLastError() or ""
+            end
+            logger.err("TTSEngine: ElevenLabs synthesis failed:", err)
+            dlog("tts-elevenlabs", "error", tostring(err))
+            UIManager:show(InfoMessage:new{
+                text = T(_("ElevenLabs TTS failed: %1"), tostring(err ~= "" and err or "error")),
+                timeout = 5,
+            })
+            if callback then callback(false, nil) end
+            return
+        elseif not st then
+            missing = missing + 1
+            if missing > 8 then
+                logger.err("TTSEngine: ElevenLabs synthesis failed: missing")
+                dlog("tts-elevenlabs", "error", "missing")
+                if callback then callback(false, nil) end
+                return
+            end
+        else
+            missing = 0
+        end
+        polls = polls + 1
+        if polls > 200 then
+            logger.err("TTSEngine: ElevenLabs synthesis timed out")
+            if callback then callback(false, nil) end
+            return
+        end
+        UIManager:scheduleIn(0.15, waitReady)
+    end
+    UIManager:scheduleIn(0.05, waitReady)
+    return nil
+end
+
+--[[--
+Speak one sentence through Android TextToSpeech.speak() and wait for onDone.
+No WAV file, no duration guess — the engine itself says when it finished.
+--]]
+function TTSEngine:_androidSpeakLive()
+    local atts = self._android_tts or self:_ensureAndroidTts()
+    local text = self._android_speak_text
+    if not atts or not atts.hasLiveSpeak or not atts:hasLiveSpeak()
+            or not text or text == "" then
+        self.is_speaking = false
+        return false
+    end
+    self:_stopElPlayer()
+    self._concat_durations = nil
+    self.play_generation = (self.play_generation or 0) + 1
+    local my_gen = self.play_generation
+    self.playback_latency_ms = 0
+    self._expected_play_duration_ms = nil
+    self._android_early_death = nil
+    if self._androidPrepareEngine and not self._android_live_session then
+        self:_androidPrepareEngine(text)
+        self._android_live_session = true
+    end
+    local dispatched = atts:speakText(text)
+    if dispatched ~= 0 then
+        logger.err("TTSEngine: speakText failed")
+        self.is_speaking = false
+        return false
+    end
+    self._audio_launched_at = UIManager:getTime()
+    self:startTimingLoop()
+    dlog("tts-android", "live-speak")
+    local engine = self
+    local polls = 0
+    local function pollSpeak()
+        if (engine.play_generation or 0) ~= my_gen then return end
+        if not engine.is_speaking then return end
+        if engine.is_paused then
+            UIManager:scheduleIn(0.05, pollSpeak)
+            return
+        end
+        polls = polls + 1
+        local st = atts.getSpeakStatus and atts:getSpeakStatus() or -1
+        if st == 1 then
+            dlog("tts-android", "live-end", "polls", polls)
+            engine:onPlaybackComplete()
+            return
+        elseif st == 2 then
+            dlog("tts-android", "live-error")
+            engine.is_speaking = false
+            if engine.on_fail_callback then
+                engine.on_fail_callback()
+            end
+            return
+        end
+        -- Safety cap ~10 min for a stuck engine
+        if polls > 12000 then
+            dlog("tts-android", "live-timeout")
+            engine:onPlaybackComplete()
+            return
+        end
+        UIManager:scheduleIn(0.05, pollSpeak)
+    end
+    UIManager:scheduleIn(0.05, pollSpeak)
+    return true
+end
+
+--[[--
+JNI MediaPlayer used by Storyteller overlay.  TtsHelper's dex MediaPlayer
+is silent on Boox; this path is the one that actually produces sound.
+--]]
+function TTSEngine:_ensureElPlayer()
+    if self._el_player then return self._el_player end
+    if not (Device.isAndroid and Device:isAndroid()) then return nil end
+    -- Same MediaPlayer instance as Storyteller overlay (one HAL output).
+    local me = self.plugin and self.plugin.media_engine
+    if me and me._ensureAndroidPlayer then
+        local shared = me:_ensureAndroidPlayer()
+        if shared then
+            self._el_player = shared
+            logger.warn("TTSEngine: ElevenLabs sharing overlay AndroidPlayer")
+            return shared
+        end
+    end
+    local plugin_dir = Utils.normalizeDirPath(self.plugin_dir or ".")
+    local ok, AndroidPlayer = pcall(dofile, plugin_dir .. "/androidplayer.lua")
+    if not ok or not AndroidPlayer then
+        logger.err("TTSEngine: androidplayer.lua failed:", AndroidPlayer)
+        return nil
+    end
+    local player = AndroidPlayer:new()
+    if player:init() then
+        self._el_player = player
+        logger.warn("TTSEngine: ElevenLabs playback via AndroidPlayer")
+        return player
+    end
+    return nil
+end
+
+function TTSEngine:_stopElPlayer()
+    if self._el_player then
+        pcall(function() self._el_player:stop() end)
+    end
+end
+
+--- Play a local MP3/WAV through AndroidPlayer. Stops TtsHelper first.
+-- @return boolean
+function TTSEngine:playClipFile(path)
+    if not path then return false end
+    if self._android_tts then
+        pcall(function()
+            if self._android_tts.stopSpeak then
+                self._android_tts:stopSpeak()
+            end
+            if self._android_tts.stopPlayback then
+                self._android_tts:stopPlayback()
+            end
+        end)
+    end
+    -- Re-take MediaSession focus that speak() stole.
+    pcall(function()
+        if self.plugin and self.plugin.notifyAudioPlaying then
+            self.plugin:notifyAudioPlaying()
+        end
+    end)
+    local player = self:_ensureElPlayer()
+    if not player then return false end
+    player:setSpeed(self:_localPlaybackRate())
+    player:setVolume(self.volume or 1.0)
+    local ok = player:play(path, 0)
+    if ok then
+        dlog("tts-elevenlabs", "androidplayer", "dur_ms", player:getDurationMs() or 0,
+            "focus", (player._has_focus and 1) or 0)
+    else
+        logger.err("TTSEngine: AndroidPlayer.play failed")
+        dlog("tts-elevenlabs", "androidplayer-fail")
+    end
+    return ok
+end
+
+--[[--
+Play a file already on disk.  ElevenLabs uses AndroidPlayer (Storyteller).
+System TTS WAV leftovers still use TtsHelper.
+@return boolean
+--]]
+function TTSEngine:_androidPlayExistingWav()
+    if self.backend == self.BACKENDS.ELEVENLABS then
+        return self:_androidPlayViaPlayer()
+    end
+    local atts = self._android_tts or self:_ensureAndroidTts()
+    if not atts then
+        logger.err("TTSEngine: Android helper not available to play ElevenLabs WAV")
+        self.is_speaking = false
+        return false
+    end
+    local path = self.current_audio_file
+    if not path then
+        self.is_speaking = false
+        return false
+    end
+    self._concat_durations = nil
+    self.play_generation = (self.play_generation or 0) + 1
+    local my_gen = self.play_generation
+    self.playback_latency_ms = 0
+    local dur_ms = self._current_audio_duration_ms
+        or WavUtils.getDurationMs(path)
+        or 5000
+    local rate = self:_localPlaybackRate()
+    if atts.setPlaybackSpeed then
+        atts:setPlaybackSpeed(rate)
+    end
+    local wall_ms = (rate > 0.01) and math.floor(dur_ms / rate + 0.5) or dur_ms
+    self._expected_play_duration_ms = wall_ms
+    self._android_early_death = nil
+    local dispatched
+    if atts.playMediaFile then
+        dispatched = atts:playMediaFile(path)
+    else
+        dispatched = atts:playFile(path)
+    end
+    if dispatched == -1 then
+        logger.err("TTSEngine: playFile failed for ElevenLabs WAV")
+        self.is_speaking = false
+        return false
+    end
+    self._audio_launched_at = UIManager:getTime()
+    self:startTimingLoop()
+    local engine = self
+    local poll_count = 0
+    local seen_play = false
+    -- Do not floor at 30s: short VoxSherpa clips used to loop until this
+    -- timeout while the highlight stayed on the same sentence.
+    local max_polls = math.max(25, math.floor((wall_ms or 0) / 80) + 20)
+    local short_clip = (wall_ms or 0) < 2500
+    -- Boox flickers isPlaybackDone ~400ms in. Finish on WAV wall-clock;
+    -- do not treat OEM "done" as real until the clip is almost over.
+    local need_ms = math.max(400, math.floor((wall_ms or 0) * 0.96))
+    if short_clip then
+        need_ms = math.max(300, math.floor((wall_ms or 0) * 0.90))
+    end
+    dlog("tts-android", "play", "dur_ms", dur_ms or 0, "wall_ms", wall_ms or 0)
+    local function pollDone()
+        if (engine.play_generation or 0) ~= my_gen then return end
+        if not engine.is_speaking then return end
+        if engine.is_paused then
+            UIManager:scheduleIn(0.3, pollDone)
+            return
+        end
+        poll_count = poll_count + 1
+        if atts:isPlaying() then
+            seen_play = true
+        end
+        local elapsed = 0
+        if engine._audio_launched_at then
+            elapsed = time.to_ms(UIManager:getTime() - engine._audio_launched_at)
+        end
+        local grace = engine._playback_speed_grace_until
+        local in_grace = grace and UIManager:getTime() < grace
+        local oem_done = atts:isPlaybackDone()
+            or (seen_play and not atts:isPlaying())
+        if in_grace then
+            UIManager:scheduleIn(0.1, pollDone)
+        elseif elapsed >= (wall_ms or 0) + 250 then
+            dlog("tts-android", "play-end", "elapsed_ms", elapsed,
+                "wall_ms", wall_ms or 0)
+            engine:onPlaybackComplete()
+        elseif elapsed >= need_ms and oem_done then
+            dlog("tts-android", "play-done", "elapsed_ms", elapsed,
+                "wall_ms", wall_ms or 0)
+            engine:onPlaybackComplete()
+        elseif poll_count >= max_polls then
+            logger.warn("TTSEngine: Android WAV playback poll timed out")
+            dlog("tts-android", "play-timeout", "elapsed_ms", elapsed, "wall_ms", wall_ms or 0)
+            atts:stopPlayback()
+            engine:onPlaybackComplete()
+        else
+            UIManager:scheduleIn(0.1, pollDone)
+        end
+    end
+    UIManager:scheduleIn(0.15, pollDone)
+    return true
+end
+
+function TTSEngine:_androidPlayViaPlayer()
+    local path = self.current_audio_file
+    if not path then
+        self.is_speaking = false
+        return false
+    end
+    self._concat_durations = nil
+    self.play_generation = (self.play_generation or 0) + 1
+    local my_gen = self.play_generation
+    self.playback_latency_ms = 0
+    self._android_early_death = nil
+    if not self:playClipFile(path) then
+        logger.err("TTSEngine: AndroidPlayer failed for ElevenLabs clip")
+        self.is_speaking = false
+        return false
+    end
+    local player = self._el_player
+    local dur_ms = (player and player.getDurationMs and player:getDurationMs()) or 0
+    if dur_ms <= 0 then
+        dur_ms = self._current_audio_duration_ms
+            or ElevenLabs.guessDurationMs(path)
+            or 5000
+    else
+        self._current_audio_duration_ms = dur_ms
+        if self.timing_data and #self.timing_data > 0 then
+            local estimated_total = self.timing_data[#self.timing_data].end_time
+            if estimated_total and estimated_total > 0 then
+                local scale = dur_ms / estimated_total
+                for _, t in ipairs(self.timing_data) do
+                    t.start_time = math.floor(t.start_time * scale)
+                    t.end_time = math.floor(t.end_time * scale)
+                end
+            end
+        end
+    end
+    local rate = self:_localPlaybackRate()
+    local wall_ms = (rate > 0.01) and math.floor(dur_ms / rate + 0.5) or dur_ms
+    self._expected_play_duration_ms = wall_ms
+    self._audio_launched_at = UIManager:getTime()
+    self:startTimingLoop()
+    dlog("tts-android", "play", "via", "androidplayer", "dur_ms", dur_ms or 0,
+        "wall_ms", wall_ms or 0)
+    local engine = self
+    local poll_count = 0
+    local max_polls = math.max(40, math.floor((wall_ms or 0) / 80) + 30)
+    local function pollDone()
+        if (engine.play_generation or 0) ~= my_gen then return end
+        if not engine.is_speaking then return end
+        if engine.is_paused then
+            UIManager:scheduleIn(0.2, pollDone)
+            return
+        end
+        poll_count = poll_count + 1
+        local elapsed = 0
+        if engine._audio_launched_at then
+            elapsed = time.to_ms(UIManager:getTime() - engine._audio_launched_at)
+        end
+        if player and player.isPlaybackDone and player:isPlaybackDone() then
+            dlog("tts-android", "play-end", "via", "androidplayer",
+                "elapsed_ms", elapsed, "wall_ms", wall_ms or 0)
+            engine:onPlaybackComplete()
+        elseif elapsed >= (wall_ms or 0) + 800 then
+            dlog("tts-android", "play-end", "via", "androidplayer-wall",
+                "elapsed_ms", elapsed, "wall_ms", wall_ms or 0)
+            engine:onPlaybackComplete()
+        elseif poll_count >= max_polls then
+            logger.warn("TTSEngine: AndroidPlayer poll timed out")
+            dlog("tts-android", "play-timeout", "via", "androidplayer",
+                "elapsed_ms", elapsed, "wall_ms", wall_ms or 0)
+            engine:_stopElPlayer()
+            engine:onPlaybackComplete()
+        else
+            UIManager:scheduleIn(0.1, pollDone)
+        end
+    end
+    UIManager:scheduleIn(0.15, pollDone)
+    return true
+end
+
 --[[--
 Generate timing estimates for words in text.
 @param text string The text being spoken
@@ -1592,6 +2094,7 @@ function TTSEngine:generateTimingEstimates(text)
     local pos = 1
     local is_neural = self.backend == self.BACKENDS.PIPER
         or self.backend == self.BACKENDS.ANDROID
+        or self.backend == self.BACKENDS.ELEVENLABS
     while pos <= #text do
         -- Skip whitespace
         while pos <= #text and text:sub(pos, pos):match("%s") do
@@ -1776,13 +2279,20 @@ function TTSEngine:prefetch(text, use_espeak)
     if not self.backend or not text or text == "" then
         return false
     end
-    -- Android TTS: skip prefetch.  synthesizeAndroid() is async, but
-    -- prefetch() assumes synchronous completion (save/restore of
-    -- current_audio_file).  The async callback overwrites current_audio_file,
-    -- then cleanup() deletes the prefetched WAV, breaking the chain.
-    -- Android TTS synthesis is fast enough that prefetching isn't needed.
+    -- Android / ElevenLabs: async WAV lookahead (Java HTTP or TTS worker).
+    -- System TTS live speak() cannot prefetch: synthesizeToFile would
+    -- tts.stop() the sentence currently being spoken.
     if self.backend == self.BACKENDS.ANDROID then
-        return false
+        if self._android_tts and self._android_tts.hasLiveSpeak
+                and self._android_tts:hasLiveSpeak() then
+            return false
+        end
+        self._wavq:enqueue(text)
+        return true
+    end
+    if self.backend == self.BACKENDS.ELEVENLABS then
+        self._wavq:enqueue(text)
+        return true
     end
     -- Piper: delegate to the async queue-based prefetcher
     if self.backend == self.BACKENDS.PIPER and not use_espeak then
@@ -1833,6 +2343,21 @@ Check if prefetched audio matches the given text and swap it in.
 @return boolean true if prefetch was used
 --]]
 function TTSEngine:usePrefetched(text)
+    -- WAV lookahead (Android TTS / ElevenLabs)
+    if self._wavq then
+        local path, timing, dur = self._wavq:useReady(text)
+        if path then
+            if self.current_audio_file and self.current_audio_file ~= path then
+                os.remove(self.current_audio_file)
+            end
+            self.current_audio_file = path
+            self.timing_data = timing
+            self._current_audio_duration_ms = dur
+            self._play_existing_wav = true
+            logger.dbg("TTSEngine: Using queued WAV")
+            return true
+        end
+    end
     -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         if self.current_audio_file then
@@ -1869,6 +2394,10 @@ _cleanPrefetch() when the file is no longer needed.
 @return number      Duration in ms
 --]]
 function TTSEngine:peekPrefetch(text)
+    if self._wavq then
+        local path, timing, dur = self._wavq:peek(text)
+        if path then return path, timing, dur end
+    end
     -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         local dur = self:getWavDurationMs(self._prefetch_file)
@@ -1881,6 +2410,10 @@ end
 Diagnostic: return a summary string of the Piper prefetch queue state.
 @return string  e.g. "queued=3 pending=2 ready=1 failed=0"
 --]]
+function TTSEngine:getWavPrefetchStatus(text)
+    if not self._wavq then return nil end
+    return self._wavq:status(text)
+end
 function TTSEngine:getPiperQueueSnapshot()
     return self._piper:getSnapshot()
 end
@@ -1903,6 +2436,37 @@ function TTSEngine:generateSilenceWav(duration_ms)
     return WavUtils.generateSilence(nil, duration_ms)
 end
 --[[--
+Drop lookahead WAVs so the next sentence is synthesized with the
+current ElevenLabs voice (and not a previously queued clip).
+--]]
+function TTSEngine:invalidateQueuedAudio()
+    self._eleven_prev_text = nil
+    self:_cleanPrefetch()
+end
+
+--- Stop the in-flight clip without tearing down the TTS session, so a
+--- voice-preview can use AndroidPlayer.  Bumps play_generation so the
+--- sentence poller cannot treat the preview as end-of-sentence.
+function TTSEngine:beginVoicePreview()
+    self.play_generation = (self.play_generation or 0) + 1
+    self.is_speaking = false
+    self._android_live_pending = false
+    self._android_speak_text = nil
+    self._android_live_session = nil
+    self:_stopElPlayer()
+    if self._android_tts then
+        pcall(function()
+            if self._android_tts.stopSpeak then
+                self._android_tts:stopSpeak()
+            end
+            if self._android_tts.stopPlayback then
+                self._android_tts:stopPlayback()
+            end
+        end)
+    end
+end
+
+--[[--
 Clean up prefetch state.
 --]]
 function TTSEngine:_cleanPrefetch()
@@ -1917,6 +2481,7 @@ function TTSEngine:_cleanPrefetch()
     self._prefetch_in_use = false
     -- Clean Piper async queue
     self._piper:cleanQueue()
+    if self._wavq then self._wavq:clean() end
 end
 -- Persistent BT pipeline retry and error handling.
 -- These limit how often we retry the pipeline, prevent rapid retry loops
@@ -1998,9 +2563,10 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     local t0 = UIManager:getTime()
     -- Register the TTS audio file with the session recorder, if active.
     if self.plugin and self.plugin.session_recorder and self.current_audio_file then
-        local is_real_wav = self.current_audio_file ~= "/tmp/.kindle_native_tts"
-            and self.current_audio_file:match("%.wav$")
-        if is_real_wav then
+        local is_real_audio = self.current_audio_file ~= "/tmp/.kindle_native_tts"
+            and (self.current_audio_file:match("%.wav$")
+                or self.current_audio_file:match("%.mp3$"))
+        if is_real_audio then
             self.plugin.session_recorder:registerAudioFile(self.current_audio_file, "tts")
         end
     end
@@ -2011,6 +2577,15 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     end
     logger.dbg("TTSEngine: play() called, audio_file=", self.current_audio_file,
         "is_speaking=", self.is_speaking)
+    if self._android_live_pending then
+        self.on_word_callback = on_word
+        self.on_complete_callback = on_complete
+        self.on_fail_callback = on_fail
+        self.is_speaking = true
+        self.is_paused = false
+        self._android_live_pending = false
+        return self:_androidSpeakLive()
+    end
     if not self.current_audio_file then
         logger.err("TTSEngine: No audio file to play")
         UIManager:show(InfoMessage:new{
@@ -3095,9 +3670,16 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         end
     end
     -- === ANDROID MEDIAPLAYER PATH ===
-    -- Audio is already playing via the synthesizeAndPlay pipeline.
-    -- We just need to set up word-timing and poll for completion.
+    -- ElevenLabs: AndroidPlayer (Storyteller JNI). System TTS live speak
+    -- is handled earlier; leftover WAVs still go through this file path.
+    -- (Do not use synthesizeAndPlay: it races lookahead onDone.)
     if self.audio_player_type == "android" then
+        if self.backend == self.BACKENDS.ELEVENLABS
+            or self.backend == self.BACKENDS.ANDROID
+            or self._play_existing_wav then
+            self._play_existing_wav = false
+            return self:_androidPlayExistingWav()
+        end
         local atts = self._android_tts or self:_ensureAndroidTts()
         if not atts then
             logger.err("TTSEngine: Android TTS helper not available for playback")
@@ -3401,7 +3983,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                                 engine:cleanup()
                                 local msg
                                 if engine._no_real_audio_output then
-                                    msg = _("Kindle audio playback failed.\n\nThis Kindle model's GStreamer installation cannot decode audio files (no wavparse plugin). Audio may work if:\n\n1. You have connected Bluetooth headphones via Kindle Settings\n2. VoiceView is enabled (Settings > Accessibility > VoiceView)\n3. You switch to espeak TTS backend (Audiobook > Voice settings > TTS engine)\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on GitHub.")
+                                    msg = _("Kindle audio playback failed.\n\nThis Kindle model's GStreamer installation cannot decode audio files (no wavparse plugin). Audio may work if:\n\n1. You have connected Bluetooth headphones via Kindle Settings\n2. VoiceView is enabled (Settings > Accessibility > VoiceView)\n3. You switch to espeak TTS backend (Audiobook > TTS settings > TTS engine)\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on GitHub.")
                                 else
                                     msg = _("Kindle audio playback failed.\n\nThe playermgr service accepted commands but audio never started.\n\nPossible causes:\n1. GStreamer cannot find the wavparse plugin on this firmware\n2. audiomgrd denied audio focus to the plugin\n3. No audio sink is configured (built-in speaker absent, BT not connected)\n\nTry: Connect Bluetooth headphones via Kindle Settings first, then start read-along.\n\nIf this persists, please generate a bug report (Audiobook > Generate bug report) and share it on GitHub.")
                                 end
@@ -3656,7 +4238,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                     else
                         msg = msg .. "."
                     end
-                    msg = msg .. _("\n\nThis is often a system library compatibility issue. Try connecting Bluetooth headphones via Kindle Settings, switch to the espeak backend (Tools → Audiobook → Voice settings → TTS engine), or generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.")
+                    msg = msg .. _("\n\nThis is often a system library compatibility issue. Try connecting Bluetooth headphones via Kindle Settings, switch to the espeak backend (Tools → Audiobook → TTS settings → TTS engine), or generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.")
                     UIManager:show(InfoMessage:new{
                         text = msg,
                         timeout = 12,
@@ -5543,7 +6125,11 @@ Get actual audio duration from the current WAV file.
 @return number Duration in milliseconds, or 0 on error
 --]]
 function TTSEngine:getAudioDurationMs()
-    return self:getWavDurationMs(self.current_audio_file)
+    local path = self.current_audio_file
+    if not path then return 0 end
+    local wav = self:getWavDurationMs(path) or 0
+    if wav > 0 then return wav end
+    return ElevenLabs.guessDurationMs(path) or 0
 end
 
 --[[--
@@ -6411,9 +6997,15 @@ function TTSEngine:pause()
     if self.is_speaking and not self.is_paused then
         self.is_paused = true
         self.pause_time = UIManager:getTime()
-        -- Android: pause via MediaPlayer API
-        if self.audio_player_type == "android" and self._android_tts then
-            self._android_tts:pausePlayback()
+        -- Android: pause via AndroidPlayer (ElevenLabs) or TtsHelper
+        if self.backend == self.BACKENDS.ELEVENLABS and self._el_player then
+            self._el_player:pause()
+        elseif self.audio_player_type == "android" and self._android_tts then
+            if self._android_speak_text and self._android_tts.stopSpeak then
+                self._android_tts:stopSpeak()
+            else
+                self._android_tts:pausePlayback()
+            end
         -- PocketBook InkView: no direct pause API; audio plays to natural
         -- end but word-highlighting and sentence advance are suspended.
         elseif self.audio_player_type == "pb-inkview" then
@@ -6455,9 +7047,16 @@ function TTSEngine:resume()
         -- Accumulate total pause time so the completion timer knows how
         -- much real playback time has actually elapsed.
         self._total_pause_ms = (self._total_pause_ms or 0) + pause_ms
-        -- Android: resume via MediaPlayer API
-        if self.audio_player_type == "android" and self._android_tts then
-            self._android_tts:resumePlayback()
+        -- Android: resume via AndroidPlayer (ElevenLabs) or TtsHelper
+        if self.backend == self.BACKENDS.ELEVENLABS and self._el_player then
+            self._el_player:resume()
+        elseif self.audio_player_type == "android" and self._android_tts then
+            if self._android_speak_text and self._android_tts.hasLiveSpeak
+                    and self._android_tts:hasLiveSpeak() then
+                self:_androidSpeakLive()
+            else
+                self._android_tts:resumePlayback()
+            end
         -- PocketBook InkView: no direct resume API; timing loop resumes
         -- automatically when is_paused is cleared above.
         elseif self.audio_player_type == "pb-inkview" then
@@ -6515,8 +7114,15 @@ function TTSEngine:stop()
     end
 
     -- Stop Android pipeline/MediaPlayer if active
+    self:_stopElPlayer()
     if self.audio_player_type == "android" and self._android_tts then
+        if self._android_tts.stopSpeak then
+            self._android_tts:stopSpeak()
+        end
         self._android_tts:stopPipeline()
+        self._android_live_pending = false
+        self._android_speak_text = nil
+        self._android_live_session = nil
     end
 
     -- Stop PocketBook InkView player: play a zero-length path to halt
@@ -6611,6 +7217,7 @@ function TTSEngine:forceKillAll()
         self._pending_launch_fn = nil
     end
     -- Shut down Android TTS engine and MediaPlayer
+    self:_stopElPlayer()
     if self._android_tts then
         self._android_tts:shutdown()
         self._android_tts = nil
@@ -6731,6 +7338,22 @@ function TTSEngine:setBackend(backend)
     self._cached_player = nil
     self.audio_player_type = nil
     self._native_tts_text = nil
+    -- Live Android speak() holds the speaker. Leaving it on made ElevenLabs
+    -- WAV playback (and voice previews) silent.
+    self._android_live_pending = false
+    self._android_speak_text = nil
+    self._android_live_session = nil
+    self:_stopElPlayer()
+    if self._android_tts then
+        pcall(function()
+            if self._android_tts.stopSpeak then
+                self._android_tts:stopSpeak()
+            end
+            if self._android_tts.stopPlayback then
+                self._android_tts:stopPlayback()
+            end
+        end)
+    end
     logger.dbg("TTSEngine: Backend switched to", backend)
     -- Restore correct backend_cmd for the selected backend
     if backend == self.BACKENDS.PIPER then
@@ -6748,6 +7371,8 @@ function TTSEngine:setBackend(backend)
         end
     elseif backend == self.BACKENDS.NATIVE then
         self.backend_cmd = self.plugin:getSetting("native_helper_path") or ""
+    elseif backend == self.BACKENDS.ELEVENLABS then
+        self.backend_cmd = nil
     end
 end
 

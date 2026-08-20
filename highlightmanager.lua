@@ -82,6 +82,8 @@ function HighlightManager:new(o)
     -- limit the next e-ink refresh to the changed strip.
     o._last_boxes = nil
     o._last_boxes_page = nil
+    o._pending_view_page = nil
+    o._pending_view_pos = nil
 
     return o
 end
@@ -107,6 +109,41 @@ function HighlightManager:_refreshHighlight(new_boxes, page)
         boxesUnionRegion(arrays))
     self._last_boxes = new_boxes
     self._last_boxes_page = page
+end
+
+--- Remember the document view the current overlay boxes belong to.
+function HighlightManager:_captureViewForBoxes()
+    local page, pos
+    pcall(function()
+        local doc = self.ui and self.ui.document
+        if not doc then return end
+        page = doc:getCurrentPage()
+        if doc.getCurrentPos then pos = doc:getCurrentPos() end
+    end)
+    self._pending_view_page = page
+    self._pending_view_pos = pos
+end
+
+--- False when the user (or auto-advance) has moved to another page/view,
+--- so screen-coordinate boxes would stamp the underline in the wrong place.
+function HighlightManager:_boxesMatchCurrentView()
+    if not self._pending_boxes then return false end
+    local page, pos
+    pcall(function()
+        local doc = self.ui and self.ui.document
+        if not doc then return end
+        page = doc:getCurrentPage()
+        if doc.getCurrentPos then pos = doc:getCurrentPos() end
+    end)
+    if self._pending_view_page ~= nil and page ~= nil
+        and page ~= self._pending_view_page then
+        return false
+    end
+    if self._pending_view_pos ~= nil and pos ~= nil
+        and math.abs(pos - self._pending_view_pos) > 24 then
+        return false
+    end
+    return true
 end
 
 function HighlightManager:setStyle(style)
@@ -139,6 +176,8 @@ function HighlightManager:highlightSentence(sentence, parsed_data)
     -- otherwise a sentence that is not visible on the current page would
     -- leave stale boxes that get mirrored at the wrong x,y.
     self._pending_boxes = nil
+    self._pending_view_page = nil
+    self._pending_view_pos = nil
     self.is_highlighting = false
 
     local doc = self.ui.document
@@ -428,6 +467,7 @@ function HighlightManager:_highlightByFragmentId(doc, fragment_id, sentence)
     self._pending_boxes = nil
     if self.current_style ~= self.STYLES.INVERT then
         self._pending_boxes = boxes
+        self:_captureViewForBoxes()
         self:_ensureViewModule()
         pcall(function() doc:clearSelection() end)
         self._selection_active = false
@@ -487,13 +527,15 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         sboxes     = cache.sboxes
         n          = cache.n
     else
-        -- Build fresh line map (expensive path — N document calls)
-        local full_res = doc:getTextFromPositions(
+        -- Build fresh line map (expensive path — N document calls).
+        -- Crop the mini-player strip so words hidden under it are not treated
+        -- as on-screen (that clipped the visible last word and delayed page follow).
+        local ok_full, full_res = pcall(doc.getTextFromPositions, doc,
             {x = 0, y = 0},
             {x = cur_w, y = crop_h},
             true
         )
-        if not full_res or not full_res.pos0 or not full_res.pos1 then
+        if not ok_full or not full_res or not full_res.pos0 or not full_res.pos1 then
             return
         end
 
@@ -507,12 +549,12 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
         local pad = 8
         for i = 1, n do
             local box = sboxes[i]
-            local r = doc:getTextFromPositions(
+            local ok_line, r = pcall(doc.getTextFromPositions, doc,
                 {x = math.max(0, box.x - pad), y = box.y + math.floor(box.h / 2)},
                 {x = math.min(cur_w - 1, box.x + box.w - 1 + pad),
                  y = box.y + math.floor(box.h / 2)},
                 true)
-            line_texts[i] = (r and r.text) and Utils.normalizeForMatching(r.text) or ""
+            line_texts[i] = (ok_line and r and r.text) and Utils.normalizeForMatching(r.text) or ""
         end
         local full_norm = Utils.normalizeForMatching(full_res.text or "")
         built_text = ""
@@ -671,8 +713,10 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
 
     -- ── Helper: query CRe selection (no-draw) ────────────────────
     local function querySelection(sx, sy, ex, ey)
-        local r = doc:getTextFromPositions({x = sx, y = sy}, {x = ex, y = ey}, true)
-        return r and r.text and Utils.normalizeForMatching(r.text) or ""
+        local ok, r = pcall(doc.getTextFromPositions, doc,
+            {x = sx, y = sy}, {x = ex, y = ey}, true)
+        if not ok or not r or not r.text then return "" end
+        return Utils.normalizeForMatching(r.text)
     end
 
     local start_y = sb.y + math.floor(sb.h / 2)
@@ -827,6 +871,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc, 
     end
     if #boxes > 0 then
         self._pending_boxes = boxes
+        self:_captureViewForBoxes()
         self:_ensureViewModule()
         self.is_highlighting = true
         self:_refreshHighlight(boxes, cur_page)
@@ -858,6 +903,13 @@ Paints highlight rectangles for all styles (including invert).
 function HighlightManager:_paintOverlay(bb, _x, _y)
     local boxes = self._pending_boxes
     if not boxes or #boxes == 0 then return end
+    if not self:_boxesMatchCurrentView() then
+        -- Page (or scroll) moved; do not stamp the old x,y on the new view.
+        self._pending_boxes = nil
+        self._pending_view_page = nil
+        self._pending_view_pos = nil
+        return
+    end
     if not bb then return end
     local style = self.current_style
     local line_w = Screen:scaleBySize(2)
@@ -923,8 +975,11 @@ function HighlightManager:clearHighlights()
         pcall(function() self.ui.document:clearSelection() end)
         self._selection_active = false
     end
+    local had_boxes = self._pending_boxes ~= nil
     self._pending_boxes = nil
-    if self.is_highlighting then
+    self._pending_view_page = nil
+    self._pending_view_pos = nil
+    if self.is_highlighting or had_boxes then
         -- Refresh only the strip where the highlight was drawn.
         self:_refreshHighlight(nil, self._last_boxes_page)
     end

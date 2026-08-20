@@ -292,10 +292,10 @@ function AudiobookPlayer:setupUI()
     table.insert(top_row_items, HorizontalSpan:new{ width = math.floor(spacing / 2) })
     if self.tts_mode then
         self.settings_button = Button:new{
-            text = "⚙",
+            text = _("TTS"),
             width = button_size,
             height = button_size,
-            text_font_size = 20,
+            text_font_size = 14,
             callback = function() self:onTtsSettings() end,
             bordersize = 0,
             show_parent = self,
@@ -638,6 +638,15 @@ function AudiobookPlayer:setupUI()
             bordersize = 0,
             show_parent = self,
         }
+        self._mini_tts = Button:new{
+            text = _("TTS"),
+            width = mini_btn_size,
+            height = mini_btn_size,
+            text_font_size = 11,
+            callback = function() self:onTtsSettings() end,
+            bordersize = 0,
+            show_parent = self,
+        }
         self._mini_sleep = Button:new{
             text = self:_formatSleepTimerText(self._sleep_timer_remaining, self._sleep_timer_active),
             width = mini_btn_size,
@@ -647,9 +656,11 @@ function AudiobookPlayer:setupUI()
             bordersize = 0,
             show_parent = self,
         }
-        center_max_width = center_max_width - (mini_btn_size + spacing) * 2
+        center_max_width = center_max_width - (mini_btn_size + spacing) * 3
         nudge_group = {
             self._mini_speed,
+            HorizontalSpan:new{ width = spacing },
+            self._mini_tts,
             HorizontalSpan:new{ width = spacing },
             self._mini_sleep,
             HorizontalSpan:new{ width = spacing },
@@ -782,6 +793,8 @@ function AudiobookPlayer:setupUI()
         nudge_group[2] or HorizontalSpan:new{ width = 0 },
         nudge_group[3] or HorizontalSpan:new{ width = 0 },
         nudge_group[4] or HorizontalSpan:new{ width = 0 },
+        nudge_group[5] or HorizontalSpan:new{ width = 0 },
+        nudge_group[6] or HorizontalSpan:new{ width = 0 },
         HorizontalSpan:new{ width = spacing },
         refocus_group[1] or HorizontalSpan:new{ width = 0 },
         refocus_group[2] or HorizontalSpan:new{ width = 0 },
@@ -1678,6 +1691,11 @@ function AudiobookPlayer:handleEvent(event)
                     if self._mini_speed
                         and self:_isTapOnWidget(ges.pos, self._mini_speed) then
                         self:onSpeed()
+                        return true
+                    end
+                    if self._mini_tts
+                        and self:_isTapOnWidget(ges.pos, self._mini_tts) then
+                        self:onTtsSettings()
                         return true
                     end
                     if self._mini_sleep

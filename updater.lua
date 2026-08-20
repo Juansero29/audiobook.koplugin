@@ -35,6 +35,8 @@ local CRITICAL_FILES = {
     "downloader.lua",
     "mediaaligner.lua",
     "ttsengine.lua",
+    "elevenlabs.lua",
+    "wavqueue.lua",
     "synccontroller.lua",
     "menubuilder.lua",
     "bugreport.lua",
