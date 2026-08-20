@@ -41,6 +41,7 @@ Text-to-speech for [KOReader](https://github.com/koreader/koreader) with synchro
 * [Audio] Play music files (MP3, FLAC, OGG, and more)
 * [Books] Play audiobooks with scrubber seek, chapter navigation, and sleep timer
 * [Audiobookshelf] Browse, download, and sync playback progress with an [Audiobookshelf](https://www.audiobookshelf.org/) server (see [setup guide](docs/AUDIOBOOKSHELF.md))!
+* [ElevenLabs] Optional cloud TTS (Wi-Fi) for high-quality narration on Android (see [setup and API key permissions](docs/ELEVENLABS.md))
 * [Sync] Storyteller compatibility; EPUB 3 Media Overlays support (work in progress)
 
 ## Audiobookshelf integration
@@ -83,7 +84,7 @@ If `opkg` is unavailable, grab the `.ipk` from [nickel-packages](https://github.
 
 **Linux** -- `sudo apt install espeak-ng`
 
-**Android (Boox, etc.)** -- the pre-built release includes `tts_helper.dex`, which bridges to the **device's system TTS engine** (Google, Samsung, SherpaTTS, …). The bundled Piper / espeak-ng binaries and the HuggingFace `.onnx` voices in `piper/` **do not run on Android**. For natural neural voices, install [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) and set it as the default engine — full walkthrough: [High-quality voices on Android](#high-quality-voices-on-android-sherpatts).
+**Android (Boox, etc.)** -- the pre-built release includes `tts_helper.dex`, which bridges to the **device's system TTS engine** (Google, Samsung, SherpaTTS, …). The bundled Piper / espeak-ng binaries and the HuggingFace `.onnx` voices in `piper/` **do not run on Android**. For natural neural voices, either install [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) as the default engine ([walkthrough](#high-quality-voices-on-android-sherpatts)) or use **ElevenLabs** over Wi-Fi ([API key permissions](docs/ELEVENLABS.md)).
 
 If you cloned the repo instead of downloading a release, build the `.dex` manually (requires Android SDK):
 
@@ -246,6 +247,8 @@ audiobook.koplugin/
   benchmarkrunner.lua  - in-plugin TTS benchmark runner
   wavutils.lua         - WAV file reading, writing, and manipulation
   androidtts.lua       - Android TTS via JNI (DexClassLoader + TtsHelper)
+  elevenlabs.lua       - ElevenLabs cloud TTS (HTTPS → MP3; key never logged)
+  wavqueue.lua         - lookahead queue for Android TTS and ElevenLabs
   utils.lua            - shared helpers
   wav-play.c           - minimal ALSA WAV player for PocketBook (compiled to wav-play/wav-play)
 ```
@@ -269,7 +272,8 @@ audiobook.koplugin/
 | No audio player found (Kindle) | Pair BT headphones via the Kindle top-swipe menu **before** starting playback. If already paired, restart KOReader so the plugin re-detects the audio output. |
 | No TTS engine found | Install espeak-ng (see Quick start). |
 | No TTS engine found (Android) | Ensure `android/tts_helper.dex` is present inside the plugin folder. The pre-built release includes it; if you cloned from source, run `./build-dex.sh` in the `android/` directory. The device must also have a TTS engine installed (most do by default). See [Android support](#android-support). |
-| Android TTS is robotic / not my SherpaTTS voice | SherpaTTS is installed but is **not** Android's preferred TTS engine. The plugin always uses the system default. Follow [High-quality voices on Android](#high-quality-voices-on-android-sherpatts), then fully quit KOReader and reopen it. |
+| Android TTS is robotic / not my SherpaTTS voice | SherpaTTS is installed but is **not** Android's preferred TTS engine. The plugin always uses the system default. Follow [High-quality voices on Android](#high-quality-voices-on-android-sherpatts), then fully quit KOReader and reopen it. For cloud quality instead, use [ElevenLabs](docs/ELEVENLABS.md) (Wi-Fi + restricted API key). |
+| ElevenLabs: `missing_permissions` | Restricted API key is missing **Text to Speech**, **Voices (Write)**, **Voice generation**, **Forced alignment**, or **Models**. See [docs/ELEVENLABS.md](docs/ELEVENLABS.md). |
 | Android TTS is high / noisy / not the SherpaTTS in-app voice | Plugin pitch must stay at the default (50). Turn **off** **Android: persistent audio stream**. Fully quit KOReader after changing the system TTS engine or language. See [Android support](#android-support). |
 | Android underline does not match the spoken sentence | Android TTS has no word timestamps; the plugin now underlines the spoken sentence as a contiguous phrase instead of a short coincidental prefix. Fully quit KOReader after updating the plugin. |
 | BT audio silent | Restart KOReader to kill orphan pipelines. Check BT is paired in the plugin menu. |
@@ -454,7 +458,7 @@ Android TTS is supported via a JNI bridge to the device's **system** `TextToSpee
 | Android system TTS | ![Works](https://img.shields.io/badge/-works-brightgreen) Via JNI bridge to `TextToSpeech` API |
 | Audio playback | ![Works](https://img.shields.io/badge/-works-brightgreen) Via Android `MediaPlayer` |
 | Bundled espeak-ng / Piper / HuggingFace `.onnx` | ![No](https://img.shields.io/badge/-not%20supported-red) Linux/glibc binaries — use SherpaTTS instead |
-| High-quality neural voices | ![Works](https://img.shields.io/badge/-works-brightgreen) Via a system engine such as [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) |
+| High-quality neural voices | ![Works](https://img.shields.io/badge/-works-brightgreen) [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) (offline) or [ElevenLabs](docs/ELEVENLABS.md) (Wi-Fi) |
 
 ### Setup
 
@@ -484,6 +488,20 @@ For the full technical analysis, see [docs/ANDROID_TTS.md](docs/ANDROID_TTS.md).
 - Word timing is estimated (Android TTS does not provide per-word callbacks when synthesizing to file). The plugin underlines the spoken sentence as a contiguous phrase instead of chasing estimated word boxes.
 - First sentence may have a brief delay while the TTS engine initializes
 - The plugin uses whatever engine Android has as **preferred TTS**. Installing SherpaTTS is not enough until you set it as that preferred engine.
+
+### ElevenLabs cloud TTS (Wi-Fi)
+
+On Android, **Tools → Audiobook → TTS settings → ElevenLabs** uses the ElevenLabs HTTP API for studio-quality speech. Wi-Fi is required for every sentence.
+
+Create the key under **Developers → API keys**. Prefer a **restricted** key (do not uncheck **Restrict key** / *Restreindre la clé* unless you accept the leak risk). Grant:
+
+- **Text to Speech** (*Text To Speech*)
+- **Voices** (*Voix*) → **Write** (*Écriture*) — needed to add a public-library voice to the account
+- **Voice generation** (*Génération de voix*)
+- **Forced alignment** (*Alignement forcé*)
+- **Models** (*Modèles*)
+
+Paste the key in the plugin only (it is never committed or copied into bug reports). Full steps, why each permission exists, and troubleshooting: [docs/ELEVENLABS.md](docs/ELEVENLABS.md).
 
 ### High-quality voices on Android (SherpaTTS)
 
