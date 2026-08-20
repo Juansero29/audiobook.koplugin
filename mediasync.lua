@@ -622,7 +622,9 @@ end
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
-function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position)
+--- @param opts table|nil  { prepare_only = true } arms SMIL + bar without audio
+function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist_files, original_path, start_position, opts)
+    opts = opts or {}
     if self.state == self.STATE.PLAYING or self.state == self.STATE.PAUSED then
         -- Soft stop: keep A2DP keepalive + player UI across playlist file changes.
         -- A hard stop was killing track-advance keepalive and hiding the bar,
@@ -743,10 +745,29 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     self:showPlaybackBar()
     -- Reflow page so book text ends above the mini player (never covered).
     self:_reserveMiniBarSpace()
+    self:_refreshPlaybackTimeUi()
 
-    -- Resume from saved position on initial start, if any.
-    if self._start_position and self._start_position > 0 then
-        self.media_engine._seek_offset = self._start_position
+    -- Resume position before the first paint, so the bar shows current/total
+    -- instead of 0:00 / 0:00, and a prepare_only Play continues from the mark.
+    local resume_pos = tonumber(self._start_position) or 0
+    if resume_pos > 0 then
+        self.media_engine._seek_offset = resume_pos
+        self.media_engine._paused_position = resume_pos
+    else
+        resume_pos = self.media_engine._seek_offset or 0
+        self.media_engine._paused_position = resume_pos
+    end
+
+    -- Arm SMIL + highlight without starting audio (book open / pinned overlay).
+    -- Play then continues from _seek_offset instead of prompting.
+    if opts.prepare_only then
+        self._start_position = nil
+        self.state = self.STATE.STOPPED
+        if self.playback_bar and self.playback_bar.setPlaying then
+            pcall(function() self.playback_bar:setPlaying(false) end)
+        end
+        logger.warn("MediaSync: prepared overlay session at", resume_pos)
+        return true
     end
 
     local gen = self._chain_generation
@@ -775,9 +796,11 @@ end
 
 --- @param keep_chapter_menu boolean|nil
 --- @param opts table|nil  { track_transition = true } spares A2DP keepalive and player UI
+---                        { drop_chrome = true } hides the bar (document close, TTS takeover)
 function MediaSync:stop(keep_chapter_menu, opts)
     opts = opts or {}
     local track_transition = opts.track_transition and true or false
+    local drop_chrome = opts.drop_chrome and true or false
     local was_playing = self.state ~= self.STATE.STOPPED
     self.state = self.STATE.STOPPED
     self._chain_generation = self._chain_generation + 1
@@ -803,14 +826,30 @@ function MediaSync:stop(keep_chapter_menu, opts)
         pcall(function() self.highlight_manager:clearHighlights() end)
     end
     if not track_transition then
-        if self.playback_bar then
-            pcall(function() self.playback_bar:hide() end)
+        local keep_bar = self:_shouldKeepOverlayBar() and not drop_chrome
+        if keep_bar then
+            -- Leave the mini player and reserved margins in place so CRE
+            -- does not reflow the book on the next play (Android ANR).
+            if self.playback_bar and self.playback_bar.setPlaying then
+                pcall(function() self.playback_bar:setPlaying(false) end)
+            end
+        else
+            if self.playback_bar then
+                pcall(function() self.playback_bar:hide() end)
+                self.playback_bar = nil
+            end
+            if self.plugin and self.plugin._hideReturnToReadAloudButton then
+                pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
+            end
+            -- Document close with the locked layout keeps the sidecar inset
+            -- (restoring it would reflow on every KOReader exit); any other
+            -- hard stop restores margins as before.
+            if not (drop_chrome and self:_shouldKeepOverlayBar()) then
+                self:_releaseMiniBarSpace()
+            else
+                self._bar_space_reserved = false
+            end
         end
-        if self.plugin and self.plugin._hideReturnToReadAloudButton then
-            pcall(function() self.plugin:_hideReturnToReadAloudButton() end)
-        end
-        -- Restore page margins only on hard stop (keep reservation across tracks).
-        self:_releaseMiniBarSpace()
     end
     if not keep_chapter_menu then
         if self._chapter_menu_window then
@@ -842,14 +881,201 @@ function MediaSync:_readerFooterHeight()
     return 0
 end
 
+--- Keep the mini bar on screen after playback stops (default: off).
+function MediaSync:_shouldKeepOverlayBar()
+    if not self.overlay_mode then return false end
+    if not (self.plugin and self.plugin.getSetting) then return false end
+    return self.plugin:getSetting("keep_media_overlay_bar", false)
+end
+
+--- Write the overlay inset into KOReader's own copt_b_page_margin so the
+--- next open typesets with it (no SetPageMargins, no CRE reflow). Default: off.
+function MediaSync:_shouldLockKoreaderMargins()
+    if not (self.plugin and self.plugin.getSetting) then return false end
+    return self.plugin:getSetting("lock_koreader_page_margins", false)
+        and self.plugin:getSetting("keep_media_overlay_bar", false)
+end
+
+--- Show the minimized overlay chrome and reserve bottom margin without
+--- starting audio, so a SMIL book does not reflow on every play/stop.
+function MediaSync:pinOverlayChrome()
+    self.overlay_mode = true
+    self:showPlaybackBar()
+    if self.playback_bar and self.playback_bar.setPlaying then
+        pcall(function() self.playback_bar:setPlaying(false) end)
+    end
+    -- Without the sidecar lock, still reserve the strip for this session so
+    -- the pinned bar never covers book text.
+    if self:_shouldKeepOverlayBar() then
+        self:_reserveMiniBarSpace()
+    end
+    self:_refreshPlaybackTimeUi()
+end
+
+--- Push current / total time (and scrubber) to the mini bar without playing.
+--- Overlay mode shows SMIL chapter time, not the raw audio-file clock.
+function MediaSync:_refreshPlaybackTimeUi()
+    if not self.playback_bar then return end
+    local pos = 0
+    if self.media_engine then
+        local ok, p = pcall(function() return self.media_engine:getPosition() end)
+        if ok and p then pos = p end
+        if not pos or pos <= 0 then
+            pos = tonumber(self.media_engine._paused_position)
+                or tonumber(self.media_engine._seek_offset)
+                or tonumber(self._start_position)
+                or 0
+        end
+    end
+    local dur = 0
+    if self.media_engine then
+        local ok, d = pcall(function() return self.media_engine:getDuration() end)
+        if ok and d then dur = d end
+    end
+    local bar_pos, bar_dur = pos, dur
+    if self.overlay_mode then
+        local ch_pos, ch_dur = self:_overlayChapterProgress(pos)
+        if ch_pos and ch_dur and ch_dur > 0 then
+            bar_pos, bar_dur = ch_pos, ch_dur
+        end
+    end
+    pcall(function()
+        self.playback_bar:updateTimeDisplay(bar_pos or 0, bar_dur or 0)
+        if bar_dur and bar_dur > 0 then
+            local pct = math.floor(((bar_pos or 0) / bar_dur) * 100)
+            if pct < 0 then pct = 0 end
+            if pct > 100 then pct = 100 end
+            self._last_progress_pct = pct
+            self.playback_bar:updateProgress(pct)
+        end
+    end)
+    self:_refreshPlaybackBarTitles()
+    dlog("overlay time ui", "pos=", bar_pos, "dur=", bar_dur, "file_pos=", pos)
+end
+
+--- KOReader "Overlap status bar": when true, CRE does not add the footer
+--- height to the bottom margin itself.
+function MediaSync:_footerReclaimsHeight()
+    local ui = self.plugin and self.plugin.ui
+    local footer = ui and ui.view and ui.view.footer
+    return footer and footer.reclaim_height and true or false
+end
+
+--- Sit the mini player above KOReader's footer so neither covers book text.
+--- True when the user keeps status bars, or when Overlap status bar is off
+--- (the footer is a real page footer, not a temporary overlay).
+function MediaSync:_miniBarAboveFooter()
+    if self.plugin and self.plugin.getSetting
+        and self.plugin:getSetting("keep_reader_status_bars", false) then
+        return true
+    end
+    local ui = self.plugin and self.plugin.ui
+    local view = ui and ui.view
+    if not (view and view.footer_visible and view.footer) then return false end
+    return not view.footer.reclaim_height
+end
+
+function MediaSync:_unscalePx(px)
+    px = tonumber(px) or 0
+    if Screen.unscaleBySize then
+        return Screen:unscaleBySize(px)
+    end
+    local dpi = Screen:getDPI() or 167
+    return math.max(1, math.floor(px * 167 / dpi + 0.5))
+end
+
+function MediaSync:_miniBarPixelHeight()
+    -- Use the painted strip height, not FrameContainer:getSize() — that can
+    -- grow with wrapped title text while paintTo still clips to _mini_height.
+    local bar = self.playback_bar
+    local bar_h = bar and tonumber(bar._mini_height)
+    if not bar_h or bar_h <= 0 then
+        bar_h = Screen:scaleBySize(44)
+    end
+    return bar_h
+end
+
+--- Bottom inset (unscaled units) that keeps CRE text above the mini player:
+--- the bar height plus, when we sit above a reclaiming footer, the footer
+--- height ReaderTypeset will not add itself. The user's original bottom
+--- margin is deliberately not carried over (that empty band sat between the
+--- last line and the overlay).
+function MediaSync:_overlayBarExtraUnscaled(bar_h)
+    local extra = self:_unscalePx(bar_h)
+    if self:_miniBarAboveFooter() and self:_footerReclaimsHeight() then
+        extra = extra + self:_unscalePx(self:_readerFooterHeight())
+    end
+    return extra
+end
+
+function MediaSync:_docConfigurable()
+    local ui = self.plugin and self.plugin.ui
+    if not ui then return nil end
+    -- ReaderUI has no .configurable; CRE options live on the document
+    -- (and are aliased onto typeset / rolling).
+    return ui.configurable
+        or (ui.document and ui.document.configurable)
+        or (ui.typeset and ui.typeset.configurable)
+end
+
+function MediaSync:_persistBottomMargin(unscaled_bottom, overlay_inset)
+    local ui = self.plugin and self.plugin.ui
+    if not ui then return end
+    local ds = ui.doc_settings
+    local tp = ui.typeset
+    if tp and tp.unscaled_margins then
+        tp.unscaled_margins[4] = unscaled_bottom
+    end
+    local cfg = self:_docConfigurable()
+    if cfg then
+        cfg.b_page_margin = unscaled_bottom
+    end
+    if ds then
+        -- Durable KOReader setting: next open typesets with this bottom
+        -- margin (CRE cache rebuilds once, then hits). Do not SetPageMargins
+        -- after the document is on screen — that partial-rerenders the
+        -- current fragment and ANRs Android on large illustrated EPUBs.
+        ds:saveSetting("copt_b_page_margin", unscaled_bottom)
+        if overlay_inset then
+            ds:saveSetting("audiobook_overlay_bottom", unscaled_bottom)
+        end
+        pcall(function() ds:flush() end)
+    end
+end
+
+-- Locked-bar reopen: re-assert the inset into the sidecar on document close.
+-- KOReader's SaveSettings fires before CloseDocument, so the copt_* value it
+-- persists already carries the inset; this covers any path that bypasses it.
+function MediaSync:_persistLockedOverlayMargin()
+    if not self:_shouldLockKoreaderMargins() then return end
+    local ui = self.plugin and self.plugin.ui
+    local ds = ui and ui.doc_settings
+    if not ds or not ds:readSetting("audiobook_overlay_margin_locked") then return end
+    local needed = ds:readSetting("audiobook_overlay_bottom")
+    if needed == nil then
+        local tp = ui.typeset
+        needed = tp and tp.unscaled_margins and tp.unscaled_margins[4]
+    end
+    if needed ~= nil then
+        self:_persistBottomMargin(needed, true)
+        dlog("overlay-margin", "close-persist", "bottom", needed,
+            "copt", ds:readSetting("copt_b_page_margin"))
+    end
+end
+
 --[[--
 Reserve the mini player's height in the document bottom margin so book text
 reflows above it (same approach as SyncController:_reserveBarSpace for TTS).
 Never leave the mini bar covering readable text — including when the user
 keeps KOReader's status / progress bars visible under the mini player.
+
+Keep-bar + lock: persist copt_b_page_margin instead of SetPageMargins.
+Changing margins after the page is on screen partial-rerenders the current
+DocFragment and ANRs Android, so there the inset is applied on the next open
+via onDocSettingsLoad (before the first CRE typeset). Off Android a live
+reflow is safe, so the first locked session gets it immediately.
 --]]
 function MediaSync:_reserveMiniBarSpace()
-    if self._bar_space_reserved then return end
     -- Full-screen (non-overlay) player intentionally covers the book.
     if not self.overlay_mode then return end
     if not (self.plugin and self.plugin.ui and self.plugin.ui.rolling) then return end
@@ -858,19 +1084,50 @@ function MediaSync:_reserveMiniBarSpace()
     if not (tp and tp.unscaled_margins and ui.document and ui.document.setPageMargins) then
         return
     end
-    local bar = self.playback_bar
-    local bar_h = bar and (bar._mini_height or (bar.dimen and bar.dimen.h)) or 0
-    if not bar_h or bar_h <= 0 then
-        bar_h = Screen:scaleBySize(44)
-    end
+    local bar_h = self:_miniBarPixelHeight()
+    local ds = ui.doc_settings
     local m = tp.unscaled_margins
-    -- Bottom inset from screen edge so CRE text ends above the mini player.
-    -- With "Keep status bars": also clear the footer/progress stack under the mini bar.
-    -- Without it: mini bar sits on the bottom edge (may cover the footer); text clears the bar only.
+
+    if self:_shouldKeepOverlayBar() and self:_shouldLockKoreaderMargins() and ds then
+        local needed = self:_overlayBarExtraUnscaled(bar_h) + 2
+        local orig = ds:readSetting("audiobook_overlay_orig_bottom")
+        if orig == nil and math.abs((m[4] or 0) - needed) > 1 then
+            orig = m[4]
+            ds:saveSetting("audiobook_overlay_orig_bottom", orig)
+        end
+        ds:saveSetting("audiobook_overlay_margin_locked", true)
+        local live_bottom = m[4]
+        self:_persistBottomMargin(needed, true)
+        self._bar_space_reserved = true
+        self._reserved_mini_bar_h = bar_h
+        logger.warn("MediaSync: overlay margin saved for next typeset",
+            "bottom=", live_bottom, "needed=", needed,
+            "copt=", ds:readSetting("copt_b_page_margin"))
+        dlog("overlay-margin", "locked-persist-copt", "bar_h", bar_h,
+            "bottom", live_bottom, "needed", needed,
+            "copt", ds:readSetting("copt_b_page_margin"))
+        if Device:isAndroid() then
+            return
+        end
+        if math.abs((live_bottom or 0) - needed) <= 1 then
+            return  -- already typeset with the inset (reopen after persist)
+        end
+        -- Off Android: reflow now so the bar does not cover text this session.
+        local ok = pcall(ui.document.setPageMargins, ui.document,
+            Screen:scaleBySize(m[1]), Screen:scaleBySize(m[2]),
+            Screen:scaleBySize(m[3]), Screen:scaleBySize(needed))
+        if ok then
+            ui:handleEvent(Event:new("UpdatePos"))
+        end
+        return
+    end
+
+    if self._bar_space_reserved then return end
+
+    -- Session-only reservation: scaled inset, restored on stop.
+    -- Mirror ReaderTypeset:onSetPageMargins so reclaim-off includes footer.
     local bottom = Screen:scaleBySize(m[4]) + bar_h
-    local keep_bars = self.plugin and self.plugin.getSetting
-        and self.plugin:getSetting("keep_reader_status_bars", false)
-    if keep_bars then
+    if not self:_footerReclaimsHeight() or self:_miniBarAboveFooter() then
         bottom = bottom + self:_readerFooterHeight()
     end
     local ok = pcall(ui.document.setPageMargins, ui.document,
@@ -885,12 +1142,36 @@ function MediaSync:_reserveMiniBarSpace()
 end
 
 function MediaSync:_releaseMiniBarSpace()
-    if not self._bar_space_reserved then return end
+    if not self._bar_space_reserved and not (
+        self.plugin and self.plugin.ui and self.plugin.ui.doc_settings
+        and self.plugin.ui.doc_settings:readSetting("audiobook_overlay_margin_locked")
+    ) then
+        return
+    end
     self._bar_space_reserved = false
     self._reserved_mini_bar_h = nil
     if not (self.plugin and self.plugin.ui) then return end
     local ui = self.plugin.ui
     local tp = ui.typeset
+    local ds = ui.doc_settings
+    local orig = ds and ds:readSetting("audiobook_overlay_orig_bottom")
+    if orig ~= nil then
+        self:_persistBottomMargin(orig)
+        if ds then
+            ds:delSetting("audiobook_overlay_margin_locked")
+            ds:delSetting("audiobook_overlay_orig_bottom")
+            ds:delSetting("audiobook_overlay_bottom")
+            pcall(function() ds:flush() end)
+        end
+        logger.warn("MediaSync: restored original bottom margin setting", orig)
+        dlog("overlay-margin", "restored-settings", orig)
+        -- On Android the live restore is the same ANR-prone reflow; it takes
+        -- effect on next open. Off Android, restore immediately.
+        if not Device:isAndroid() and tp and tp.unscaled_margins then
+            ui:handleEvent(Event:new("SetPageMargins", tp.unscaled_margins))
+        end
+        return
+    end
     if tp and tp.unscaled_margins then
         ui:handleEvent(Event:new("SetPageMargins", tp.unscaled_margins))
         logger.warn("MediaSync: restored user page margins after mini player")

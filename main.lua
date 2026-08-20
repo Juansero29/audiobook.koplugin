@@ -35,6 +35,14 @@ local BtUI, BtMediaControl, BugReport, BenchmarkRunner, MenuBuilder, Utils, Upda
 local SessionRecorder
 local PLUGIN_PATH
 
+--- Plugin debug.log (included in bug reports). No book text. Never throws.
+local function dlog(...)
+    local DL = package.loaded["audiobook_debuglog"]
+    if DL and DL.log then
+        pcall(DL.log, ...)
+    end
+end
+
 local Audiobook = WidgetContainer:extend{
     name = "audiobook",
     is_doc_only = false,
@@ -871,15 +879,55 @@ function Audiobook:addToMainMenu(menu_items)
                         help_text = _("When enabled (default), the book view auto-turns to keep the current narration sentence on screen while you stay with the read-aloud. Manually turning a page never seeks or restarts audio: highlighting pauses and a “Return to read-aloud” cue appears until you jump back or the narration catches up."),
                     },
                     {
-                        text = _("Keep status bars during read-aloud"),
+                        text = _("Keep the audiobook bar"),
                         enabled_func = function() return (self.ui and self.ui.document) or false end,
                         checked_func = function()
-                            return self:getSetting("keep_reader_status_bars", false)
+                            return self:getSetting("keep_media_overlay_bar", false)
                         end,
                         callback = function()
-                            self:toggleSetting("keep_reader_status_bars", false)
+                            self:toggleSetting("keep_media_overlay_bar", false)
+                            local now = self:getSetting("keep_media_overlay_bar", false)
+                            local ms = self.media_sync
+                            if not ms then return end
+                            if now then
+                                if self:_hasMediaOverlays() then
+                                    pcall(function() ms:pinOverlayChrome() end)
+                                end
+                            else
+                                pcall(function()
+                                    if ms.playback_bar then
+                                        ms.playback_bar:hide()
+                                        ms.playback_bar = nil
+                                    end
+                                    ms:_releaseMiniBarSpace()
+                                end)
+                            end
                         end,
-                        help_text = _("When enabled, the minimized read-aloud mini player sits above KOReader’s bottom status bar / progress bar (alt status bar at the top is unchanged). The page always reflows so book text ends above the mini player — the player never covers readable text. When disabled (default), the mini player sits at the bottom of the screen (may cover the status bar) but text is still reflowed above it."),
+                        help_text = _("When enabled, the mini audiobook bar stays on screen after you stop narration. When disabled (default), the bar hides when idle."),
+                    },
+                    {
+                        text = _("Lock KOReader page margins"),
+                        enabled_func = function()
+                            return (self.ui and self.ui.document
+                                and self:getSetting("keep_media_overlay_bar", false)) and true or false
+                        end,
+                        checked_func = function()
+                            return self:getSetting("lock_koreader_page_margins", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("lock_koreader_page_margins", false)
+                            local now = self:getSetting("lock_koreader_page_margins", false)
+                            local ms = self.media_sync
+                            if not ms then return end
+                            if now then
+                                if self:_hasMediaOverlays() then
+                                    pcall(function() ms:pinOverlayChrome() end)
+                                end
+                            else
+                                pcall(function() ms:_releaseMiniBarSpace() end)
+                            end
+                        end,
+                        help_text = _("When enabled, the plugin writes this book’s bottom page margin into KOReader’s own settings before CRE typesets. The next open rebuilds the layout once (text stays above the audiobook bar); after that, KOReader reuses that layout. Disable to restore your original margins and edit them with KOReader’s usual controls."),
                     },
                     {
                         text = _("Keep status bars during read-aloud"),
@@ -1587,7 +1635,10 @@ function Audiobook:onShowFileDialog(file_manager, file)
     end
 end
 
-function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
+--- @param opts table|nil  { prepare_only = true } arms the overlay (bar, SMIL,
+--- saved position) without starting audio; Play continues from the mark.
+function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
+    opts = opts or {}
     allow_resume = (allow_resume == true)
 
     -- Reuse a just-loaded cache (e.g. "Play aligned from here") so we don't
@@ -1793,7 +1844,9 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
                 "start_time=", start_time)
         end
 
-        pcall(function() self:_ensureBtMediaControl() end)
+        if not opts.prepare_only then
+            pcall(function() self:_ensureBtMediaControl() end)
+        end
 
         -- Cache parser/timing for page-follow and selection restarts.
         -- If we are switching to a different EPUB, drop the resolved-xpointer
@@ -1827,9 +1880,10 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
         end
 
         local started = self.media_sync:start(first, by_file[first].timing,
-            by_file[first].chapters, nil, playlist, first, start_position)
+            by_file[first].chapters, nil, playlist, first, start_position, opts)
         if started and start_position then
-            logger.warn("Audiobook: SMIL playback started at", start_position, "for", first:match("([^/]+)$"))
+            logger.warn("Audiobook: SMIL", opts.prepare_only and "prepared" or "playback started",
+                "at", start_position, "for", first:match("([^/]+)$"))
         end
         -- Jump the book view straight to the chosen SMIL entry (by fragment),
         -- not a page-by-page crawl and not a fragile start_time lookup.
@@ -1846,11 +1900,16 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
             if not ok_nav then
                 logger.warn("Audiobook: navigate to entry error:", nav_err)
             end
+            if opts.prepare_only then
+                pcall(function() self.media_sync:_refreshPlaybackTimeUi() end)
+            end
             -- Extra seek after start: some Kindle backends ignore #t= on the
             -- first play(); seekToTime restarts at the correct clip time.
             -- Skip when MediaEngine already started at start_position — a
             -- redundant seek-by-restart kills A2DP (AirPods: brief sound then silence).
-            if start_position and start_position > 0 and self.media_sync.seekToTime then
+            -- Skip entirely when we only armed the overlay (no audio yet).
+            if not opts.prepare_only
+                and start_position and start_position > 0 and self.media_sync.seekToTime then
                 UIManager:scheduleIn(0.8, function()
                     pcall(function()
                         if not self.media_sync or not self.media_sync.media_engine then return end
@@ -1873,6 +1932,23 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume)
             end
             self:_hideReturnToReadAloudButton()
         end
+    end
+
+    if opts.prepare_only then
+        -- Arming the pinned bar on book open: resume the saved mark silently
+        -- (no prompt, no audio); Play continues from there.
+        if allow_resume and not (start_entry and start_entry.audio_path) then
+            local saved_pos, _, saved_audio = self:_getSavedAlignedPosition(doc_path)
+            if saved_pos and saved_pos > 10 and saved_audio and by_file[saved_audio] then
+                start_entry = { audio_path = saved_audio, start_time = saved_pos }
+            end
+        end
+        if not (start_entry and start_entry.audio_path) then
+            pcall(function() self.media_sync:pinOverlayChrome() end)
+            return
+        end
+        do_start(start_entry)
+        return
     end
 
     -- When invoked from the main menu, offer to resume from the last saved position.
@@ -3525,8 +3601,111 @@ function Audiobook:onResume()
     end
 end
 
+function Audiobook:_shouldLockKoreaderMargins()
+    return self:getSetting("lock_koreader_page_margins", false)
+        and self:getSetting("keep_media_overlay_bar", false)
+end
+
+function Audiobook:_defaultOverlayBottomUnscaled()
+    local screen = Device and Device.screen
+    if not screen then
+        return 46
+    end
+    local bar_h = screen:scaleBySize(44)
+    if screen.unscaleBySize then
+        return screen:unscaleBySize(bar_h) + 2
+    end
+    return 46
+end
+
+function Audiobook:_docWantsLockedOverlayMargins(config, document)
+    if not self:_shouldLockKoreaderMargins() then return false end
+    if not config then return false end
+    -- copt_b_page_margin is a CRE (rolling) setting; fixed-layout documents
+    -- never read it, and aligned overlay books are EPUB anyway.
+    local path = document and (document.file or document.file_path)
+    local ext = path and path:lower():match("%.([^.]+)$")
+    if ext == "pdf" or ext == "djvu" or ext == "cbz" or ext == "zip" then
+        return false
+    end
+    if config:readSetting("audiobook_overlay_margin_locked") then return true end
+    if config:readSetting("audiobook_overlay_bottom") then return true end
+    if config:readSetting("audiobook_overlay_orig_bottom") then return true end
+    if path then
+        local pos = self:_getSavedAlignedPosition(path)
+        if pos then return true end
+    end
+    return false
+end
+
+-- Apply the overlay inset as KOReader's own bottom margin *before* CRE
+-- typesets. That is the one durable reload: later opens hit the new cache.
+-- Never SetPageMargins after the page is on screen (Android ANR).
+function Audiobook:onDocSettingsLoad(config, document)
+    if not config then return end
+    if not self:_docWantsLockedOverlayMargins(config, document) then return end
+    local needed = tonumber(config:readSetting("audiobook_overlay_bottom"))
+        or self:_defaultOverlayBottomUnscaled()
+    if not needed or needed <= 0 then return end
+    local copt = tonumber(config:readSetting("copt_b_page_margin"))
+    if config:readSetting("audiobook_overlay_orig_bottom") == nil
+        and copt ~= nil and math.abs(copt - needed) > 1 then
+        config:saveSetting("audiobook_overlay_orig_bottom", copt)
+    end
+    config:saveSetting("copt_b_page_margin", needed)
+    config:saveSetting("audiobook_overlay_bottom", needed)
+    config:saveSetting("audiobook_overlay_margin_locked", true)
+    local cfg = document and document.configurable
+    if cfg then
+        cfg.b_page_margin = needed
+    end
+    pcall(function() config:flush() end)
+    dlog("overlay-margin", "docsettings-copt", "needed", needed, "was", copt)
+end
+
+--- Pin the overlay mini-bar and restore the last sentence (highlighted,
+--- audio armed, not playing) so Play continues from there.
+function Audiobook:onReaderReady()
+    if not self._init_ok or not self.media_sync then return end
+    if not self:getSetting("keep_media_overlay_bar", false) then return end
+    if not (self.ui and self.ui.rolling and self.ui.document) then return end
+    local ds = self.ui.doc_settings
+    local locked = ds and ds:readSetting("audiobook_overlay_margin_locked")
+    if not locked and not self:_hasMediaOverlays() then return end
+    local delay = locked and 0.2 or 0.9
+    UIManager:scheduleIn(delay, function()
+        if not self.ui or not self.ui.document then return end
+        if not self:getSetting("keep_media_overlay_bar", false) then return end
+        pcall(function() self:_restoreAlignedOverlaySession() end)
+    end)
+end
+
+function Audiobook:_restoreAlignedOverlaySession()
+    local doc_path = self.ui.document.file_path or self.ui.document.file
+    if not doc_path or not self.media_sync then return end
+    -- Already armed for this EPUB (play-from-here, or a previous restore).
+    if self._smil_doc_path == doc_path
+        and self.media_sync.media_engine
+        and self.media_sync.media_engine.current_path then
+        pcall(function() self.media_sync:pinOverlayChrome() end)
+        return
+    end
+    if not self:_hasMediaOverlays() then
+        pcall(function() self.media_sync:pinOverlayChrome() end)
+        return
+    end
+    self:_startSmilPlayback(doc_path, nil, true, { prepare_only = true })
+end
+
 function Audiobook:onCloseDocument()
     logger.warn("Audiobook: onCloseDocument event received")
+    -- Re-assert the overlay inset into the sidecar before ReaderConfig writes
+    -- copt_* (SaveSettings fires before CloseDocument, so this only covers
+    -- paths that bypassed it). Dropping chrome must not restore the original
+    -- bottom margin while keep-bar is on.
+    if self.media_sync then
+        pcall(function() self.media_sync:_persistLockedOverlayMargin() end)
+    end
     -- Do NOT stop the session recorder here: opening a new book from the
     -- file browser fires CloseDocument, and the user expects the recording
     -- to persist across book changes. The recorder still stops on suspend,
