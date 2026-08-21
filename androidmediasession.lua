@@ -278,12 +278,12 @@ function AndroidMediaSession:startPolling(plugin)
                 self._last_dispatch_time = now
                 logger.warn("AndroidMediaSession: command", cmd)
                 local p = self._plugin
-                if cmd == self.CMD_PLAY_PAUSE then
+                -- AirPods Pro stem AVRCP often repeats KEYCODE_MEDIA_PAUSE for
+                -- both clicks (never PLAY).  Honor the plugin's real state.
+                if cmd == self.CMD_PLAY_PAUSE
+                    or cmd == self.CMD_PLAY
+                    or cmd == self.CMD_PAUSE then
                     pcall(function() p:onMediaPlayPause() end)
-                elseif cmd == self.CMD_PLAY then
-                    pcall(function() p:onMediaPlay() end)
-                elseif cmd == self.CMD_PAUSE then
-                    pcall(function() p:onMediaPause() end)
                 elseif cmd == self.CMD_STOP then
                     pcall(function() p:onMediaStop() end)
                 elseif cmd == self.CMD_NEXT then
