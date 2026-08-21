@@ -3386,6 +3386,12 @@ function Audiobook:notifyAudioPlaying()
     pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
 end
 
+--- Tell the headset the overlay is paused (stem maps HEADSETHOOK from PlaybackState).
+function Audiobook:notifyAudioPaused()
+    if not BtMediaControl then return end
+    pcall(function() BtMediaControl.sendPlaybackStatus("paused") end)
+end
+
 function Audiobook:pauseReadAlong()
     if not self._init_ok then return end
     -- Pause media playback if active

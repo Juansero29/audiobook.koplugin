@@ -106,7 +106,14 @@ end
 --- Android MediaSession path (AirPods stem / BT headset buttons on Boox).
 function BtMediaControl._startAndroidMediaSession(plugin)
     if BtMediaControl._android_session then
-        BtMediaControl._android_session:startPolling(plugin)
+        local session = BtMediaControl._android_session
+        session:startPolling(plugin)
+        -- stopSession() keeps the Lua wrapper but releases the Java session.
+        -- Re-activate so AirPods stem events reach us after a previous stop.
+        if not BtMediaControl._android_session_started then
+            session:startSession("Audiobook", "")
+            BtMediaControl._android_session_started = true
+        end
         return true
     end
     local plugin_dir = (plugin and plugin.path) or "."
@@ -128,6 +135,7 @@ function BtMediaControl._startAndroidMediaSession(plugin)
     end
     BtMediaControl._android_session = session
     session:startSession("Audiobook", "")
+    BtMediaControl._android_session_started = true
     session:startPolling(plugin)
     logger.warn("BtMediaControl: Android MediaSession AVRCP active")
     return true
