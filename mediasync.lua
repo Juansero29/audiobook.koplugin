@@ -763,9 +763,7 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     if opts.prepare_only then
         self._start_position = nil
         self.state = self.STATE.STOPPED
-        if self.playback_bar and self.playback_bar.setPlaying then
-            pcall(function() self.playback_bar:setPlaying(false) end)
-        end
+        self:_publishPlayState(false)
         logger.warn("MediaSync: prepared overlay session at", resume_pos)
         return true
     end
@@ -788,10 +786,33 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     self.state = self.STATE.PLAYING
     self:_startSyncLoop(gen)
     self:_startPositionPoller(gen)
+    -- Overlay pin / "play from here" reuse a bar that was showing Play, and
+    -- the mini-player pause path never went through pauseReadAlong — publish
+    -- both the icon and Android MediaSession (AirPods stem uses PlaybackState).
+    self:_publishPlayState(true)
 
     logger.warn("MediaSync: started playback, sentences=", self._total_sentences,
         "duration=", self.media_engine:getDuration())
     return true
+end
+
+--- Keep the mini-bar icon and BT/MediaSession PlaybackState in lockstep.
+-- Android maps AirPods HEADSETHOOK to play vs pause from that state; if it
+-- still says paused while audio is running, the stem becomes a no-op.
+function MediaSync:_publishPlayState(playing)
+    playing = playing and true or false
+    if self.playback_bar and self.playback_bar.setPlaying then
+        pcall(function() self.playback_bar:setPlaying(playing) end)
+    end
+    local plugin = self.plugin
+    if not plugin then return end
+    if playing then
+        if plugin.notifyAudioPlaying then
+            pcall(function() plugin:notifyAudioPlaying() end)
+        end
+    elseif plugin.notifyAudioPaused then
+        pcall(function() plugin:notifyAudioPaused() end)
+    end
 end
 
 --- @param keep_chapter_menu boolean|nil
@@ -834,9 +855,7 @@ function MediaSync:stop(keep_chapter_menu, opts)
         if keep_bar then
             -- Leave the mini player and reserved margins in place so CRE
             -- does not reflow the book on the next play (Android ANR).
-            if self.playback_bar and self.playback_bar.setPlaying then
-                pcall(function() self.playback_bar:setPlaying(false) end)
-            end
+            self:_publishPlayState(false)
         else
             if self.playback_bar then
                 pcall(function() self.playback_bar:hide() end)
@@ -1217,9 +1236,7 @@ function MediaSync:pause(auto)
     end
     -- Pin the SMIL highlight to the pause time immediately.
     pcall(function() self:_updateHighlightAtTime(pos) end)
-    if self.playback_bar then
-        pcall(function() self.playback_bar:setPlaying(false) end)
-    end
+    self:_publishPlayState(false)
     logger.warn("MediaSync: paused", auto and "(auto)" or "", "at", pos)
 end
 
@@ -1258,11 +1275,7 @@ function MediaSync:resume(auto)
     end
     -- Snap highlight to the SMIL sentence for this audio time before the loop.
     pcall(function() self:_updateHighlightAtTime(resume_pos) end)
-    if self.playback_bar then
-        pcall(function()
-            self.playback_bar:setPlaying(true)
-        end)
-    end
+    self:_publishPlayState(true)
     -- The sync loop self-terminates while paused: its tick bails out without
     -- rescheduling once state != PLAYING.  Restart it (and the position
     -- poller, for symmetry) so the highlight tracks the audio again instead of
@@ -2503,9 +2516,7 @@ function MediaSync:showPlaybackBar()
                 if ok then
                     self:_startSyncLoop(gen)
                     self:_startPositionPoller(gen)
-                    if self.playback_bar and self.playback_bar.setPlaying then
-                        pcall(function() self.playback_bar:setPlaying(true) end)
-                    end
+                    self:_publishPlayState(true)
                 else
                     self.state = self.STATE.STOPPED
                 end

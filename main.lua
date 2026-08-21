@@ -3253,6 +3253,28 @@ function Audiobook:_ensureBtMediaControl()
     end
 end
 
+--- Re-take MediaSession audio focus after Android TTS speak() stole it.
+function Audiobook:notifyAudioPlaying()
+    self:_ensureBtMediaControl()
+    if not BtMediaControl then return end
+    local session = BtMediaControl.getAndroidSession and BtMediaControl.getAndroidSession()
+    if session and session.startSession then
+        session:startSession("Audiobook", "")
+        BtMediaControl._android_session_started = true
+        if session.setPlaying then
+            session:setPlaying(true, 0)
+        end
+        return
+    end
+    pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
+end
+
+--- Tell the headset the overlay is paused (stem maps HEADSETHOOK from PlaybackState).
+function Audiobook:notifyAudioPaused()
+    if not BtMediaControl then return end
+    pcall(function() BtMediaControl.sendPlaybackStatus("paused") end)
+end
+
 function Audiobook:pauseReadAlong()
     if not self._init_ok then return end
     -- Pause media playback if active
