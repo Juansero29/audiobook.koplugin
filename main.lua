@@ -3423,12 +3423,32 @@ end
 
 function Audiobook:onMediaPlay()
     if not self._init_ok then return true end
+    -- Some headsets send PLAY for every stem click.  If we are already
+    -- playing, treat it as pause rather than a no-op resume.
+    local media_playing = self.media_sync and self.media_sync.state == "playing"
+    local tts_playing = self.sync_controller and self.sync_controller.isPlaying
+        and self.sync_controller:isPlaying()
+    if media_playing or tts_playing then
+        logger.warn("Audiobook: headset PLAY while playing — pause")
+        self:pauseReadAlong()
+        return true
+    end
     self:resumeReadAlong()
     return true
 end
 
 function Audiobook:onMediaPause()
     if not self._init_ok then return true end
+    -- AirPods Pro stem often repeats KEYCODE_MEDIA_PAUSE instead of PLAY.
+    -- A second pause while already paused is the resume click.
+    local media_paused = self.media_sync and self.media_sync.state == "paused"
+    local tts_paused = self.sync_controller and self.sync_controller.isPaused
+        and self.sync_controller:isPaused()
+    if media_paused or tts_paused then
+        logger.warn("Audiobook: headset PAUSE while paused — resume")
+        self:resumeReadAlong()
+        return true
+    end
     self:pauseReadAlong()
     return true
 end
