@@ -949,13 +949,14 @@ function MediaSync:_refreshPlaybackTimeUi()
         end
     end
     pcall(function()
-        self.playback_bar:updateTimeDisplay(bar_pos or 0, bar_dur or 0)
+        -- force=true so e-ink paints immediately on pin / seek / pause.
+        self.playback_bar:updateTimeDisplay(bar_pos or 0, bar_dur or 0, true)
         if bar_dur and bar_dur > 0 then
             local pct = math.floor(((bar_pos or 0) / bar_dur) * 100)
             if pct < 0 then pct = 0 end
             if pct > 100 then pct = 100 end
             self._last_progress_pct = pct
-            self.playback_bar:updateProgress(pct)
+            self.playback_bar:updateProgress(pct, true)
         end
     end)
     self:_refreshPlaybackBarTitles()
@@ -1242,6 +1243,7 @@ function MediaSync:pause(auto)
     -- Pin the SMIL highlight to the pause time immediately.
     pcall(function() self:_updateHighlightAtTime(pos) end)
     self:_publishPlayState(false)
+    pcall(function() self:_refreshPlaybackTimeUi() end)
     logger.warn("MediaSync: paused", auto and "(auto)" or "", "at", pos)
 end
 
@@ -1281,6 +1283,7 @@ function MediaSync:resume(auto)
     -- Snap highlight to the SMIL sentence for this audio time before the loop.
     pcall(function() self:_updateHighlightAtTime(resume_pos) end)
     self:_publishPlayState(true)
+    pcall(function() self:_refreshPlaybackTimeUi() end)
     -- The sync loop self-terminates while paused: its tick bails out without
     -- rescheduling once state != PLAYING.  Restart it (and the position
     -- poller, for symmetry) so the highlight tracks the audio again instead of
@@ -1547,12 +1550,7 @@ function MediaSync:_refreshPlaybackBarTitles()
     end
     if not label or label == "" then return end
     pcall(function()
-        -- Force mini refresh even when the chapter label is unchanged (e.g. first
-        -- paint used the book title before chapter_title was applied).
         local bar = self.playback_bar
-        if bar.chapter_title == label and bar._mini_title then
-            bar:_updateMiniWidgets()
-        end
         bar:updateChapterTitle(label)
         if ch and bar.setCurrentChapter then
             bar:setCurrentChapter(ch)
@@ -1946,8 +1944,11 @@ function MediaSync:_updateHighlightAtTime(pos)
                     self.highlight_manager:highlightWord(word, {sentences = {sentence}})
                 end)
             end
-            -- Update playback bar word display (only in non-scrubber mode)
-            if self.playback_bar and not self.playback_bar.scrubber_mode then
+            -- TTS PlaybackBar can show the spoken word. Overlay AudiobookPlayer
+            -- uses that slot for the chapter title — rewriting it every word
+            -- flashes the Kindle footer into a second ghost bar.
+            if self.playback_bar and not self.overlay_mode
+                and not self.playback_bar.scrubber_mode then
                 pcall(function()
                     self.playback_bar:updateCurrentWord(word.text or "")
                 end)
@@ -2344,12 +2345,12 @@ function MediaSync:_startPositionPoller(gen)
             pcall(function()
                 self.playback_bar:updateTimeDisplay(display_pos, display_dur)
             end)
-            -- Update chapter title (overlay: SMIL chapter across audio parts)
+            -- Only rewrite the chapter label when it actually changes. A 1 Hz
+            -- force-refresh ghosts a second bar on Kindle e-ink.
             local ok_ch, ch, ch_idx = pcall(function() return self:getCurrentChapter() end)
-            if ok_ch then
+            if ok_ch and ch_idx ~= self._last_bar_chapter_idx then
+                self._last_bar_chapter_idx = ch_idx
                 pcall(function() self:_refreshPlaybackBarTitles() end)
-                -- Update chapter menu highlight if it's open (chapter mode only;
-                -- playlist mode uses playlist index, not chapter index)
                 if self._chapter_menu and ch_idx and not self.playlist_files then
                     local menu = self._chapter_menu
                     if menu.item_table.current ~= ch_idx then
@@ -2620,10 +2621,9 @@ function MediaSync:showPlaybackBar()
         -- BT reconnect lives in plugin settings (Reconnect BT on track change)
         -- and the Bluetooth menu — no overlay "BT" button.
         show_fix_audio = false,
-        keep_reader_status_bars = self.plugin
-            and self.plugin.getSetting
-            and self.plugin:getSetting("keep_reader_status_bars", false)
-            or false,
+        -- Sit above a visible KOReader footer even when the user did not
+        -- toggle "Keep status bars" — otherwise the mini player overlaps it.
+        keep_reader_status_bars = self:_miniBarAboveFooter(),
     }
     player:show()
     if self.plugin then
