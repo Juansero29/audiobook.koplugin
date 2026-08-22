@@ -17,7 +17,7 @@ local function escape_unzip_member(path)
 end
 
 local function url_decode(path)
-    if not path or not path:find("%%", 1, true) then
+    if not path or not path:find("%", 1, true) then
         return path
     end
     return (path:gsub("%%(%x%x)", function(hex)
