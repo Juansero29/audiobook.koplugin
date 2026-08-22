@@ -66,7 +66,9 @@ end
 -- literal spaces.  unzip then misses every SMIL and we report "no
 -- built-in audiobook" even though Readest still plays the same file.
 function EpubMediaOverlay:_urlDecode(path)
-    if not path or not path:find("%%", 1, true) then
+    -- plain find: "%" is one percent. "%%" would look for two percents
+    -- and skip every real %20 / %2C href (Readest/Calibre).
+    if not path or not path:find("%", 1, true) then
         return path
     end
     return (path:gsub("%%(%x%x)", function(hex)
